@@ -18,3 +18,6 @@ packages = ["em_volume_tools"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: exercises a real dask cluster (LocalCluster); slower to run",
+]

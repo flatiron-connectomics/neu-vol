@@ -9,7 +9,7 @@ from __future__ import annotations
 from .base import ArrayBackend, Region, open_backend, register_backend
 
 # Import concrete backends for their self-registration side effects.
-from . import tensorstore, imagestack, hdf5  # noqa: E402,F401
+from . import tensorstore, imagestack, hdf5, view  # noqa: E402,F401
 
 __all__ = [
     "ArrayBackend",

@@ -13,7 +13,7 @@ from .engine import Block, iter_blocks, block_map, idempotent
 from .dask_runner import start_dask
 from .backends.base import ArrayBackend, open_backend, register_backend
 from .profiles import StorageProfile, PROFILES, get_profile
-from .ops import ingest_image_stack, convert
+from .ops import ingest_image_stack, convert, extract_roi
 
 __all__ = [
     "__version__",
@@ -32,4 +32,5 @@ __all__ = [
     "get_profile",
     "ingest_image_stack",
     "convert",
+    "extract_roi",
 ]

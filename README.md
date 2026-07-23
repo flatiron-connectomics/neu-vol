@@ -46,9 +46,26 @@ convert("in.zarr", "out.precomputed", voxel_size=(8, 8, 8),
         profile="s3-neuroglancer", kind="segmentation")   # mode-downsampled pyramid
 ```
 
+`extract_roi()` crops/pads a region (and can pyramid it) into either format.
+
 Implemented: `VoxelMeta`, `Volume`, block-map engine, `start_dask`, TensorStore
 zarr v3 (sharded/unsharded) **and** precomputed (canonical-axis view + multiscale
-`info`), image-stack source, type-aware pyramids, storage profiles, OME-NGFF 0.5
-metadata, `ingest`/`convert` ops. Outputs verified via ngff-zarr's reader (zarr)
-and TensorStore round-trip (precomputed). Next: `roi` (crop/pad), HDF5 source,
-SLURM smoke test. See `docs/DESIGN.md`.
+`info`), image-stack / HDF5 / crop-view sources, type-aware pyramids, storage
+profiles, OME-NGFF 0.5 metadata, and the `ingest` / `convert` / `extract_roi` ops.
+Outputs verified via ngff-zarr's reader (zarr) and TensorStore round-trip
+(precomputed); the distributed path is exercised over a real `LocalCluster`.
+
+## Running on the cluster
+
+The same ops run across SLURM workers by passing a `client` from `start_dask`.
+See `examples/run_convert_slurm.py` and `docs/dask-slurm-rusty.md`:
+
+```bash
+# smoke test locally, then launch on Rusty surviving logout:
+nohup python -u examples/run_convert_slurm.py \
+    --config configs/dask-slurm-gen.yaml --workers 48 > run.log 2>&1 &
+squeue -u "$USER"
+```
+
+Next: read source metadata on `convert`, brightness/normalization + morphological
+transforms, a CLI. See `docs/DESIGN.md`.
