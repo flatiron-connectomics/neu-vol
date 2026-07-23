@@ -1,0 +1,28 @@
+# Production — Rusty `gen` partition (genoa: 96 cores / ~1.5 TB).
+# See docs/dask-slurm-rusty.md §5a. Set `account` to your center (e.g. ccn/ccb/ccm...).
+jobqueue:
+  slurm:
+    cores: 96               # CPUs per SLURM job; whole genoa node
+    processes: 24           # dask workers per job -> cores/processes = threads/worker (=1)
+    memory: 1400GB          # RAM per job (--mem); memory/processes = ~58 GB per worker
+    walltime: "12:00:00"    # per-job wall limit; rely on idempotent resume for long runs
+
+    account: your-account            # -A  (your center's account) -- EDIT ME
+    queue: gen              # --partition
+    job-extra-directives: ["--constraint=genoa"]
+
+    name: em-volume-tools
+    log-directory: /path/to/scratch/dask-job-logs   # keep logs on ceph
+
+distributed:
+  scheduler:
+    work-stealing: true
+  worker:
+    memory:
+      target: false
+      spill: false
+      pause: false
+      terminate: false
+  admin:
+    tick:
+      limit: 3h

@@ -1,0 +1,11 @@
+# Local (dev / smoke test) — no SLURM. See docs/dask-slurm-rusty.md §5c.
+jobqueue:
+  local: {}
+distributed:
+  worker:
+    memory:
+      # DISABLE dask's memory manager. Use `false`, NOT 0.0 (see cookbook Gotcha #1).
+      target: false
+      spill: false
+      pause: false
+      terminate: false

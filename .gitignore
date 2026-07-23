@@ -1,0 +1,20 @@
+# pixi: env is detached to ceph; keep only the lockfile under version control
+.pixi/
+# but do track the lockfile
+!pixi.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# dask job logs / local scratch
+dask-job-logs/
+*.log
+
+# editor
+.vscode/
+.idea/

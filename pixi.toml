@@ -1,0 +1,37 @@
+[workspace]
+name = "em-volume-tools"
+version = "0.1.0"
+description = "Chunked I/O, conversion, and multiscale generation for large 3D EM volumes, orchestrated with dask (local or Rusty/SLURM)."
+authors = ["Erik Schomburg <eschomburg@flatironinstitute.org>"]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.11,<3.14"
+numpy = ">=2"
+scipy = "*"
+# Chunked array backends
+tensorstore = ">=0.1.70"   # zarr v3 array data + neuroglancer-precomputed
+zarr = ">=3"               # zarr-python v3
+ngff_zarr = ">=0.39"       # OME-Zarr / OME-NGFF 0.5 multiscale group metadata
+jsonschema = "*"           # enables ngff_zarr.validate() for strict 0.5 compliance
+h5py = "*"                 # HDF5 chunk shards
+tifffile = "*"             # TIFF (multi-file + multipage) sources
+imageio = "*"              # PNG / misc 2D image sources
+# Orchestration
+dask = "*"
+distributed = "*"
+dask-jobqueue = ">=0.8"    # SLURMCluster (see docs/dask-slurm-rusty.md)
+pyyaml = "*"               # dask-config.yaml loading
+
+[pypi-dependencies]
+em-volume-tools = { path = ".", editable = true }
+
+[feature.dev.dependencies]
+pytest = "*"
+
+[feature.dev.tasks]
+test = "pytest -q"
+
+[environments]
+dev = ["dev"]

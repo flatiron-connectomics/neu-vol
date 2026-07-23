@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "em-volume-tools"
+version = "0.1.0"
+description = "Chunked I/O, conversion, and multiscale generation for large 3D EM volumes, orchestrated with dask (local or Rusty/SLURM)."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Erik Schomburg", email = "eschomburg@flatironinstitute.org" }]
+# Runtime dependencies are provided by conda-forge via pixi (see pixi.toml),
+# so they are intentionally not duplicated here.
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["em_volume_tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
