@@ -70,3 +70,44 @@ def test_convert_to_precomputed_multichannel(tmp_path):
     np.testing.assert_array_equal(_full(s0), data)
     info = json.load(open(os.path.join(dst, "info")))
     assert info["num_channels"] == 3
+
+
+def test_segmentation_defaults_to_compressed_segmentation(tmp_path):
+    seg = np.random.default_rng(7).integers(0, 9, (16, 12, 8), dtype=np.uint64)
+    src = str(tmp_path / "seg.zarr")
+    _make_zarr(src, seg, chunk=(8, 8, 8))
+    dst = str(tmp_path / "seg.precomputed")
+
+    summary = convert(src, dst, voxel_size=(8, 8, 8), profile="s3-neuroglancer",
+                      chunk=(8, 8, 8), kind="segmentation", min_dim=8, delete_existing=True)
+    assert summary["encoding"] == "compressed_segmentation"
+    info = json.load(open(os.path.join(dst, "info")))
+    assert info["type"] == "segmentation"
+    assert all(s["encoding"] == "compressed_segmentation" for s in info["scales"])
+    assert all("compressed_segmentation_block_size" in s for s in info["scales"])
+    # round-trips (incl. label-preserving downsample stored compressed)
+    s0 = open_backend({"backend": "neuroglancer_precomputed", "path": dst, "scale_index": 0})
+    np.testing.assert_array_equal(_full(s0), seg)
+
+
+def test_encoding_override_to_raw(tmp_path):
+    seg = np.zeros((8, 8, 8), np.uint64)
+    src = str(tmp_path / "s.zarr")
+    _make_zarr(src, seg, chunk=(8, 8, 8))
+    dst = str(tmp_path / "s.precomputed")
+    summary = convert(src, dst, voxel_size=(8, 8, 8), profile="s3-neuroglancer",
+                      chunk=(8, 8, 8), kind="segmentation", encoding="raw",
+                      multiscale=False, delete_existing=True)
+    assert summary["encoding"] == "raw"
+    info = json.load(open(os.path.join(dst, "info")))
+    assert info["scales"][0]["encoding"] == "raw"
+
+
+def test_compressed_segmentation_bad_dtype_raises(tmp_path):
+    img = np.zeros((8, 8, 8), np.uint8)
+    src = str(tmp_path / "i.zarr")
+    _make_zarr(src, img, chunk=(8, 8, 8))
+    with pytest.raises(ValueError, match="compressed_segmentation requires"):
+        convert(src, str(tmp_path / "bad.precomputed"), voxel_size=(8, 8, 8),
+                profile="s3-neuroglancer", chunk=(8, 8, 8),
+                encoding="compressed_segmentation", multiscale=False, delete_existing=True)

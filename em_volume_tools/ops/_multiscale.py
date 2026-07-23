@@ -134,6 +134,7 @@ def materialize_zarr_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
+    encoding=None, compressed_segmentation_block_size=(8, 8, 8),  # precomputed-only; ignored here
 ) -> dict:
     prof = get_profile(profile)
     out_dtype = dtype or str(src_dtype)
@@ -188,12 +189,21 @@ def materialize_precomputed_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
+    encoding=None, compressed_segmentation_block_size=(8, 8, 8),
 ) -> dict:
     prof = get_profile(profile)
     out_dtype = dtype or str(src_dtype)
     dst = dst.rstrip("/")
     pc_type = "segmentation" if kind == "segmentation" else "image"
-    encoding = "compressed_segmentation" if False else "raw"  # raw for v1 (see DESIGN)
+
+    # Default encoding: compressed_segmentation for label data, raw otherwise.
+    if encoding is None:
+        encoding = "compressed_segmentation" if kind == "segmentation" else "raw"
+    if encoding == "compressed_segmentation" and out_dtype not in ("uint32", "uint64"):
+        raise ValueError(
+            f"compressed_segmentation requires uint32/uint64, got {out_dtype!r}; "
+            "pass encoding='raw' or a suitable dtype"
+        )
 
     def create_level(i, shape, cum):
         resolution = [v * c for v, c in zip(voxel_size, cum)]      # (z, y, x) nm
@@ -202,6 +212,7 @@ def materialize_precomputed_multiscale(
             prof, dst, shape, out_dtype, resolution_zyx=resolution, scale_index=i,
             num_channels=num_channels, chunk=chunk, encoding=encoding, type_=pc_type,
             voxel_offset_zyx=voxel_offset,
+            compressed_segmentation_block_size=compressed_segmentation_block_size,
         )
         return TensorStoreBackend.create(spec, delete_existing=(delete_existing and i == 0))
 
@@ -212,9 +223,10 @@ def materialize_precomputed_multiscale(
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
     )
     scales = [[float(v * c) for v, c in zip(voxel_size, F)] for F in cum]
-    logger.info("wrote precomputed multiscale info: %d scales", len(level_shapes))
+    logger.info("wrote precomputed multiscale info: %d scales (encoding=%s)", len(level_shapes), encoding)
     return {"dst": dst, "format": "neuroglancer_precomputed", "num_levels": len(level_shapes),
-            "level_shapes": level_shapes, "level_scales": scales, "dtype": out_dtype}
+            "level_shapes": level_shapes, "level_scales": scales, "dtype": out_dtype,
+            "encoding": encoding}
 
 
 def materialize_multiscale(**kw) -> dict:

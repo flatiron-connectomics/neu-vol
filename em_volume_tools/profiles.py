@@ -113,18 +113,21 @@ def precomputed_create_spec(
     encoding: str = "raw",
     type_: str = "image",
     voxel_offset_zyx: Sequence[int] | None = None,
+    compressed_segmentation_block_size: Sequence[int] | None = None,
 ) -> dict:
     """Build a normalized neuroglancer-precomputed create spec (one scale).
 
     ``canonical_shape``/``resolution_zyx``/``chunk`` are in canonical ``(z, y, x)``
     order (with a leading channel axis when ``num_channels > 1``); the backend
-    reverses them to precomputed's native ``(x, y, z)``.
+    reverses them to precomputed's native ``(x, y, z)``. For
+    ``encoding="compressed_segmentation"`` a block size (canonical z,y,x) is
+    required (defaults to 8,8,8).
     """
     p = get_profile(profile)
     if p.format != "neuroglancer_precomputed":
         raise ValueError(f"profile format {p.format!r} is not precomputed")
     spatial_chunk = tuple(chunk) if chunk is not None else p.chunk
-    return {
+    spec = {
         "backend": "neuroglancer_precomputed",
         "path": path,
         "shape": list(canonical_shape),
@@ -137,3 +140,7 @@ def precomputed_create_spec(
         "voxel_offset_zyx": list(voxel_offset_zyx) if voxel_offset_zyx else [0, 0, 0],
         "scale_index": int(scale_index),
     }
+    if encoding == "compressed_segmentation":
+        block = compressed_segmentation_block_size or (8, 8, 8)
+        spec["compressed_segmentation_block_size_zyx"] = list(block)
+    return spec

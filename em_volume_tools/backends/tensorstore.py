@@ -145,6 +145,17 @@ class TensorStoreBackend:
         num_channels = int(spec.get("num_channels", 1))
         canonical_shape = [int(s) for s in spec["shape"]]
         spatial = canonical_shape[-3:]  # (z, y, x)
+        encoding = spec.get("encoding", "raw")
+        scale_metadata = {
+            "size": _rev(spatial),
+            "resolution": _rev(spec["resolution_zyx"]),
+            "encoding": encoding,
+            "chunk_size": _rev(spec["chunk_zyx"]),
+            "voxel_offset": _rev(spec.get("voxel_offset_zyx", [0, 0, 0])),
+        }
+        if encoding == "compressed_segmentation":
+            block = spec.get("compressed_segmentation_block_size_zyx", [8, 8, 8])
+            scale_metadata["compressed_segmentation_block_size"] = _rev(block)
         ts_spec = {
             "driver": "neuroglancer_precomputed",
             "kvstore": kv,
@@ -153,13 +164,7 @@ class TensorStoreBackend:
                 "data_type": str(spec["dtype"]),
                 "num_channels": num_channels,
             },
-            "scale_metadata": {
-                "size": _rev(spatial),
-                "resolution": _rev(spec["resolution_zyx"]),
-                "encoding": spec.get("encoding", "raw"),
-                "chunk_size": _rev(spec["chunk_zyx"]),
-                "voxel_offset": _rev(spec.get("voxel_offset_zyx", [0, 0, 0])),
-            },
+            "scale_metadata": scale_metadata,
             "create": True,
             "delete_existing": delete_existing,
         }

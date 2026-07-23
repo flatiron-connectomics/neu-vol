@@ -38,12 +38,15 @@ ingest_image_stack(
 ```
 
 `convert()` does the same from any source backend (zarr v3, precomputed, HDF5)
-to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel:
+to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel. It reads
+`voxel_size`/`offset`/`units` from the source when present (OME-NGFF groups,
+precomputed `info`); explicit args override. Segmentations default to
+`compressed_segmentation` encoding on precomputed.
 
 ```python
 from em_volume_tools import convert
-convert("in.zarr", "out.precomputed", voxel_size=(8, 8, 8),
-        profile="s3-neuroglancer", kind="segmentation")   # mode-downsampled pyramid
+convert("in.zarr", "out.precomputed",           # voxel_size read from in.zarr's OME metadata
+        profile="s3-neuroglancer", kind="segmentation")   # mode pyramid, compressed_segmentation
 ```
 
 `extract_roi()` crops/pads a region (and can pyramid it) into either format.
@@ -67,5 +70,4 @@ nohup python -u examples/run_convert_slurm.py \
 squeue -u "$USER"
 ```
 
-Next: read source metadata on `convert`, brightness/normalization + morphological
-transforms, a CLI. See `docs/DESIGN.md`.
+Next: brightness/normalization + morphological transforms, a CLI. See `docs/DESIGN.md`.
