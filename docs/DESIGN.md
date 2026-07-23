@@ -201,21 +201,25 @@ Use **pixi**, but relocate its heavy, high-inode storage off the GPFS home
 ## 9. Proposed module layout
 
 ```
-em_volume_tools/
+em_volume_tools/                # v1 IMPLEMENTED (45 tests)
 ├── volume.py        # Volume handle
 ├── meta.py          # VoxelMeta + coordinate/axis conversion
 ├── backends/
-│   ├── base.py      # ArrayBackend protocol
-│   ├── tensorstore.py  # zarr v3 + precomputed
+│   ├── base.py      # ArrayBackend protocol + spec opener registry
+│   ├── tensorstore.py  # zarr v3 (sharded/unsharded) + precomputed (canonical view)
 │   ├── imagestack.py   # tifffile/imageio (read-only source)
-│   └── hdf5.py         # h5py (read/assemble)
+│   ├── hdf5.py         # h5py (read)
+│   └── view.py         # CropBackend: read-only crop/pad view over a source
 ├── engine.py        # block-map engine (output-block iteration, idempotent tasks)
-├── dask_runner.py   # start_dask (from cookbook) + block-task submission
-├── pyramid.py       # downsample schedule + type-aware reducers
-├── profiles.py      # storage target profiles (§5)
+├── dask_runner.py   # start_dask (from cookbook)
+├── pyramid.py       # downsample schedule + type-aware reducers + OME transforms
+├── profiles.py      # storage target profiles (§5) + create-spec builders
+├── ngff.py          # OME-NGFF 0.5 group metadata (build/validate/write)
 ├── ops/
-│   ├── ingest.py    # image stack -> volume (first slice)
-│   ├── convert.py   # same-res format -> format
-│   └── roi.py       # crop / pad / extract
+│   ├── _multiscale.py  # shared copy+pyramid loop; zarr3 & precomputed targets
+│   ├── ingest.py    # image stack -> multiscale volume
+│   ├── convert.py   # any source backend -> multiscale volume
+│   └── roi.py       # extract_roi: crop / pad (-> multiscale)
 └── cli.py           # (later)
+examples/run_convert_slurm.py   # Rusty/SLURM driver
 ```
