@@ -98,3 +98,42 @@ def zarr3_create_spec(
         spec["chunk_shape"] = chunk_full
         spec["inner_chunk_shape"] = None
     return spec
+
+
+def precomputed_create_spec(
+    profile: str | StorageProfile,
+    path: str,
+    canonical_shape: Sequence[int],
+    dtype: str,
+    *,
+    resolution_zyx: Sequence[float],
+    scale_index: int,
+    num_channels: int = 1,
+    chunk: Sequence[int] | None = None,
+    encoding: str = "raw",
+    type_: str = "image",
+    voxel_offset_zyx: Sequence[int] | None = None,
+) -> dict:
+    """Build a normalized neuroglancer-precomputed create spec (one scale).
+
+    ``canonical_shape``/``resolution_zyx``/``chunk`` are in canonical ``(z, y, x)``
+    order (with a leading channel axis when ``num_channels > 1``); the backend
+    reverses them to precomputed's native ``(x, y, z)``.
+    """
+    p = get_profile(profile)
+    if p.format != "neuroglancer_precomputed":
+        raise ValueError(f"profile format {p.format!r} is not precomputed")
+    spatial_chunk = tuple(chunk) if chunk is not None else p.chunk
+    return {
+        "backend": "neuroglancer_precomputed",
+        "path": path,
+        "shape": list(canonical_shape),
+        "dtype": dtype,
+        "resolution_zyx": list(resolution_zyx),
+        "chunk_zyx": list(spatial_chunk),
+        "num_channels": int(num_channels),
+        "encoding": encoding,
+        "type": type_,
+        "voxel_offset_zyx": list(voxel_offset_zyx) if voxel_offset_zyx else [0, 0, 0],
+        "scale_index": int(scale_index),
+    }

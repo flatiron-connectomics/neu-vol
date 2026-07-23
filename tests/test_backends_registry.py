@@ -18,14 +18,6 @@ def test_open_backend_missing_tag():
         open_backend({"path": "/tmp/x"})
 
 
-def test_precomputed_create_not_implemented(tmp_path):
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-
-    with pytest.raises(NotImplementedError):
-        TensorStoreBackend.create({"backend": "neuroglancer_precomputed",
-                                   "path": str(tmp_path / "p")})
-
-
 def test_open_missing_store_raises(tmp_path):
     with pytest.raises(Exception):
         open_backend({"backend": "zarr3", "path": str(tmp_path / "does-not-exist")})

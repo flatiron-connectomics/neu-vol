@@ -37,8 +37,18 @@ ingest_image_stack(
 )
 ```
 
-Output is read back cleanly by ngff-zarr's own reader (verified). Implemented:
-`VoxelMeta`, `Volume`, block-map engine, `start_dask`, TensorStore zarr v3 backend
-(sharded/unsharded), image-stack source, type-aware pyramids, storage profiles,
-OME-NGFF 0.5 metadata. Next: precomputed writer, `convert`/`roi` ops, HDF5 source,
-SLURM smoke test. See `docs/DESIGN.md` for the roadmap.
+`convert()` does the same from any source backend (zarr v3, precomputed, HDF5)
+to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel:
+
+```python
+from em_volume_tools import convert
+convert("in.zarr", "out.precomputed", voxel_size=(8, 8, 8),
+        profile="s3-neuroglancer", kind="segmentation")   # mode-downsampled pyramid
+```
+
+Implemented: `VoxelMeta`, `Volume`, block-map engine, `start_dask`, TensorStore
+zarr v3 (sharded/unsharded) **and** precomputed (canonical-axis view + multiscale
+`info`), image-stack source, type-aware pyramids, storage profiles, OME-NGFF 0.5
+metadata, `ingest`/`convert` ops. Outputs verified via ngff-zarr's reader (zarr)
+and TensorStore round-trip (precomputed). Next: `roi` (crop/pad), HDF5 source,
+SLURM smoke test. See `docs/DESIGN.md`.
