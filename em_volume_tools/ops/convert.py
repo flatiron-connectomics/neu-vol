@@ -14,7 +14,7 @@ import logging
 from typing import Any, Sequence
 
 from ..backends.base import open_backend
-from ..introspect import read_source_metadata
+from ..introspect import detect_backend, read_source_metadata
 from ._multiscale import materialize_multiscale
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ def convert(
     dst: str,
     *,
     voxel_size: Sequence[float] | None = None,
-    src_format: str = "zarr3",
+    src_format: str | None = None,
     units: str | None = None,
     axes: Sequence[str] | None = None,
     offset: Sequence[float] | None = None,
@@ -52,13 +52,23 @@ def convert(
 ) -> dict:
     """Convert ``src`` into a multiscale volume at ``dst``.
 
-    ``src`` is a path (opened with ``src_format``) or a full backend spec dict.
-    Metadata not passed explicitly is taken from the source where available;
-    ``voxel_size`` is required if the source carries none. With ``resume=True``
-    (zarr output only) an interrupted run continues, skipping already-written
-    blocks instead of recreating them.
+    ``src`` is a path or a full backend spec dict. For a path, ``src_format`` is
+    auto-detected (``info``->precomputed, ``zarr.json``->zarr3,
+    ``.zarray``/``.zgroup``->zarr2) unless given. Metadata not passed explicitly is
+    taken from the source where available; ``voxel_size`` is required if the source
+    carries none. With ``resume=True`` an interrupted run continues, skipping
+    already-done blocks instead of recreating them.
     """
-    src_spec = dict(src) if isinstance(src, dict) else {"backend": src_format, "path": src}
+    if isinstance(src, dict):
+        src_spec = dict(src)
+    else:
+        fmt = src_format or detect_backend(src)
+        if fmt is None:
+            raise ValueError(
+                f"could not detect source format at {src!r} (no info/zarr.json/.zarray); "
+                "pass src_format= explicitly"
+            )
+        src_spec = {"backend": fmt, "path": src}
     meta = read_source_metadata(src_spec)
 
     # The array/scale to actually read (level 0 of an OME group / finest precomputed scale).

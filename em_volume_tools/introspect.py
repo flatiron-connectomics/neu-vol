@@ -15,7 +15,25 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
-from .location import join, spec_kvstore
+from .location import join, spec_kvstore, to_kvstore
+
+
+def detect_backend(location: str | Mapping[str, Any]) -> str | None:
+    """Detect a source's format from its marker file (no data read).
+
+    ``info`` -> neuroglancer-precomputed; ``zarr.json`` -> zarr v3;
+    ``.zarray``/``.zgroup`` -> zarr v2. Returns ``None`` if none match.
+    """
+    kv = to_kvstore(location)
+    if "path" in kv and not str(kv["path"]).endswith("/"):
+        kv["path"] = str(kv["path"]) + "/"
+    if _read_key(kv, "info") is not None:
+        return "neuroglancer_precomputed"
+    if _read_key(kv, "zarr.json") is not None:
+        return "zarr3"
+    if _read_key(kv, ".zarray") is not None or _read_key(kv, ".zgroup") is not None:
+        return "zarr2"
+    return None
 
 
 def _kvstore_of(spec: Mapping[str, Any], *, trailing_slash: bool = True) -> dict[str, Any]:

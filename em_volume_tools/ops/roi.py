@@ -25,7 +25,7 @@ def extract_roi(
     stop: Sequence[int],
     voxel_size: Sequence[float],
     *,
-    src_format: str = "zarr3",
+    src_format: str | None = None,
     pad_value: float = 0,
     units: str = "nm",
     axes: Sequence[str] = ("z", "y", "x"),
@@ -56,7 +56,14 @@ def extract_roi(
     ``start`` may be negative and ``stop`` may exceed the source extent; the
     out-of-bounds margin is filled with ``pad_value`` (crop *and* pad in one).
     """
-    src_spec = dict(src) if isinstance(src, dict) else {"backend": src_format, "path": src}
+    if isinstance(src, dict):
+        src_spec = dict(src)
+    else:
+        from ..introspect import detect_backend
+        fmt = src_format or detect_backend(src)
+        if fmt is None:
+            raise ValueError(f"could not detect source format at {src!r}; pass src_format=")
+        src_spec = {"backend": fmt, "path": src}
     src_backend = open_backend(src_spec)
     src_shape = src_backend.shape
     n_spatial = len(axes)

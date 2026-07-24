@@ -20,10 +20,11 @@ import numpy as np
 
 from .base import Region, register_backend
 
-TAGS = ("zarr3", "neuroglancer_precomputed")
+TAGS = ("zarr3", "zarr2", "neuroglancer_precomputed")
 
 _TAG_TO_DRIVER = {
     "zarr3": "zarr3",
+    "zarr2": "zarr",   # TensorStore's zarr v2 driver (read source; no create here)
     "neuroglancer_precomputed": "neuroglancer_precomputed",
 }
 
@@ -159,6 +160,8 @@ class TensorStoreBackend:
             return cls(store, tag, kv)
         if tag == "neuroglancer_precomputed":
             return cls._create_precomputed(spec, kv, delete_existing=delete_existing)
+        if tag == "zarr2":
+            raise NotImplementedError("zarr2 is a read-only source; write zarr3 instead")
         raise ValueError(f"unknown backend {tag!r}")
 
     @classmethod
