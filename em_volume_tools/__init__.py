@@ -9,8 +9,9 @@ __version__ = "0.1.0"
 
 from .meta import VoxelMeta
 from .volume import Volume
-from .engine import Block, iter_blocks, block_map, idempotent
-from .dask_runner import start_dask
+# Orchestration substrate now lives in the shared em-blockrun package; re-export
+# the common names here for convenience / backward compatibility.
+from em_blockrun import Block, iter_blocks, block_map, idempotent, start_dask
 from .backends.base import ArrayBackend, open_backend, register_backend
 from .profiles import StorageProfile, PROFILES, get_profile
 from .ops import ingest_image_stack, convert, extract_roi

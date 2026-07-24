@@ -228,18 +228,27 @@ Use **pixi**, but relocate its heavy, high-inode storage off the GPFS home
 
 ## 9. Proposed module layout
 
+The dask/SLURM orchestration substrate lives in a **separate shared package,
+`em-blockrun`** (`../em-blockrun`, a pixi path dependency): `start_dask`,
+`block_map`, `Manifest`, `iter_blocks`/`Block`, `idempotent`, and the dask config
+templates. It has no EM/volume deps and is reused by other projects (e.g. the
+planned meshing package). `em_volume_tools` re-exports the common names for
+convenience.
+
 ```
-em_volume_tools/                # v1 IMPLEMENTED (45 tests)
+em_volume_tools/                # volume/EM-specific
 ├── volume.py        # Volume handle
 ├── meta.py          # VoxelMeta + coordinate/axis conversion
+├── location.py      # local/s3/gs/kvstore normalization + subpath join
+├── aws.py           # S3 credential bootstrap (tensorstore profile-provider workaround)
+├── introspect.py    # read source metadata + detect_backend (autodetect format)
 ├── backends/
 │   ├── base.py      # ArrayBackend protocol + spec opener registry
 │   ├── tensorstore.py  # zarr v3 (sharded/unsharded) + precomputed (canonical view)
 │   ├── imagestack.py   # tifffile/imageio (read-only source)
 │   ├── hdf5.py         # h5py (read)
-│   └── view.py         # CropBackend: read-only crop/pad view over a source
-├── engine.py        # block-map engine (output-block iteration, idempotent tasks)
-├── dask_runner.py   # start_dask (from cookbook)
+│   ├── view.py         # CropBackend: read-only crop/pad view over a source
+│   └── (zarr2 read via the tensorstore driver)
 ├── pyramid.py       # downsample schedule + type-aware reducers + OME transforms
 ├── profiles.py      # storage target profiles (§5) + create-spec builders
 ├── ngff.py          # OME-NGFF 0.5 group metadata (build/validate/write)
@@ -249,5 +258,12 @@ em_volume_tools/                # v1 IMPLEMENTED (45 tests)
 │   ├── convert.py   # any source backend -> multiscale volume
 │   └── roi.py       # extract_roi: crop / pad (-> multiscale)
 └── cli.py           # (later)
+
+../em-blockrun/em_blockrun/      # shared dask/SLURM substrate (no EM deps)
+├── dask_runner.py   # start_dask (LocalCluster / SLURMCluster from one config)
+├── engine.py        # block_map (client.map + as_completed), iter_blocks, Block, idempotent
+├── manifest.py      # Manifest (single-writer resume/intent log)
+└── configs/         # dask config templates (local / slurm-gen / slurm-any)
+
 examples/run_convert_slurm.py   # Rusty/SLURM driver
 ```

@@ -26,6 +26,7 @@ pyyaml = "*"               # dask-config.yaml loading
 
 [pypi-dependencies]
 em-volume-tools = { path = ".", editable = true }
+em-blockrun = { path = "../em-blockrun", editable = true }   # shared dask/SLURM chunked-map substrate
 
 [feature.dev.dependencies]
 pytest = "*"

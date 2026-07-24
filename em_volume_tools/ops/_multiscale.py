@@ -22,11 +22,11 @@ import functools
 import logging
 from typing import Any, Callable, Sequence
 
+from em_blockrun import Block, Manifest, block_map, iter_blocks
+
 from ..backends.base import Region, open_backend
 from ..backends.tensorstore import TensorStoreBackend
-from ..engine import Block, block_map, iter_blocks
 from ..location import default_progress_path, join, to_kvstore
-from ..manifest import Manifest
 from ..ngff import build_dataset, build_multiscales_attrs, ome_unit, validate_attrs, write_group_metadata
 from ..profiles import get_profile, precomputed_create_spec, zarr3_create_spec
 from ..pyramid import cumulative_factors, downsample_schedule, get_reducer, level_scale_translation
