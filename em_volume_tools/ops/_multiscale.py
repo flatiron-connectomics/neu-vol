@@ -89,7 +89,7 @@ def _run_level(manifest, level, backend, worker_factory, *, resume, verify, clie
     blocks = list(iter_blocks(backend.shape, backend.chunks))
     total = len(blocks)
     if resume and not verify:
-        done = manifest.done_indices(level)
+        done = manifest.done_keys(level)
         blocks = [b for b in blocks if b.index not in done]
     on_result = lambda res, lvl=level: manifest.record(lvl, res)  # noqa: E731
     block_map(blocks, worker_factory(verify=verify), client=client,
