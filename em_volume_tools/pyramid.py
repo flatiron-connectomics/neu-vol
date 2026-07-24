@@ -94,14 +94,29 @@ def mean_downsample(arr: np.ndarray, factors: Sequence[int]) -> np.ndarray:
     """Mask-weighted mean downsample (anti-aliasing); ragged edges use real voxels only.
 
     Integer dtypes are rounded; float dtypes preserved. For images/probabilities.
+
+    Memory-light: the per-window sum is accumulated at the *output* size (via
+    ``reduce(dtype=...)``) rather than upcasting the whole input region to
+    float64, and the validity mask is built only when a block is ragged. This
+    keeps a 512^3-block downsample at a few GB instead of ~30 GB (which
+    OOM-killed SLURM workers).
     """
     factors = tuple(int(f) for f in factors)
     pad = [(0, (-s) % f) for s, f in zip(arr.shape, factors)]
-    data = np.pad(arr.astype(np.float64), pad, mode="constant", constant_values=0.0)
-    mask = np.pad(np.ones(arr.shape, np.float64), pad, mode="constant", constant_values=0.0)
+    needs_pad = any(p[1] for p in pad)
+    a = np.pad(arr, pad, mode="constant", constant_values=0) if needs_pad else arr
     win = tuple(range(1, 2 * arr.ndim, 2))
-    total = _split_windows(data, factors).sum(axis=win)
-    count = _split_windows(mask, factors).sum(axis=win)
+
+    acc = np.float64 if np.issubdtype(arr.dtype, np.floating) else np.uint64
+    total = _split_windows(a, factors).sum(axis=win, dtype=acc)  # output-sized accumulator
+
+    if needs_pad:
+        mask = np.zeros(a.shape, np.uint8)
+        mask[tuple(slice(0, s) for s in arr.shape)] = 1
+        count = _split_windows(mask, factors).sum(axis=win, dtype=np.uint64)
+    else:
+        count = np.uint64(int(np.prod(factors)))
+
     res = total / count
     if np.issubdtype(arr.dtype, np.integer):
         return np.rint(res).astype(arr.dtype)
