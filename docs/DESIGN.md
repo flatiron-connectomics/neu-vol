@@ -154,6 +154,12 @@ For 2×2×2 into a 128³ block at uint64: input region 256³×8B ≈ 134 MB. Tun
 block size. Read cost is optimal — each level is read exactly once, total ≈
 `1.14·V` for isotropic 2×2×2.
 
+The reducers must accumulate at *output* size, not upcast the whole input
+region: `mean_downsample` sums via `reduce(dtype=...)` and only builds a
+validity mask for ragged blocks, keeping a 512³-block downsample at ~3 GB. An
+earlier version upcast the 1024³ input to float64 (data+mask ≈ 8.6 GB each,
+~30 GB/task) and OOM-killed SLURM workers.
+
 **Task granularity vs. sharding:** a zarr v3 shard is one file of many inner
 chunks; two workers writing different inner chunks of the *same* shard race on a
 read-modify-write with no cross-process lock. So for **sharded** outputs a task

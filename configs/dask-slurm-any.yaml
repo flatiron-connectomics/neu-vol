@@ -3,10 +3,10 @@
 # target node (icelake 64c / rome+icelake 1 TB), so it is eligible everywhere:
 #   cores <= 64  and  memory <= ~900GB.
 #
-# Per-task memory note: mean-downsample upcasts a 1024^3 input region to float64
-# (~2 x 8.6 GB) for a 512^3 output block, so ~30 GB/worker headroom is wanted.
-# processes=24 -> 900/24 = ~37 GB/worker (safe). See configs/dask-slurm-gen.yaml
-# for the genoa-only, fatter-node variant.
+# Per-task memory: a 512^3-block downsample now peaks ~3 GB (reducer accumulates
+# at output size), and the level-0 copy is ~0.5 GB. processes=24 -> ~37 GB/worker
+# is very comfortable; you could raise `processes` for more parallelism if memory
+# allows. See configs/dask-slurm-gen.yaml for the genoa-only, fatter-node variant.
 jobqueue:
   slurm:
     cores: 64               # <= icelake core count, so icelake is eligible too
