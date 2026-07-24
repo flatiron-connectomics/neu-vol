@@ -26,6 +26,13 @@ cookbook). This library provides the *volume* layer that sits on top of it.
 **Later (not v1):** brightness scaling / normalization, morphological ops
 (dilation/erosion) on segmentations, relabeling, channel algebra, CLI.
 
+**Planned — DVID source backend (~week of 2026-07-31):** fetch segmentation
+label arrays in chunks from a DVID server into precomputed/zarr. Implemented as a
+read-only `backends/dvid.py` (tag `"dvid"`) that slots into the existing source
+pattern, with the DVID client as an **optional dependency** (a PyPI extra +
+lazy import inside the backend, so it's never required). Details in the
+`dvid-source-todo` memory.
+
 **Explicitly out of scope:** meshing, skeletonization (separate library; this
 lib owns the multiscale *image/label arrays* that those attach to).
 
