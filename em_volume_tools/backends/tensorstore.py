@@ -31,11 +31,18 @@ _TAG_TO_DRIVER = {
 
 def _kvstore_from_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     if "kvstore" in spec:
-        return dict(spec["kvstore"])
-    if "path" in spec:
+        kv = dict(spec["kvstore"])
+    elif "path" in spec:
         from ..location import to_kvstore  # local path or s3://... URL
-        return to_kvstore(spec["path"])
-    raise ValueError("spec needs either 'kvstore' or 'path'")
+        kv = to_kvstore(spec["path"])
+    else:
+        raise ValueError("spec needs either 'kvstore' or 'path'")
+    if kv.get("driver") == "s3":
+        # tensorstore 0.1.84's profile provider can't read ~/.aws/credentials;
+        # bootstrap the environment provider from the file (no-op if env already set).
+        from ..aws import ensure_aws_credentials
+        ensure_aws_credentials()
+    return kv
 
 
 def _compressor_codec(name: str | None, level: int | None) -> list[dict[str, Any]]:
@@ -97,20 +104,29 @@ class TensorStoreBackend:
         self._tag = tag
         self._kvstore = dict(kvstore)
         self._scale_index = scale_index
-        self._scale_key_cache: str | None = None
+        self._scale_key_cache: dict | None = None
         self._view = self._canonical_view(store, tag)
 
     @staticmethod
     def _canonical_view(store: Any, tag: str) -> Any:
-        """Return a view in canonical (z,y,x)/(c,z,y,x) order."""
+        """Return a view in canonical (z,y,x)/(c,z,y,x) order, 0-based.
+
+        precomputed carries a global ``voxel_offset``, giving the store an
+        offset-based domain (e.g. [5118, 6142)). The engine emits 0-based blocks,
+        so we ``translate_to[0]`` — a pure index relabel (no data moves) — so the
+        view indexes from 0 like a zarr array. TensorStore still routes writes to
+        the correct voxel_offset-based chunks on disk.
+        """
         if tag != "neuroglancer_precomputed":
-            return store  # zarr3 arrays are created canonically
+            return store  # zarr3 arrays are created canonically and 0-based
         import tensorstore as ts
 
         num_channels = int(store.shape[-1])  # native (x, y, z, channel)
         if num_channels == 1:
-            return store[ts.d["channel"][0]].transpose([2, 1, 0])       # -> (z, y, x)
-        return store.transpose([3, 2, 1, 0])                            # -> (c, z, y, x)
+            view = store[ts.d["channel"][0]].transpose([2, 1, 0])       # -> (z, y, x)
+        else:
+            view = store.transpose([3, 2, 1, 0])                        # -> (c, z, y, x)
+        return view[ts.d[:].translate_to[0]]
 
     # -- construction ------------------------------------------------------
     @classmethod
@@ -233,14 +249,18 @@ class TensorStoreBackend:
         if self._tag == "zarr3":
             stats = self._view[region].storage_statistics(query_fully_stored=True).result()
             return bool(stats.fully_stored)
-        # neuroglancer_precomputed: <scale_key>/<x0>-<x1>_<y0>-<y1>_<z0>-<z1>
+        # neuroglancer_precomputed chunk key is global (voxel_offset-based); the
+        # region is 0-based (post-translate), so add voxel_offset back:
+        #   <scale_key>/<vx+x0>-<vx+x1>_<vy+y0>-<vy+y1>_<vz+z0>-<vz+z1>
+        sm = self._precomputed_scale_meta()
+        vx, vy, vz = sm.get("voxel_offset", [0, 0, 0])
         (z0, z1), (y0, y1), (x0, x1) = [(s.start, s.stop) for s in region[-3:]]
-        key = f"{self._precomputed_scale_key()}/{x0}-{x1}_{y0}-{y1}_{z0}-{z1}"
+        key = (f"{sm['key']}/{vx + x0}-{vx + x1}_{vy + y0}-{vy + y1}_{vz + z0}-{vz + z1}")
         return self._store.kvstore.read(key).result().state == "value"
 
-    def _precomputed_scale_key(self) -> str:
+    def _precomputed_scale_meta(self) -> dict:
         if self._scale_key_cache is None:
-            self._scale_key_cache = self._store.spec().to_json()["scale_metadata"]["key"]
+            self._scale_key_cache = self._store.spec().to_json()["scale_metadata"]
         return self._scale_key_cache
 
     def to_spec(self) -> dict[str, Any]:
