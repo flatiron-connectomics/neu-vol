@@ -46,6 +46,8 @@ def convert(
     npartitions: int | None = None,
     delete_existing: bool = False,
     resume: bool = False,
+    verify: bool = False,
+    progress_path: str | None = None,
     validate: bool = True,
 ) -> dict:
     """Convert ``src`` into a multiscale volume at ``dst``.
@@ -121,5 +123,7 @@ def convert(
         npartitions=npartitions,
         delete_existing=delete_existing,
         resume=resume,
+        verify=verify,
+        progress_path=progress_path,
         validate=validate,
     )

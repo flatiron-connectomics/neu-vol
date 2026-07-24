@@ -40,6 +40,8 @@ def ingest_image_stack(
     npartitions: int | None = None,
     delete_existing: bool = False,
     resume: bool = False,
+    verify: bool = False,
+    progress_path: str | None = None,
     validate: bool = True,
 ) -> dict:
     """Ingest ``src`` image stack into a multiscale zarr v3 group at ``dst``.
@@ -77,5 +79,7 @@ def ingest_image_stack(
         npartitions=npartitions,
         delete_existing=delete_existing,
         resume=resume,
+        verify=verify,
+        progress_path=progress_path,
         validate=validate,
     )

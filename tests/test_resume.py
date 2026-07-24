@@ -70,10 +70,32 @@ def test_resume_completes_partial_run(tmp_path):
     np.testing.assert_array_equal(_full(lvl0), vol)
 
 
-def test_resume_unsupported_for_precomputed(tmp_path):
-    vol = np.zeros((8, 8, 8), np.uint8)
-    src = str(tmp_path / "src.zarr")
-    _make_zarr(src, vol)
-    with pytest.raises(NotImplementedError, match="resume is not supported for precomputed"):
-        convert(src, str(tmp_path / "o.precomputed"), voxel_size=(8, 8, 8),
-                profile="s3-neuroglancer", chunk=(8, 8, 8), multiscale=False, resume=True)
+def test_resume_precomputed_via_manifest(tmp_path):
+    # precomputed resume now works via the manifest (not storage_statistics)
+    seg = np.random.default_rng(12).integers(1, 9, (16, 12, 8), dtype=np.uint64)
+    src = str(tmp_path / "seg.zarr")
+    _make_zarr(src, seg)
+    dst = str(tmp_path / "seg.precomputed")
+
+    convert(src, dst, voxel_size=(8, 8, 8), profile="s3-neuroglancer", kind="segmentation",
+            chunk=(8, 8, 8), min_dim=8, resume=True)
+    # relaunch: manifest says done -> nothing recomputed, data intact
+    convert(src, dst, voxel_size=(8, 8, 8), profile="s3-neuroglancer", kind="segmentation",
+            chunk=(8, 8, 8), min_dim=8, resume=True)
+
+    s0 = open_backend({"backend": "neuroglancer_precomputed", "path": dst, "scale_index": 0})
+    np.testing.assert_array_equal(s0.read_region(tuple(slice(0, s) for s in s0.shape)), seg)
+
+
+def test_verify_precomputed_object_check(tmp_path):
+    # verify=True uses the kvstore chunk-existence check (is_region_stored) for precomputed
+    seg = np.random.default_rng(13).integers(1, 9, (8, 8, 8), dtype=np.uint64)
+    src = str(tmp_path / "s.zarr")
+    _make_zarr(src, seg)
+    dst = str(tmp_path / "v.precomputed")
+    convert(src, dst, voxel_size=(8, 8, 8), profile="s3-neuroglancer", kind="segmentation",
+            chunk=(8, 8, 8), multiscale=False)
+    # second pass with verify: block already present -> skipped
+    summary = convert(src, dst, voxel_size=(8, 8, 8), profile="s3-neuroglancer", kind="segmentation",
+                      chunk=(8, 8, 8), multiscale=False, verify=True)
+    assert summary["status_counts"].get("skipped", 0) >= 1

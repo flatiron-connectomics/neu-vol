@@ -50,32 +50,61 @@ def iter_blocks(shape: Sequence[int], chunks: Sequence[int]) -> Iterator[Block]:
         yield Block(index=index, region=region)
 
 
+def _apply_batch(batch: Sequence[Block], fn: Callable[[Block], Any]) -> list[Any]:
+    """Run ``fn`` over a batch of blocks (one dask task per batch)."""
+    return [fn(b) for b in batch]
+
+
 def block_map(
     blocks: Sequence[Block],
     fn: Callable[[Block], Any],
     *,
     client: Any | None = None,
     npartitions: int | None = None,
+    on_result: Callable[[list[Any]], None] | None = None,
 ) -> list[Any]:
     """Apply ``fn`` to each block, returning the per-block results.
 
     ``fn`` must be top-level / picklable and should return a *small* status value
     (write big outputs to the store, not back through the scheduler).
 
+    ``on_result``, if given, is called with each completed group's results as they
+    arrive — used to persist progress to a manifest incrementally so a mid-run
+    death still leaves an accurate record.
+
     If ``client`` is ``None``, runs serially in-process (ideal for smoke tests).
-    Otherwise dispatches via ``dask.bag`` under the active distributed client
-    (see :func:`em_volume_tools.dask_runner.start_dask`).
+    Otherwise batches blocks and dispatches via ``client.map`` + ``as_completed``
+    under the active distributed client, so results stream back for durable
+    progress (rather than the all-or-nothing of ``bag.compute()``).
     """
     blocks = list(blocks)
+    if not blocks:
+        return []
     if client is None:
-        return [fn(b) for b in blocks]
+        results = []
+        for b in blocks:
+            r = fn(b)
+            results.append(r)
+            if on_result is not None:
+                on_result([r])
+        return results
 
-    import dask.bag as db
+    from dask.distributed import as_completed
 
-    n = npartitions or len(blocks)
-    n = max(1, min(n, len(blocks)))
-    bag = db.from_sequence(blocks, npartitions=n).map(fn)
-    return list(bag.compute())
+    n_batches = npartitions or min(len(blocks), 512)
+    n_batches = max(1, min(n_batches, len(blocks)))
+    # round-robin split balances cost across batches (adjacent blocks are similar)
+    batches = [b for b in (blocks[i::n_batches] for i in range(n_batches)) if b]
+    futures = client.map(_apply_batch, batches, fn=fn, pure=False)
+
+    results: list[Any] = []
+    for fut in as_completed(futures):
+        res = fut.result()
+        if on_result is not None:
+            on_result(res)
+        results.extend(res)
+        fut.release()
+    return results
 
 
 def idempotent(

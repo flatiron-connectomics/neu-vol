@@ -13,17 +13,13 @@ Returned dict keys: ``data_spec`` (the array/scale spec to actually read),
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Mapping
+
+from .location import join, spec_kvstore
 
 
 def _kvstore_of(spec: Mapping[str, Any], *, trailing_slash: bool = True) -> dict[str, Any]:
-    if "kvstore" in spec:
-        kv = dict(spec["kvstore"])
-    elif "path" in spec:
-        kv = {"driver": "file", "path": str(spec["path"])}
-    else:
-        raise ValueError("spec needs 'kvstore' or 'path'")
+    kv = spec_kvstore(spec)  # handles 'kvstore', local 'path', and s3://... URLs
     if trailing_slash and "path" in kv and not str(kv["path"]).endswith("/"):
         kv["path"] = str(kv["path"]) + "/"
     return kv
@@ -48,12 +44,6 @@ def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
     return None
 
 
-def _base_path(spec: Mapping[str, Any]) -> str:
-    if "path" in spec:
-        return str(spec["path"])
-    return str(spec["kvstore"]["path"])
-
-
 def _read_zarr_ome(spec: Mapping[str, Any]) -> dict | None:
     raw = _read_key(_kvstore_of(spec), "zarr.json")
     if raw is None:
@@ -74,7 +64,7 @@ def _read_zarr_ome(spec: Mapping[str, Any]) -> dict | None:
     spatial = [i for i, a in enumerate(axes) if a.get("type") == "space"]
     has_channels = any(a.get("type") == "channel" for a in axes)
     return {
-        "data_spec": {"backend": "zarr3", "path": os.path.join(_base_path(spec), ds0["path"])},
+        "data_spec": {"backend": "zarr3", "kvstore": join(spec_kvstore(spec), ds0["path"])},
         "voxel_size": tuple(scale[i] for i in spatial),
         "offset": tuple(translation[i] for i in spatial),
         "units": axes[spatial[0]].get("unit"),
@@ -98,7 +88,7 @@ def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
     nch = int(info.get("num_channels", 1))
     return {
         "data_spec": {"backend": "neuroglancer_precomputed",
-                      "path": _base_path(spec), "scale_index": idx},
+                      "kvstore": spec_kvstore(spec), "scale_index": idx},
         "voxel_size": voxel_size,
         "offset": offset,
         "units": "nm",

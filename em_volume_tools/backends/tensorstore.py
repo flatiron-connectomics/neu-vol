@@ -32,7 +32,8 @@ def _kvstore_from_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     if "kvstore" in spec:
         return dict(spec["kvstore"])
     if "path" in spec:
-        return {"driver": "file", "path": str(spec["path"])}
+        from ..location import to_kvstore  # local path or s3://... URL
+        return to_kvstore(spec["path"])
     raise ValueError("spec needs either 'kvstore' or 'path'")
 
 
@@ -95,6 +96,7 @@ class TensorStoreBackend:
         self._tag = tag
         self._kvstore = dict(kvstore)
         self._scale_index = scale_index
+        self._scale_key_cache: str | None = None
         self._view = self._canonical_view(store, tag)
 
     @staticmethod
@@ -218,20 +220,25 @@ class TensorStoreBackend:
         self._view[region].write(data).result()
 
     def is_region_stored(self, region: Region) -> bool:
-        """True if every chunk in ``region`` is already written (for resume).
+        """True if ``region`` is already fully written (authoritative, for verify).
 
-        Uses TensorStore's storage_statistics. Not available for precomputed
-        output: that driver's storage_statistics is broken in this TensorStore
-        version (malformed keys), so resume must target zarr output.
+        zarr3 uses TensorStore's ``storage_statistics``. precomputed's
+        storage_statistics is broken in this TensorStore version, so we check the
+        chunk object directly via the kvstore (valid for unsharded precomputed
+        where one engine block == one chunk, which is our S3 case).
         """
-        if self._tag != "zarr3":
-            raise NotImplementedError(
-                f"resume is not supported for {self._tag!r} output "
-                "(TensorStore storage_statistics is broken for it); "
-                "use delete_existing=True for precomputed targets"
-            )
-        stats = self._view[region].storage_statistics(query_fully_stored=True).result()
-        return bool(stats.fully_stored)
+        if self._tag == "zarr3":
+            stats = self._view[region].storage_statistics(query_fully_stored=True).result()
+            return bool(stats.fully_stored)
+        # neuroglancer_precomputed: <scale_key>/<x0>-<x1>_<y0>-<y1>_<z0>-<z1>
+        (z0, z1), (y0, y1), (x0, x1) = [(s.start, s.stop) for s in region[-3:]]
+        key = f"{self._precomputed_scale_key()}/{x0}-{x1}_{y0}-{y1}_{z0}-{z1}"
+        return self._store.kvstore.read(key).result().state == "value"
+
+    def _precomputed_scale_key(self) -> str:
+        if self._scale_key_cache is None:
+            self._scale_key_cache = self._store.spec().to_json()["scale_metadata"]["key"]
+        return self._scale_key_cache
 
     def to_spec(self) -> dict[str, Any]:
         spec: dict[str, Any] = {"backend": self._tag, "kvstore": dict(self._kvstore)}

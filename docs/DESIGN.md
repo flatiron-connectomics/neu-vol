@@ -77,11 +77,22 @@ via one YAML config).
 
 Rules (from the cookbook gotchas):
 - **Idempotent tasks** — skip an output block already written; enables
-  resume-by-relaunch and `walltime` growth across restarts. Implemented via
-  `resume=True` on the ops: a block is skipped when TensorStore's
-  `storage_statistics` reports its region fully stored. **zarr output only** —
-  that call is broken for the precomputed driver in tensorstore 0.1.84, so
-  precomputed resume raises (use `delete_existing=True`).
+  resume-by-relaunch and `walltime` growth across restarts. Resume is
+  **manifest-based** (`resume=True`): the driver is the single writer, and as
+  per-block results stream back (`client.map` + `as_completed`) it appends each
+  block's status to a JSONL manifest (`location.default_progress_path`, on ceph /
+  next to a local dst). On resume the ops filter out already-done blocks before
+  dispatch — no per-object scan, works for **both** zarr and precomputed, and
+  records intent so empty chunks aren't reprocessed. `verify=True` instead checks
+  storage authoritatively per block (zarr via `storage_statistics`; precomputed
+  via a kvstore chunk-key existence check, since its `storage_statistics` is
+  broken in tensorstore 0.1.84).
+- **Empty-chunk elision** — a block equal to the fill value (0) is not written
+  (read back as fill) and recorded as `empty`. Keeps sparse segmentations small.
+- **Destinations are locations** — `location.to_kvstore` maps local paths /
+  `s3://` / `gs://` / kvstore dicts to TensorStore kvstores; ops join subpaths and
+  write group metadata through them, so S3 works with no code change (creds via
+  `AWS_*` env or `~/.aws`).
 - **No big arrays through the scheduler** — workers write to the store, return
   small status tuples.
 - **Thread-pinned single-thread workers**; disable dask memory manager with

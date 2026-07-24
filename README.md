@@ -58,6 +58,28 @@ profiles, OME-NGFF 0.5 metadata, and the `ingest` / `convert` / `extract_roi` op
 Outputs verified via ngff-zarr's reader (zarr) and TensorStore round-trip
 (precomputed); the distributed path is exercised over a real `LocalCluster`.
 
+## S3 / object stores
+
+Destinations can be local paths, `s3://bucket/prefix` URLs, or kvstore dicts (for
+region/endpoint control) — TensorStore handles the transport. Credentials come
+from the environment (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) or `~/.aws`.
+
+```python
+convert("seg.zarr", "s3://my-bucket/seg/sample3.precomputed",
+        profile="s3-neuroglancer", kind="segmentation", resume=True)
+```
+
+See `examples/convert_to_s3.py` (incl. notes on propagating creds to SLURM workers).
+
+## Resume & sparsity
+
+`resume=True` makes a run continue after an interruption via a **single-writer
+manifest** (the driver records each completed block as results stream back), so no
+per-object existence scan is needed and it works for **both** zarr and precomputed.
+All-fill (e.g. all-zero) chunks are **elided** (not written) and recorded as
+`empty`, so sparse segmentations stay small and resume never reprocesses them.
+`verify=True` instead checks storage authoritatively per block.
+
 ## Running on the cluster
 
 The same ops run across SLURM workers by passing a `client` from `start_dask`.

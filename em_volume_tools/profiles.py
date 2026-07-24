@@ -14,7 +14,9 @@ overridable at call sites.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Mapping, Sequence
+
+from .location import to_kvstore
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,7 @@ def _with_channel(spatial: Sequence[int], num_channels: int, has_channels: bool)
 
 def zarr3_create_spec(
     profile: str | StorageProfile,
-    path: str,
+    location: str | Mapping[str, Any],
     shape: Sequence[int],
     dtype: str,
     *,
@@ -65,8 +67,9 @@ def zarr3_create_spec(
 ) -> dict:
     """Build a normalized zarr3 create spec (for ``TensorStoreBackend.create``).
 
-    ``chunk``/``shard`` override the profile's spatial values. A leading channel
-    axis (full extent) is added automatically when ``has_channels``.
+    ``location`` is a local path, ``s3://…`` URL, or kvstore dict. ``chunk``/
+    ``shard`` override the profile's spatial values. A leading channel axis (full
+    extent) is added automatically when ``has_channels``.
     """
     p = get_profile(profile)
     if p.format != "zarr3":
@@ -78,7 +81,7 @@ def zarr3_create_spec(
     chunk_full = _with_channel(spatial_chunk, num_channels, has_channels)
     spec: dict = {
         "backend": "zarr3",
-        "path": path,
+        "kvstore": to_kvstore(location),
         "shape": list(shape),
         "dtype": dtype,
         "compressor": p.compressor,
@@ -102,7 +105,7 @@ def zarr3_create_spec(
 
 def precomputed_create_spec(
     profile: str | StorageProfile,
-    path: str,
+    location: str | Mapping[str, Any],
     canonical_shape: Sequence[int],
     dtype: str,
     *,
@@ -129,7 +132,7 @@ def precomputed_create_spec(
     spatial_chunk = tuple(chunk) if chunk is not None else p.chunk
     spec = {
         "backend": "neuroglancer_precomputed",
-        "path": path,
+        "kvstore": to_kvstore(location),
         "shape": list(canonical_shape),
         "dtype": dtype,
         "resolution_zyx": list(resolution_zyx),
