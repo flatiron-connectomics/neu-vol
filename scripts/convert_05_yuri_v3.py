@@ -15,7 +15,11 @@ Usage
   #    launched from a workstation so it survives logout:
   nohup pixi run -e dev python -u scripts/convert_05_yuri_v3.py full \
       --config configs/dask-slurm-gen.yaml --workers 48 > yuri_v3.log 2>&1 &
-  squeue -u "$USER"          # monitor (read-only)
+  squeue -u "$USER"          # monitor jobs (read-only)
+
+  # progress (written chunks per level), from any terminal:
+  pixi run -e dev python scripts/zarr_progress.py
+  # ...and the dask dashboard URL is printed in the log at startup.
 
 Resume: the full run is resume-safe (resume=True) -- if it dies (walltime, node
 failure), just relaunch the same command and it skips already-written blocks.
