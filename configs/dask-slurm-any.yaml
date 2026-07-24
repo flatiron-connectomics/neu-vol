@@ -1,0 +1,35 @@
+# Rusty `gen` partition, node-type-agnostic (no --constraint) so the job starts on
+# whatever CPU nodes are free (genoa / rome / icelake). Sized to fit the *smallest*
+# target node (icelake 64c / rome+icelake 1 TB), so it is eligible everywhere:
+#   cores <= 64  and  memory <= ~900GB.
+#
+# Per-task memory note: mean-downsample upcasts a 1024^3 input region to float64
+# (~2 x 8.6 GB) for a 512^3 output block, so ~30 GB/worker headroom is wanted.
+# processes=24 -> 900/24 = ~37 GB/worker (safe). See configs/dask-slurm-gen.yaml
+# for the genoa-only, fatter-node variant.
+jobqueue:
+  slurm:
+    cores: 64               # <= icelake core count, so icelake is eligible too
+    processes: 24           # ~37 GB/worker at 900 GB
+    memory: 900GB           # <= 1 TB so rome/icelake are eligible
+    walltime: "12:00:00"
+
+    account: your-account            # -A  (Center for Computational Neuroscience) -- EDIT if wrong
+    queue: gen              # --partition
+    # NO job-extra-directives / --constraint: let SLURM pick any free CPU node type.
+
+    name: em-volume-tools
+    log-directory: /path/to/scratch/dask-job-logs
+
+distributed:
+  scheduler:
+    work-stealing: true
+  worker:
+    memory:
+      target: false
+      spill: false
+      pause: false
+      terminate: false
+  admin:
+    tick:
+      limit: 3h
