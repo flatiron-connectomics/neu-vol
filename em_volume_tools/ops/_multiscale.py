@@ -36,9 +36,12 @@ def _input_region(out_region: Region, factor: Sequence[int], src_shape: Sequence
     )
 
 
-def _copy_block(block: Block, *, src_spec: dict, dst_spec: dict, out_dtype: str) -> tuple:
-    src = open_backend(src_spec)
+def _copy_block(block: Block, *, src_spec: dict, dst_spec: dict, out_dtype: str,
+                resume: bool = False) -> tuple:
     dst = open_backend(dst_spec)
+    if resume and dst.is_region_stored(block.region):
+        return ("skip", block.index)
+    src = open_backend(src_spec)
     data = src.read_region(block.region)
     if str(data.dtype) != out_dtype:
         data = data.astype(out_dtype)
@@ -47,9 +50,11 @@ def _copy_block(block: Block, *, src_spec: dict, dst_spec: dict, out_dtype: str)
 
 
 def _downsample_block(block: Block, *, src_spec: dict, dst_spec: dict,
-                      factor: tuple, kind: str) -> tuple:
-    src = open_backend(src_spec)
+                      factor: tuple, kind: str, resume: bool = False) -> tuple:
     dst = open_backend(dst_spec)
+    if resume and dst.is_region_stored(block.region):
+        return ("skip", block.index)
+    src = open_backend(src_spec)
     data = src.read_region(_input_region(block.region, factor, src.shape))
     out = get_reducer(kind)(data, factor)
     dst.write_region(block.region, out)
@@ -83,6 +88,7 @@ def _run_multiscale(
     create_level: Callable[[int, Sequence[int], Sequence[int]], TensorStoreBackend],
     client: Any | None,
     npartitions: int | None,
+    resume: bool = False,
 ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]]]:
     """Create + fill each level. Returns (level_shapes, cumulative_factors)."""
     src_shape = tuple(int(s) for s in src_shape)
@@ -93,7 +99,7 @@ def _run_multiscale(
     prev_spec = lvl0.to_spec()
     blocks = list(iter_blocks(lvl0.shape, lvl0.chunks))
     block_map(blocks, functools.partial(_copy_block, src_spec=src_spec,
-                                        dst_spec=prev_spec, out_dtype=out_dtype),
+                                        dst_spec=prev_spec, out_dtype=out_dtype, resume=resume),
               client=client, npartitions=npartitions)
     logger.info("level 0: shape=%s chunks=%s (%d blocks)", lvl0.shape, lvl0.chunks, len(blocks))
 
@@ -116,7 +122,7 @@ def _run_multiscale(
         lvl_spec = lvl.to_spec()
         blocks = list(iter_blocks(lvl.shape, lvl.chunks))
         block_map(blocks, functools.partial(_downsample_block, src_spec=prev_spec,
-                                            dst_spec=lvl_spec, factor=ff, kind=kind),
+                                            dst_spec=lvl_spec, factor=ff, kind=kind, resume=resume),
                   client=client, npartitions=npartitions)
         logger.info("level %d: shape=%s factor=%s (%d blocks)", i, lvl_shape, ff, len(blocks))
         level_shapes.append(lvl_shape)
@@ -134,6 +140,7 @@ def materialize_zarr_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
+    resume=False,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),  # precomputed-only; ignored here
 ) -> dict:
     prof = get_profile(profile)
@@ -142,11 +149,11 @@ def materialize_zarr_multiscale(
     dim_names = (["c"] + list(spatial_axes)) if has_channels else list(spatial_axes)
 
     def create_level(i, shape, cum):
-        return TensorStoreBackend.create(
+        return TensorStoreBackend.open_or_create(
             zarr3_create_spec(prof, os.path.join(dst, str(i)), shape, out_dtype,
                               has_channels=has_channels, num_channels=num_channels,
                               dimension_names=dim_names, chunk=chunk, shard=shard),
-            delete_existing=delete_existing,
+            resume=resume, delete_existing=delete_existing,
         )
 
     level_shapes, cum = _run_multiscale(
@@ -154,6 +161,7 @@ def materialize_zarr_multiscale(
         has_channels=has_channels, n_spatial=len(spatial_axes), voxel_size=voxel_size,
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
+        resume=resume,
     )
 
     datasets, scales = [], []
@@ -189,8 +197,14 @@ def materialize_precomputed_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
+    resume=False,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),
 ) -> dict:
+    if resume:
+        raise NotImplementedError(
+            "resume is not supported for precomputed output (TensorStore "
+            "storage_statistics is broken for that driver); use delete_existing=True"
+        )
     prof = get_profile(profile)
     out_dtype = dtype or str(src_dtype)
     dst = dst.rstrip("/")

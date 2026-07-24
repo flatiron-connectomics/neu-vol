@@ -17,9 +17,9 @@ Usage
       --config configs/dask-slurm-gen.yaml --workers 48 > yuri_v3.log 2>&1 &
   squeue -u "$USER"          # monitor (read-only)
 
-NOTE: this pipeline is not yet resume-safe -- a killed full run recreates levels
-from scratch (delete_existing=True). Size walltime accordingly, or ask to add
-idempotent resume before the full run.
+Resume: the full run is resume-safe (resume=True) -- if it dies (walltime, node
+failure), just relaunch the same command and it skips already-written blocks.
+Use --fresh to wipe and restart from scratch instead.
 """
 
 from __future__ import annotations
@@ -110,7 +110,9 @@ def run_full(args):
         summary = convert(
             source_spec(), DST, profile=out_profile(), kind=KIND, chunk=CHUNK,
             multiscale=True, min_dim=args.min_dim, client=client,
-            npartitions=args.npartitions, delete_existing=True,
+            npartitions=args.npartitions,
+            resume=not args.fresh,          # relaunch continues; skips written blocks
+            delete_existing=args.fresh,     # --fresh wipes and restarts
             validate=False,  # schema already proven in tests; avoids driver-side net dependency
         )
     log.info("done: %d levels, shapes=%s", summary["num_levels"], summary["level_shapes"])
@@ -128,6 +130,8 @@ def main():
                     help="stop adding pyramid levels once max spatial dim <= this")
     ap.add_argument("--npartitions", type=int, default=None,
                     help="dask partitions per block-map (default: one per block)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="full mode: wipe and restart instead of resuming an interrupted run")
     args = ap.parse_args()
     (run_test if args.mode == "test" else run_full)(args)
 

@@ -45,13 +45,16 @@ def convert(
     client: Any | None = None,
     npartitions: int | None = None,
     delete_existing: bool = False,
+    resume: bool = False,
     validate: bool = True,
 ) -> dict:
     """Convert ``src`` into a multiscale volume at ``dst``.
 
     ``src`` is a path (opened with ``src_format``) or a full backend spec dict.
     Metadata not passed explicitly is taken from the source where available;
-    ``voxel_size`` is required if the source carries none.
+    ``voxel_size`` is required if the source carries none. With ``resume=True``
+    (zarr output only) an interrupted run continues, skipping already-written
+    blocks instead of recreating them.
     """
     src_spec = dict(src) if isinstance(src, dict) else {"backend": src_format, "path": src}
     meta = read_source_metadata(src_spec)
@@ -117,5 +120,6 @@ def convert(
         client=client,
         npartitions=npartitions,
         delete_existing=delete_existing,
+        resume=resume,
         validate=validate,
     )

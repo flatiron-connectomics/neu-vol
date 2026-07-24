@@ -46,6 +46,7 @@ def extract_roi(
     client: Any | None = None,
     npartitions: int | None = None,
     delete_existing: bool = False,
+    resume: bool = False,
     validate: bool = True,
 ) -> dict:
     """Extract ``src[start:stop]`` (spatial) into a new volume at ``dst``.
@@ -92,5 +93,5 @@ def extract_roi(
         multiscale=multiscale,
         factors=factors, max_levels=max_levels, min_dim=min_dim, name=name,
         chunk=chunk, shard=shard, client=client, npartitions=npartitions,
-        delete_existing=delete_existing, validate=validate,
+        delete_existing=delete_existing, resume=resume, validate=validate,
     )

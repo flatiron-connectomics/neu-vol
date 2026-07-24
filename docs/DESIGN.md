@@ -77,7 +77,11 @@ via one YAML config).
 
 Rules (from the cookbook gotchas):
 - **Idempotent tasks** — skip an output block already written; enables
-  resume-by-relaunch and `walltime` growth across restarts.
+  resume-by-relaunch and `walltime` growth across restarts. Implemented via
+  `resume=True` on the ops: a block is skipped when TensorStore's
+  `storage_statistics` reports its region fully stored. **zarr output only** —
+  that call is broken for the precomputed driver in tensorstore 0.1.84, so
+  precomputed resume raises (use `delete_existing=True`).
 - **No big arrays through the scheduler** — workers write to the store, return
   small status tuples.
 - **Thread-pinned single-thread workers**; disable dask memory manager with

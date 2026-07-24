@@ -124,6 +124,27 @@ class TensorStoreBackend:
         return cls(store, tag, kv, scale_index)
 
     @classmethod
+    def open_or_create(cls, spec: Mapping[str, Any], *, resume: bool,
+                       delete_existing: bool = False) -> "TensorStoreBackend":
+        """Create the store, or (when ``resume``) open it if it already exists.
+
+        On resume, an existing store with a matching shape is opened (so already
+        written blocks survive); otherwise it is created fresh.
+        """
+        if not resume:
+            return cls.create(spec, delete_existing=delete_existing)
+        reopen: dict[str, Any] = {"backend": spec["backend"], "kvstore": _kvstore_from_spec(spec)}
+        if spec["backend"] == "neuroglancer_precomputed" and "scale_index" in spec:
+            reopen["scale_index"] = spec["scale_index"]
+        try:
+            be = cls.open(reopen)
+            if tuple(int(s) for s in be.shape) == tuple(int(s) for s in spec["shape"]):
+                return be
+        except Exception:
+            pass
+        return cls.create(spec, delete_existing=False)
+
+    @classmethod
     def create(cls, spec: Mapping[str, Any], *, delete_existing: bool = False) -> "TensorStoreBackend":
         import tensorstore as ts
 
@@ -195,6 +216,22 @@ class TensorStoreBackend:
 
     def write_region(self, region: Region, data: np.ndarray) -> None:
         self._view[region].write(data).result()
+
+    def is_region_stored(self, region: Region) -> bool:
+        """True if every chunk in ``region`` is already written (for resume).
+
+        Uses TensorStore's storage_statistics. Not available for precomputed
+        output: that driver's storage_statistics is broken in this TensorStore
+        version (malformed keys), so resume must target zarr output.
+        """
+        if self._tag != "zarr3":
+            raise NotImplementedError(
+                f"resume is not supported for {self._tag!r} output "
+                "(TensorStore storage_statistics is broken for it); "
+                "use delete_existing=True for precomputed targets"
+            )
+        stats = self._view[region].storage_statistics(query_fully_stored=True).result()
+        return bool(stats.fully_stored)
 
     def to_spec(self) -> dict[str, Any]:
         spec: dict[str, Any] = {"backend": self._tag, "kvstore": dict(self._kvstore)}
