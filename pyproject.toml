@@ -9,9 +9,23 @@ description = "Chunked I/O, conversion, and multiscale generation for large 3D E
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Erik Schomburg", email = "eschomburg@flatironinstitute.org" }]
-# Runtime dependencies are provided by conda-forge via pixi (see pixi.toml),
-# so they are intentionally not duplicated here.
-dependencies = []
+# In the shared conda env these come from conda-forge, so install with
+# `pip install --no-deps -e .` to keep pip from re-resolving them.
+dependencies = [
+    "numpy>=2",
+    "tensorstore>=0.1.70", # zarr v3 array data + neuroglancer-precomputed
+    "ngff-zarr>=0.39",     # OME-Zarr / OME-NGFF 0.5 multiscale group metadata
+    "zarr>=3",             # ngff-zarr's array backend; v3 metadata is required
+    "jsonschema",          # ngff_zarr.validate() in ngff.validate_attrs — not
+                           # optional: convert()/extract_roi() default validate=True
+    "h5py",                # HDF5 chunk shards
+    "tifffile",            # TIFF (multi-file + multipage) sources
+    "imageio",             # PNG / misc 2D image sources
+    "em-blockrun",         # shared dask/SLURM chunked-map substrate
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["em_volume_tools"]

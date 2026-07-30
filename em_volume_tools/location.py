@@ -49,6 +49,124 @@ def spec_kvstore(spec: Mapping[str, Any]) -> dict[str, Any]:
     raise ValueError("spec needs 'kvstore' or 'path'")
 
 
+def is_local(location: str | Mapping[str, Any]) -> bool:
+    """True if ``location`` resolves to an ordinary filesystem path.
+
+    Callers that genuinely need POSIX semantics (sqlite, append-in-place logs,
+    ``os.replace``) use this to reject object-store locations up front with a
+    clear message, rather than failing deep inside a write.
+    """
+    return to_kvstore(location).get("driver") == "file"
+
+
+def local_path(location: str | Mapping[str, Any]) -> str:
+    """The filesystem path for a local location; raises if it is remote."""
+    kv = to_kvstore(location)
+    if kv.get("driver") != "file":
+        raise ValueError(
+            f"{location!r} is not a local path (driver={kv.get('driver')!r}); "
+            "this operation needs a filesystem")
+    return str(kv.get("path", ""))
+
+
+# --------------------------------------------------------------------------- #
+# Byte / JSON I/O over a kvstore
+#
+# One code path for local files and object stores, so callers never branch on
+# the destination. Note the file driver creates missing parent directories on
+# write, so these replace `os.makedirs` + `open` rather than supplementing it.
+# --------------------------------------------------------------------------- #
+def ensure_credentials(kvstore: Mapping[str, Any]) -> dict[str, Any]:
+    """Bootstrap object-store credentials for a kvstore that is about to be opened.
+
+    **Call this at every point where a store is opened, not where a spec is
+    built.** tensorstore 0.1.84's S3 *profile* provider cannot read
+    ``~/.aws/credentials``, so ``aws.ensure_aws_credentials`` copies the profile
+    into ``AWS_*`` env vars for its *environment* provider — which means the
+    bootstrap is **per process**, and a process that skips it gets a 403 on every
+    write. That failure mode is nasty on dask: whether a given worker has
+    bootstrapped depends on whether it happened to open an S3 store earlier in the
+    run, so the same code path succeeds on some workers and 403s on others, and
+    which is which changes with worker startup timing.
+    """
+    kv = dict(kvstore)
+    if kv.get("driver") == "s3":
+        from .aws import ensure_aws_credentials
+        ensure_aws_credentials()
+    return kv
+
+
+# Opened stores, keyed by their *prefix* spec. A KvStore is a handle to a prefix,
+# not to one object, so every read/write under that prefix can share one — and
+# reopening is not free: each S3 open reconstructs the credential provider chain,
+# which costs setup and emits two absl ERROR lines per open. Unbounded by design;
+# the key space is the handful of prefixes one run writes to (volume, mesh,
+# skeleton). Per process, so dask workers each build their own after forking.
+_STORES: dict[str, Any] = {}
+
+
+def _open_store(kvstore: Mapping[str, Any]):
+    import json as _json
+
+    import tensorstore as ts
+
+    cache_key = _json.dumps(dict(kvstore), sort_keys=True, default=str)
+    store = _STORES.get(cache_key)
+    if store is None:
+        store = ts.KvStore.open(ensure_credentials(kvstore)).result()
+        _STORES[cache_key] = store
+    return store
+
+
+def _kv(location: str | Mapping[str, Any], *parts: str):
+    kv = join(to_kvstore(location), *parts) if parts else to_kvstore(location)
+    key = ""
+    base = str(kv.get("path", ""))
+    if base:
+        # Split the final segment off as the key so the store is opened on the
+        # containing prefix — a trailing separator is what keeps the key from
+        # being concatenated onto the directory name.
+        head, _, tail = base.rstrip("/").rpartition("/")
+        kv["path"] = (head + "/") if head else ("/" if base.startswith("/") else "")
+        key = tail
+    return _open_store(kv), key
+
+
+def read_bytes(location: str | Mapping[str, Any], *parts: str) -> bytes | None:
+    """Read one object; ``None`` if it does not exist."""
+    store, key = _kv(location, *parts)
+    result = store.read(key).result()
+    return bytes(result.value) if result.state == "value" else None
+
+
+def write_bytes(location: str | Mapping[str, Any], data: bytes, *parts: str) -> None:
+    """Write one object, creating parent directories for the file driver."""
+    store, key = _kv(location, *parts)
+    store.write(key, bytes(data)).result()
+
+
+def exists(location: str | Mapping[str, Any], *parts: str) -> bool:
+    """True if the object exists. One request; safe against object stores."""
+    store, key = _kv(location, *parts)
+    return store.read(key).result().state == "value"
+
+
+def read_json(location: str | Mapping[str, Any], *parts: str):
+    """Read and parse a JSON object; ``None`` if it does not exist."""
+    import json
+
+    raw = read_bytes(location, *parts)
+    return None if raw is None else json.loads(raw.decode("utf-8"))
+
+
+def write_json(location: str | Mapping[str, Any], obj: Any, *parts: str,
+               indent: int | None = 2) -> None:
+    """Serialize ``obj`` as JSON and write it."""
+    import json
+
+    write_bytes(location, json.dumps(obj, indent=indent).encode("utf-8"), *parts)
+
+
 def default_progress_path(dst: str | Mapping[str, Any]) -> str:
     """Default manifest path for a destination (local: alongside it; remote: cwd)."""
     kv = to_kvstore(dst)

@@ -30,19 +30,17 @@ _TAG_TO_DRIVER = {
 
 
 def _kvstore_from_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    from ..location import ensure_credentials, to_kvstore
+
     if "kvstore" in spec:
         kv = dict(spec["kvstore"])
     elif "path" in spec:
-        from ..location import to_kvstore  # local path or s3://... URL
-        kv = to_kvstore(spec["path"])
+        kv = to_kvstore(spec["path"])          # local path or s3://... URL
     else:
         raise ValueError("spec needs either 'kvstore' or 'path'")
-    if kv.get("driver") == "s3":
-        # tensorstore 0.1.84's profile provider can't read ~/.aws/credentials;
-        # bootstrap the environment provider from the file (no-op if env already set).
-        from ..aws import ensure_aws_credentials
-        ensure_aws_credentials()
-    return kv
+    # Shared with location._kv so both store-opening paths bootstrap identically;
+    # see ensure_credentials for why it must happen per process.
+    return ensure_credentials(kv)
 
 
 def _compressor_codec(name: str | None, level: int | None) -> list[dict[str, Any]]:
@@ -166,6 +164,12 @@ class TensorStoreBackend:
     @classmethod
     def create(cls, spec: Mapping[str, Any], *, delete_existing: bool = False) -> "TensorStoreBackend":
         import tensorstore as ts
+
+        if delete_existing:
+            # A cached handle for this location would keep serving the metadata of
+            # the volume we are about to destroy.
+            from .base import clear_backend_cache
+            clear_backend_cache()
 
         tag = spec["backend"]
         kv = _kvstore_from_spec(spec)

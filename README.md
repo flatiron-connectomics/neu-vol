@@ -9,16 +9,21 @@ locally on a workstation or on the Flatiron Rusty cluster via SLURM.
 
 ## Environment
 
-Managed with [pixi](https://pixi.sh). The environment is **detached to ceph**
-(`/mnt/ceph/users/<user>/pixi-envs`) to avoid the GPFS home inode quota and so
-that SLURM workers on Rusty can import it directly. The pixi package cache stays
-on local `/home` (no quota).
+One conda environment covers this repo, its substrate (`em-blockrun`) and its
+consumers, each installed editable. Runtime deps come from conda-forge, so
+`--no-deps` keeps pip from re-resolving them.
 
 ```bash
-pixi install          # solve + create the detached env on ceph
-pixi run test         # run the test suite
-pixi shell            # drop into the environment
+conda activate em-lib
+pip install --no-deps -e ../em-blockrun -e .
+python -m pytest -q
 ```
+
+`em-blockrun` must be a **sibling directory** — the layering depends on it. The
+combined environment spec lives one level up, at `em-libraries/environment.yml`.
+
+Previously managed with pixi, with envs detached to ceph to dodge the GPFS home
+inode quota; see `docs/DESIGN.md` §8 for that history and why it changed.
 
 ## Status
 

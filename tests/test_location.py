@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from em_volume_tools.location import default_progress_path, join, spec_kvstore, to_kvstore
@@ -43,3 +45,144 @@ def test_spec_kvstore_forms():
 def test_default_progress_path():
     assert default_progress_path("/a/vol.zarr") == "/a/vol.zarr.progress.jsonl"
     assert default_progress_path("s3://b/data/seg").endswith("seg.progress.jsonl")
+
+
+# --------------------------------------------------------------------------- #
+# Byte / JSON I/O — one code path for local files and object stores
+# --------------------------------------------------------------------------- #
+def test_is_local_and_local_path():
+    from em_volume_tools.location import is_local, local_path
+
+    assert is_local("/mnt/x/vol") and is_local({"driver": "file", "path": "/x"})
+    assert not is_local("s3://b/p") and not is_local("gs://b/p")
+    assert local_path("/mnt/x/vol") == "/mnt/x/vol"
+    with pytest.raises(ValueError, match="not a local path"):
+        local_path("s3://b/p")
+
+
+def test_write_read_bytes_creates_parent_dirs(tmp_path):
+    """The file driver makes directories on write, so callers need no makedirs."""
+    import os
+
+    from em_volume_tools.location import exists, read_bytes, write_bytes
+
+    base = str(tmp_path / "vol")
+    write_bytes(base, b"\x00\x01", "mesh", "deep", "42")
+    assert os.path.exists(f"{base}/mesh/deep/42")
+    assert read_bytes(base, "mesh", "deep", "42") == b"\x00\x01"
+    assert exists(base, "mesh", "deep", "42")
+
+
+def test_missing_object_reads_as_none_not_an_error(tmp_path):
+    """Existence checks must not need a separate stat, nor raise."""
+    from em_volume_tools.location import exists, read_bytes, read_json
+
+    base = str(tmp_path / "vol")
+    assert read_bytes(base, "nope") is None
+    assert read_json(base, "nope") is None
+    assert not exists(base, "nope")
+
+
+def test_json_round_trip_and_overwrite(tmp_path):
+    from em_volume_tools.location import read_json, write_json
+
+    base = str(tmp_path / "vol")
+    write_json(base, {"type": "segmentation", "scales": [1]}, "info")
+    assert read_json(base, "info")["type"] == "segmentation"
+    write_json(base, {"type": "segmentation", "mesh": "mesh"}, "info")
+    assert read_json(base, "info")["mesh"] == "mesh"     # overwrite, not append
+
+
+def test_full_path_with_no_parts(tmp_path):
+    """A location may already name the object itself."""
+    from em_volume_tools.location import read_json, write_json
+
+    p = str(tmp_path / "vol" / "info")
+    write_json(p, {"a": 1})
+    assert read_json(p) == {"a": 1}
+
+
+def test_opening_an_s3_store_bootstraps_credentials(tmp_path, monkeypatch):
+    """Every store-opening path must bootstrap, or it 403s on un-bootstrapped workers.
+
+    tensorstore's profile provider cannot read ~/.aws/credentials, so credentials
+    reach it only as AWS_* env vars, set per process. A path that skips the
+    bootstrap fails *only* on workers that happened not to open an S3 store
+    earlier in the run — invisible locally and intermittent on dask.
+    """
+    from em_volume_tools import location as L
+
+    creds = tmp_path / "credentials"
+    creds.write_text("[default]\naws_access_key_id = AKIATEST\n"
+                     "aws_secret_access_key = secret\n")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(creds))
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SESSION_TOKEN", raising=False)
+
+    L._kv("s3://bucket/prefix", "info")
+    assert os.environ["AWS_ACCESS_KEY_ID"] == "AKIATEST"
+
+
+def test_local_stores_need_no_credentials(tmp_path, monkeypatch):
+    """The bootstrap must not fire for the file driver."""
+    from em_volume_tools import location as L
+
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    L.write_bytes(str(tmp_path / "vol"), b"x", "info")
+    assert "AWS_ACCESS_KEY_ID" not in os.environ
+
+
+def test_stores_are_reused_per_prefix(tmp_path, monkeypatch):
+    """Reopening per object is what floods the logs and re-resolves credentials.
+
+    Each S3 open reconstructs the credential provider chain and emits two absl
+    ERROR lines. Stage 2 writes ~3 objects per body, so at 20k bodies a
+    per-object open means ~60k opens and ~120k spurious error lines — enough to
+    bury a real failure.
+    """
+    import tensorstore as ts
+
+    from em_volume_tools import location as L
+
+    monkeypatch.setattr(L, "_STORES", {})
+    opens = []
+    real_open = ts.KvStore.open
+    monkeypatch.setattr(ts.KvStore, "open",
+                        lambda *a, **k: (opens.append(1), real_open(*a, **k))[1])
+
+    base = str(tmp_path / "vol")
+    for body in range(50):
+        L.write_bytes(f"{base}/mesh", b"d", str(body))
+        L.write_bytes(f"{base}/mesh", b"i", f"{body}.index")
+    assert len(opens) == 1, f"{len(opens)} opens for one prefix; the store is not reused"
+
+    L.write_bytes(f"{base}/skeleton", b"s", "1")      # a second prefix
+    assert len(opens) == 2
+    # reuse must not blur prefixes together
+    assert L.read_bytes(f"{base}/mesh", "7") == b"d"
+    assert L.read_bytes(f"{base}/skeleton", "1") == b"s"
+    assert L.read_bytes(f"{base}/skeleton", "7") is None
+
+
+def test_both_store_opening_paths_share_one_bootstrap():
+    """The backend and the byte helpers must not drift apart again."""
+    import inspect
+
+    from em_volume_tools.backends import tensorstore as ts_backend
+
+    src = inspect.getsource(ts_backend._kvstore_from_spec)
+    assert "ensure_credentials" in src, \
+        "the backend must use location.ensure_credentials, not its own copy"
+
+
+def test_remote_locations_split_into_prefix_and_key():
+    """s3 keys must not be concatenated onto the prefix (no network needed)."""
+    from em_volume_tools.location import _kv
+
+    store, key = _kv("s3://bucket/sample3/segmentation", "mesh", "info")
+    assert key == "info"
+    assert store.spec().to_json()["path"] == "sample3/segmentation/mesh/"
+
+    store, key = _kv("s3://bucket/info")          # bucket root
+    assert key == "info"
+    assert store.spec().to_json().get("path", "") == ""

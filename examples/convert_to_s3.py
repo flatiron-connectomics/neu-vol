@@ -18,12 +18,12 @@ Credentials (this example uses environment variables):
 Usage:
   # local smoke test against a real bucket (few workers), precomputed:
   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-    pixi run -e dev python examples/convert_to_s3.py \
+    python examples/convert_to_s3.py \
       --src /mnt/ceph/.../seg.zarr --format precomputed \
       --dst s3://my-bucket/segmentations/sample3 --workers 4
 
   # full run on SLURM (resumable -- relaunch to continue):
-  nohup pixi run -e dev python -u examples/convert_to_s3.py \
+  nohup python -u examples/convert_to_s3.py \
       --src ... --dst s3://... --format both \
       --config configs/dask-slurm-any.yaml --workers 48 > s3.log 2>&1 &
 """

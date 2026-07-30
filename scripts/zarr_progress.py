@@ -3,7 +3,7 @@
 Counts written chunks per level (via the kvstore, no filesystem walk) against the
 expected chunk count, so you can check a detached run from any terminal:
 
-    pixi run -e dev python scripts/zarr_progress.py /mnt/ceph/.../05_yuri_v3.zarr
+    python scripts/zarr_progress.py /mnt/ceph/.../05_yuri_v3.zarr
 
 Assumes unsharded zarr v3 (chunk keys under "c/"). Levels are discovered by
 probing 0, 1, 2, ... until one is missing (the group's OME metadata is only

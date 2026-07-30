@@ -9,11 +9,11 @@ voxel_size/offset are read from the source `info` automatically.
 Usage
 -----
   # 1) local subvolume smoke test (centered box) + integrity check vs source:
-  pixi run -e dev python scripts/convert_05_yuri_v3.py test --workers 4 --subvol 1024
+  python scripts/convert_05_yuri_v3.py test --workers 4 --subvol 1024
 
   # 2) full run on Rusty/SLURM (edit configs/dask-slurm-gen.yaml: account, etc.),
   #    launched from a workstation so it survives logout:
-  nohup pixi run -e dev python -u scripts/convert_05_yuri_v3.py full \
+  nohup python -u scripts/convert_05_yuri_v3.py full \
       --config configs/dask-slurm-gen.yaml --workers 48 > yuri_v3.log 2>&1 &
   squeue -u "$USER"          # monitor (read-only)
 

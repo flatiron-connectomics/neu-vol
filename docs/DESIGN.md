@@ -73,6 +73,24 @@ OME); for image stacks (no reliable metadata) the caller **must** supply
 `voxel_size`. Translate between precomputed (nm, XYZ) and zarr/OME axis
 conventions on conversion.
 
+**Locations** (`location.py`) — everything downstream speaks TensorStore *kvstore
+specs*, so a local path and an `s3://` / `gs://` URL take the same code path.
+`to_kvstore` normalizes, `join` appends path segments, and the byte/JSON layer —
+`read_bytes` / `write_bytes` / `read_json` / `write_json` / `exists` — carries
+sidecar metadata (a precomputed `info`, a mesh fragment) to either kind of
+destination. Two consequences worth knowing:
+
+- The **file driver creates parent directories on write**, so these replace
+  `os.makedirs` + `open` rather than supplementing them, and a single kvstore key
+  write is atomic — no tmp-plus-rename needed.
+- A **missing object reads as `None`** (`state == "missing"`), so existence is one
+  request with no separate stat and no exception handling.
+
+`is_local` / `local_path` are the escape hatch for things that genuinely need
+POSIX — sqlite, appended logs, `os.replace`. Callers use them to reject a remote
+location up front with a clear message instead of failing deep inside a write;
+em-seg-morpho's `--work-dir` is exactly this case.
+
 ---
 
 ## 4. Block-map engine + dask
@@ -206,30 +224,50 @@ brightness/normalization pipelines come later.
 
 ---
 
-## 8. Environment / packaging (pixi + ceph relocation)
+## 8. Environment / packaging (one shared conda env)
 
-Use **pixi**, but relocate its heavy, high-inode storage off the GPFS home
-(inode-quota constrained):
+**Current:** a single conda environment covering all three repos, each installed
+editable (`pip install --no-deps -e .`). Superseded pixi; see the history below
+for what pixi was solving and which of those constraints still bind.
 
-- `detached-environments` → `/path/to/scratch/pixi-envs` (set
-  project-local in `.pixi/config.toml`; envs live on ceph, repo in home keeps
-  only source + `pixi.toml` + lockfile).
-- **Cache stays on local `/home`** (pixi's default `~/.cache/rattler` is already
-  `/home` = local XFS, *no* inode quota). No reason to move it to ceph — that
-  would only consume ceph inodes. It's only touched at solve/install time on the
-  driver.
-- The env *must* be on shared ceph anyway: `/home` is local to the workstation,
-  so SLURM workers on Rusty can't see it. ceph does double duty — dodging the
-  GPFS-home inode quota *and* making the env importable by workers (no
-  conda-pack / rsync).
-- Verified with pixi 0.62.2: `pixi config set --local detached-environments <path>`.
+- Env name `em-lib`, under `~/miniforge3/envs` (GPFS home → visible to Rusty
+  workers; see the shared-visibility constraint below).
+- Python is pinned to **3.12**, and this is not a preference: `vol2mesh` and
+  `dvidutils` are built for py312 only on flyem-forge, with no py313 build.
+- Those two are also **conda-only** — no PyPI equivalent exists, so pip can
+  never resolve them and the conda env has to provide them. This is the reason
+  the stack can't simply be a set of pip requirements.
+- Runtime deps come from conda-forge, so editable installs use `--no-deps`;
+  otherwise pip re-resolves conda-provided binaries (tensorstore, h5py) from
+  PyPI and invites an ABI mismatch.
+- Combined spec: `em-libraries/environment.yml` + `pypi_requirements.txt`.
+  conda cannot jointly solve multiple env files (`conda env create` takes a
+  single `-f`), and layering them via `conda env update` gives sequential solves
+  where `flyem-forge` priority lands last — hence one combined file.
+
+**Constraint that survives from the pixi design:** the env *must* live on shared
+storage. `/home` is local XFS on the workstation, so SLURM workers on Rusty
+can't see it; GPFS `/mnt/home` and ceph both work.
+
+**Constraint that returned:** pixi detached its envs to
+`/path/to/scratch/pixi-envs` specifically to dodge the GPFS home
+**inode** quota. A conda env in `~/miniforge3/envs` puts that inode load back on
+home. If the quota becomes tight, relocate with `conda create -p
+/mnt/ceph/users/<user>/conda-envs/em-lib` rather than reaching back for pixi —
+ceph does the same double duty (inode relief *and* worker visibility, no
+conda-pack / rsync).
+
+*Historical (pixi 0.62.2):* `detached-environments` → ceph, set project-local in
+`.pixi/config.toml`, with the repo in home keeping only source + `pixi.toml` +
+lockfile. Cache deliberately stayed on local `/home` (pixi's default
+`~/.cache/rattler`, no inode quota, touched only at solve time on the driver).
 
 ---
 
 ## 9. Proposed module layout
 
 The dask/SLURM orchestration substrate lives in a **separate shared package,
-`em-blockrun`** (`../em-blockrun`, a pixi path dependency): `start_dask`,
+`em-blockrun`** (`../em-blockrun`, an editable sibling install): `start_dask`,
 `block_map`, `Manifest`, `iter_blocks`/`Block`, `idempotent`, and the dask config
 templates. It has no EM/volume deps and is reused by other projects (e.g. the
 planned meshing package). `em_volume_tools` re-exports the common names for

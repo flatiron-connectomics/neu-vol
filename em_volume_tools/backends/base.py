@@ -61,11 +61,44 @@ def register_backend(tag: str, opener: Any) -> None:
     _OPENERS[tag] = opener
 
 
+# Opened backends, keyed by their spec. Opening is NOT cheap: for
+# neuroglancer_precomputed it reads `info` from the store, so a remote destination
+# costs an HTTPS round trip and a TLS handshake *per open*. Workers call
+# open_backend once per block, so an uncached open turns one copy stage into tens
+# of thousands of handshakes — and one of those eventually gets reset by the peer,
+# which is fatal to a fail-fast stage. Measured: a whole-volume scale-0 copy is
+# 10,692 blocks x 2 opens.
+#
+# Keyed on the full spec, so a different scale_index / path / kvstore is a
+# different entry. Per process, so dask workers each build their own.
+_BACKENDS: dict[str, ArrayBackend] = {}
+
+
+def _spec_key(spec: Mapping[str, Any]) -> str:
+    import json
+
+    return json.dumps(dict(spec), sort_keys=True, default=str)
+
+
+def clear_backend_cache() -> None:
+    """Drop all cached backends.
+
+    Call after anything that invalidates an open handle — deleting and recreating
+    a volume at the same location, most importantly, where a cached handle would
+    otherwise keep serving the old metadata.
+    """
+    _BACKENDS.clear()
+
+
 def open_backend(spec: Mapping[str, Any]) -> ArrayBackend:
-    """Open a backend from a serializable spec.
+    """Open a backend from a serializable spec (cached per spec, per process).
 
     ``spec["backend"]`` selects the implementation (e.g. ``"zarr3"``,
     ``"neuroglancer_precomputed"``, ``"image_stack"``, ``"hdf5"``).
+
+    The returned backend is **shared**: callers must treat it as a handle for
+    region I/O and not mutate it. Use :func:`clear_backend_cache` if a volume is
+    recreated underneath.
     """
     try:
         tag = spec["backend"]
@@ -75,4 +108,9 @@ def open_backend(spec: Mapping[str, Any]) -> ArrayBackend:
         raise ValueError(
             f"unknown backend {tag!r}; registered: {sorted(_OPENERS)}"
         )
-    return _OPENERS[tag](spec)
+    key = _spec_key(spec)
+    backend = _BACKENDS.get(key)
+    if backend is None:
+        backend = _OPENERS[tag](spec)
+        _BACKENDS[key] = backend
+    return backend
