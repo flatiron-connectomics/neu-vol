@@ -64,6 +64,9 @@ def _parse_args(argv=None):
     p.add_argument("--progress-path", default=None)
     p.add_argument("--dry-run", action="store_true",
                    help="report the plan and exit, touching nothing")
+    p.add_argument("--store-logs", action="store_true",
+                   help="keep TensorStore's benign S3 credential-chain logging "
+                        "(suppressed by default; real errors are never suppressed)")
     return p.parse_args(argv)
 
 
@@ -129,6 +132,13 @@ def _plan(args):
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+    from em_volume_tools.logs import quiet_store_logs
+
+    with quiet_store_logs(not args.store_logs):
+        return _run(args)
+
+
+def _run(args) -> int:
     fmt, meta, shapes, vox, kind, n_sched = _plan(args)
     existing = _existing_levels(args.volume, fmt, n_sched + 1)
 

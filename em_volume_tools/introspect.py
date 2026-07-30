@@ -44,13 +44,17 @@ def _kvstore_of(spec: Mapping[str, Any], *, trailing_slash: bool = True) -> dict
 
 
 def _read_key(kvstore: Mapping[str, Any], key: str) -> bytes | None:
-    import tensorstore as ts
+    """Read one metadata object.
 
-    kv = ts.KvStore.open(dict(kvstore)).result()
-    res = kv.read(key).result()
-    if res.state != "value":
-        return None
-    return bytes(res.value)
+    Goes through ``location.read_bytes`` rather than opening a kvstore directly,
+    so it gets the S3 credential bootstrap and the per-prefix store cache like
+    every other store-opening path. Opening raw here meant the credential chain
+    fell through to the EC2 metadata service — which does not exist on Rusty — and
+    waited out a socket timeout on *each* of ``detect_backend``'s four probes.
+    """
+    from .location import read_bytes
+
+    return read_bytes(dict(kvstore), key)
 
 
 def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
