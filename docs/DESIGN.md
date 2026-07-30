@@ -176,6 +176,30 @@ own resumable block-map reading a downsample-factor region from the level above.
   - segmentations (uint64) → **mode / label-preserving** (never interpolate IDs).
   - caller-overridable.
 
+### 6a. Rebuilding a pyramid in place
+
+Because each level is derived from the one below it, a bad level poisons every
+level above it — and re-converting to fix the coarse end means recopying level 0.
+`rebuild_pyramid(dst, start_level=k)` (`ops/rebuild.py`, CLI at
+`scripts/rebuild_pyramid.py`) regenerates levels `k+1…` in place. Levels at or
+below `k` are never opened for writing.
+
+- The schedule is recomputed **from level 0**, not from the seed. Its tail is the
+  same either way (`downsample_schedule` is iterative), but computing all of it
+  also yields the shapes needed to rewrite metadata describing the whole pyramid,
+  and lets the seed's shape be checked against what the schedule predicts.
+- **`min_dim` / `max_levels` / `factors` must match the original conversion**, or
+  the two disagree on level count. `--dry-run` prints the computed schedule beside
+  the levels on disk, which is how you check.
+- The seed goes through a separate `open_level` callback that only ever opens.
+  Routing it through `create_level` would let `resume=False` recreate the very
+  level being rebuilt from, destroying the input.
+- `create_level` must *reopen* the regenerated levels rather than create them —
+  they already exist, and creating over an existing precomputed scale is an error.
+- `kind` defaults to what the volume records (precomputed `info["type"]`, OME
+  multiscales `type`). It picks the reducer, so a wrong value is silent and
+  destructive: averaging label ids invents ids that were never in the data.
+
 ### 6b. Schedule & memory
 
 Strict **level-by-level materialization**: each level is its own `block_map`

@@ -117,10 +117,47 @@ def _run_multiscale(
     resume: bool,
     verify: bool,
     progress_path: str | None,
+    start_level: int = 0,
+    open_level: Callable[[int, Sequence[int], Sequence[int]], TensorStoreBackend] | None = None,
 ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]], dict[str, int]]:
-    """Create + fill each level. Returns (level_shapes, cumulative_factors, status_counts)."""
+    """Create + fill each level. Returns (level_shapes, cumulative_factors, status_counts).
+
+    ``start_level`` > 0 rebuilds an **existing** pyramid in place: levels at or
+    below it are left alone and the cascade is seeded from level ``start_level``
+    instead of from a fresh copy of ``src_spec``. The schedule is still computed
+    from level 0, so the regenerated levels keep the factors the original run
+    used — ``downsample_schedule`` is iterative, so its tail from ``start_level``
+    is what a schedule rooted there would produce anyway, and computing the whole
+    thing also yields the shapes needed to rewrite complete metadata.
+
+    The seed is obtained through ``open_level``, never ``create_level``: opening
+    for creation with ``resume=False`` would recreate the very level being
+    regenerated from, destroying the input.
+    """
     src_shape = tuple(int(s) for s in src_shape)
     identity = tuple([1] * n_spatial)
+
+    spatial_shape = src_shape[1:] if has_channels else src_shape
+    schedule = (
+        downsample_schedule(spatial_shape, voxel_size, factors=factors,
+                            max_levels=max_levels, min_dim=min_dim)
+        if multiscale else []
+    )
+    if start_level < 0 or start_level > len(schedule):
+        raise ValueError(
+            f"start_level {start_level} out of range: this volume's schedule has "
+            f"levels 0..{len(schedule)}")
+    if start_level and open_level is None:
+        raise ValueError("start_level > 0 requires open_level")
+
+    # Shapes/cumulative factors for EVERY level, including the ones left alone —
+    # the caller needs them to write metadata describing the whole pyramid.
+    level_shapes = [src_shape]
+    cum = [identity]
+    for f in schedule:
+        ff = _full_factor(f, has_channels)
+        level_shapes.append(_downsampled(level_shapes[-1], ff))
+        cum.append(tuple(c * x for c, x in zip(cum[-1], f)))
 
     manifest = Manifest(progress_path)
     if resume:
@@ -129,31 +166,31 @@ def _run_multiscale(
         manifest.reset()
 
     try:
-        # level 0 (copy)
-        lvl0 = create_level(0, src_shape, identity)
-        prev_spec = lvl0.to_spec()
-        _run_level(manifest, 0, lvl0,
-                   lambda *, verify: functools.partial(_copy_block, src_spec=src_spec,
-                                                        dst_spec=prev_spec, out_dtype=out_dtype,
-                                                        verify=verify),
-                   resume=resume, verify=verify, client=client, npartitions=npartitions)
+        if start_level == 0:
+            lvl0 = create_level(0, src_shape, identity)
+            prev_spec = lvl0.to_spec()
+            _run_level(manifest, 0, lvl0,
+                       lambda *, verify: functools.partial(_copy_block, src_spec=src_spec,
+                                                            dst_spec=prev_spec, out_dtype=out_dtype,
+                                                            verify=verify),
+                       resume=resume, verify=verify, client=client, npartitions=npartitions)
+        else:
+            seed = open_level(start_level, level_shapes[start_level], cum[start_level])
+            got = tuple(int(s) for s in seed.shape)
+            want = tuple(int(s) for s in level_shapes[start_level])
+            if got != want:
+                raise ValueError(
+                    f"level {start_level} has shape {got}, but the pyramid schedule "
+                    f"predicts {want}. Regenerating on top of it would produce a "
+                    f"volume whose levels disagree; check voxel_size/factors, or "
+                    f"rebuild from a level that matches.")
+            prev_spec = seed.to_spec()
+            logger.info("rebuilding from existing level %d %s (levels 0-%d untouched)",
+                        start_level, got, start_level)
 
-        level_shapes = [src_shape]
-        cum = [identity]
-        prev_shape = src_shape
-        cur_cum = identity
-
-        spatial_shape = src_shape[1:] if has_channels else src_shape
-        schedule = (
-            downsample_schedule(spatial_shape, voxel_size, factors=factors,
-                                max_levels=max_levels, min_dim=min_dim)
-            if multiscale else []
-        )
-        for i, f in enumerate(schedule, start=1):
-            ff = _full_factor(f, has_channels)
-            lvl_shape = _downsampled(prev_shape, ff)
-            cur_cum = tuple(c * x for c, x in zip(cur_cum, f))
-            lvl = create_level(i, lvl_shape, cur_cum)
+        for i in range(start_level + 1, len(schedule) + 1):
+            ff = _full_factor(schedule[i - 1], has_channels)
+            lvl = create_level(i, level_shapes[i], cum[i])
             lvl_spec = lvl.to_spec()
             src_for_lvl = prev_spec
             _run_level(manifest, i, lvl,
@@ -161,9 +198,6 @@ def _run_multiscale(
                            _downsample_block, src_spec=s, dst_spec=d, factor=fac, kind=kind,
                            verify=verify),
                        resume=resume, verify=verify, client=client, npartitions=npartitions)
-            level_shapes.append(lvl_shape)
-            cum.append(cur_cum)
-            prev_shape = lvl_shape
             prev_spec = lvl_spec
 
         return level_shapes, cum, manifest.counts()
@@ -178,7 +212,7 @@ def materialize_zarr_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
-    resume=False, verify=False, progress_path=None,
+    resume=False, verify=False, progress_path=None, start_level=0,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),  # precomputed-only; ignored here
 ) -> dict:
     prof = get_profile(profile)
@@ -187,13 +221,22 @@ def materialize_zarr_multiscale(
     progress_path = progress_path or default_progress_path(dst)
     dim_names = (["c"] + list(spatial_axes)) if has_channels else list(spatial_axes)
 
+    def _level_spec(i, shape):
+        return zarr3_create_spec(prof, join(base_kv, str(i)), shape, out_dtype,
+                                 has_channels=has_channels, num_channels=num_channels,
+                                 dimension_names=dim_names, chunk=chunk, shard=shard)
+
     def create_level(i, shape, cum):
+        # A rebuild targets levels that already exist, so it must reopen them
+        # rather than create: creating over an existing level is an error.
         return TensorStoreBackend.open_or_create(
-            zarr3_create_spec(prof, join(base_kv, str(i)), shape, out_dtype,
-                              has_channels=has_channels, num_channels=num_channels,
-                              dimension_names=dim_names, chunk=chunk, shard=shard),
-            resume=resume or verify, delete_existing=delete_existing,
-        )
+            _level_spec(i, shape), resume=resume or verify or bool(start_level),
+            delete_existing=delete_existing)
+
+    def open_level(i, shape, cum):
+        """Open an existing level. Never creates — this is the rebuild seed."""
+        return TensorStoreBackend.open({"backend": "zarr3",
+                                        "kvstore": join(base_kv, str(i))})
 
     level_shapes, cum, counts = _run_multiscale(
         src_spec=src_spec, src_shape=src_shape, out_dtype=out_dtype,
@@ -201,6 +244,7 @@ def materialize_zarr_multiscale(
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
         resume=resume, verify=verify, progress_path=progress_path,
+        start_level=start_level, open_level=open_level,
     )
 
     datasets, scales = [], []
@@ -237,7 +281,7 @@ def materialize_precomputed_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
-    resume=False, verify=False, progress_path=None,
+    resume=False, verify=False, progress_path=None, start_level=0,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),
 ) -> dict:
     prof = get_profile(profile)
@@ -265,8 +309,15 @@ def materialize_precomputed_multiscale(
             compressed_segmentation_block_size=compressed_segmentation_block_size,
         )
         # For precomputed, delete_existing must apply only to scale 0 (shared volume).
+        # A rebuild reopens existing scales; creating over one is an error.
         return TensorStoreBackend.open_or_create(
-            spec, resume=resume or verify, delete_existing=(delete_existing and i == 0))
+            spec, resume=resume or verify or bool(start_level),
+            delete_existing=(delete_existing and i == 0))
+
+    def open_level(i, shape, cum):
+        """Open an existing scale. Never creates — this is the rebuild seed."""
+        return TensorStoreBackend.open({"backend": "neuroglancer_precomputed",
+                                        "kvstore": dict(base_kv), "scale_index": i})
 
     level_shapes, cum, counts = _run_multiscale(
         src_spec=src_spec, src_shape=src_shape, out_dtype=out_dtype,
@@ -274,6 +325,7 @@ def materialize_precomputed_multiscale(
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
         resume=resume, verify=verify, progress_path=progress_path,
+        start_level=start_level, open_level=open_level,
     )
     scales = [[float(v * c) for v, c in zip(voxel_size, F)] for F in cum]
     logger.info("wrote precomputed multiscale info: %d scales (encoding=%s)", len(level_shapes), encoding)

@@ -88,6 +88,9 @@ def _read_zarr_ome(spec: Mapping[str, Any]) -> dict | None:
         "units": axes[spatial[0]].get("unit"),
         "spatial_axes": tuple(axes[i]["name"] for i in spatial),
         "has_channels": has_channels,
+        # The multiscales "type" is the downsampling method; we write `kind` there,
+        # but another writer may put something else, so only trust our own values.
+        "kind": ms.get("type") if ms.get("type") in ("image", "segmentation") else None,
     }
 
 
@@ -112,4 +115,7 @@ def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
         "units": "nm",
         "spatial_axes": ("z", "y", "x"),
         "has_channels": nch > 1,
+        # precomputed records the volume type directly, which is what decides
+        # whether downsampling may average (image) or must take a mode (labels).
+        "kind": "segmentation" if info.get("type") == "segmentation" else "image",
     }
