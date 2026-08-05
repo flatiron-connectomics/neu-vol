@@ -17,7 +17,11 @@ from em_volume_tools.backends.tensorstore import TensorStoreBackend
 from em_volume_tools.profiles import zarr3_create_spec
 from em_volume_tools.pyramid import mean_downsample
 
-CONFIG = os.path.join(os.path.dirname(__file__), "..", "configs", "dask-local.yaml")
+# The bundled template from em-blockrun, resolved by name. This used to be the
+# repo-relative "../configs/dask-local.yaml", which broke when that directory became
+# untracked site-local scratch — and broke *invisibly*, because a working tree that
+# still had the file kept passing while a fresh clone could not.
+CONFIG = "dask-local"
 
 
 def _make_zarr(path, data, chunk=(4, 4, 4)):
