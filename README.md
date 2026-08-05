@@ -74,7 +74,11 @@ convert("seg.zarr", "s3://my-bucket/seg/sample3.precomputed",
         profile="s3-neuroglancer", kind="segmentation", resume=True)
 ```
 
-See `examples/convert_to_s3.py` (incl. notes on propagating creds to SLURM workers).
+On SLURM the **workers** need credentials too. Slurm's default `--export=ALL`
+propagates the submitting environment, so launching with the vars set is usually
+enough; if your site disables that, use a shared `~/.aws/credentials` readable on the
+worker nodes, or add the exports to the dask `job-script-prologue`. Never bake secrets
+into a config file.
 
 ## Resume & sparsity
 
@@ -85,16 +89,51 @@ All-fill (e.g. all-zero) chunks are **elided** (not written) and recorded as
 `empty`, so sparse segmentations stay small and resume never reprocesses them.
 `verify=True` instead checks storage authoritatively per block.
 
-## Running on the cluster
+## The `em-vol` command
 
-The same ops run across SLURM workers by passing a `client` from `start_dask`.
-See `examples/run_convert_slurm.py` and `docs/dask-slurm-rusty.md`:
+Installing the package provides **`em-vol`** (equivalently `python -m em_volume_tools`):
 
 ```bash
-# smoke test locally, then launch on Rusty surviving logout:
-nohup python -u examples/run_convert_slurm.py \
-    --config configs/dask-slurm-gen.yaml --workers 48 > run.log 2>&1 &
+em-vol info    <volume>                      # format, voxel sizes, levels present
+em-vol convert --src ... --dst ...           # build a multiscale volume
+em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
+em-vol progress <volume>                     # chunks written, per level
+```
+
+`info` and `progress` read only. `downsample` rebuilds a pyramid **in place** from a
+level you trust — cascaded downsampling means a bad level poisons everything above it
+— and `--dry-run` prints the schedule beside what is on disk, refusing if they
+disagree rather than leaving the pyramid inconsistent. Use `convert` to build a *new*
+volume.
+
+```bash
+# smoke test locally, then launch on SLURM surviving logout:
+em-vol convert --src ... --dst ... --serial --single-level
+nohup env PYTHONUNBUFFERED=1 em-vol convert --src ... --dst s3://... \
+    --config dask-slurm-example --config ~/my-site.yaml --workers 48 > run.log 2>&1 &
 squeue -u "$USER"
 ```
 
-Next: brightness/normalization + morphological transforms, a CLI. See `docs/DESIGN.md`.
+`PYTHONUNBUFFERED=1` is the console-script equivalent of `python -u`; without it the
+log lags a long run in 8 KB blocks.
+
+### Cluster config
+
+`--config` takes a **bundled template name or a path**, and is **repeatable**,
+deep-merged left to right. The templates (`dask-local`, `dask-slurm-example`) ship
+with **em-blockrun**, next to `start_dask`, so all its consumers share one set.
+An overlay carries only the keys that differ:
+
+```yaml
+# my-site.yaml
+jobqueue:
+  slurm:
+    account: my-account
+    queue: my-partition
+    log-directory: /path/with/room
+```
+
+Unrecognised keys raise rather than merging silently. Site-specific configs are
+deliberately not in this repo; the top-level `configs/` is gitignored.
+
+Next: brightness/normalization + morphological transforms. See `docs/DESIGN.md`.

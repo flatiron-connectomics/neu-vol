@@ -181,7 +181,7 @@ own resumable block-map reading a downsample-factor region from the level above.
 Because each level is derived from the one below it, a bad level poisons every
 level above it — and re-converting to fix the coarse end means recopying level 0.
 `rebuild_pyramid(dst, start_level=k)` (`ops/rebuild.py`, CLI at
-`scripts/rebuild_pyramid.py`) regenerates levels `k+1…` in place. Levels at or
+`em-vol downsample`) regenerates levels `k+1…` in place. Levels at or
 below `k` are never opened for writing.
 
 - The schedule is recomputed **from level 0**, not from the seed. Its tail is the
@@ -327,5 +327,5 @@ em_volume_tools/                # volume/EM-specific
 ├── manifest.py      # Manifest (single-writer resume/intent log)
 └── configs/         # dask config templates (local / slurm-gen / slurm-any)
 
-examples/run_convert_slurm.py   # Rusty/SLURM driver
+em_volume_tools/cli.py          # the `em-vol` command: info / convert / downsample / progress
 ```

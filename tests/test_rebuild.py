@@ -285,18 +285,13 @@ def test_kind_is_validated(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# CLI (scripts/rebuild_pyramid.py)
+# CLI (`em-vol downsample`)
 # --------------------------------------------------------------------------- #
-def _cli():
-    """Load the script by path; scripts/ is not a package."""
-    import importlib.util
-    import pathlib
+def _cli_downsample(argv):
+    """Drive the real entry point. Was a script loaded by path from scripts/."""
+    from em_volume_tools.cli import main
 
-    path = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "rebuild_pyramid.py"
-    spec = importlib.util.spec_from_file_location("rebuild_cli", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    return main(["downsample", *argv])
 
 
 def _converted(tmp_path, **kw):
@@ -314,7 +309,7 @@ def test_cli_dry_run_touches_nothing(tmp_path):
     before = [a.copy() for a in _levels(dst)]
     clear_backend_cache()
 
-    assert _cli().main([dst, "--start-level", "1", "--min-dim", str(MIN_DIM),
+    assert _cli_downsample([dst, "--start-level", "1", "--min-dim", str(MIN_DIM),
                         "--dry-run"]) == 0
     clear_backend_cache()
     for i, (a, b) in enumerate(zip(before, _levels(dst))):
@@ -330,7 +325,7 @@ def test_cli_rebuilds(tmp_path):
     be.write_region(tuple(slice(0, s) for s in be.shape), np.zeros(be.shape, np.uint8))
     clear_backend_cache()
 
-    assert _cli().main([dst, "--start-level", "1", "--min-dim", str(MIN_DIM),
+    assert _cli_downsample([dst, "--start-level", "1", "--min-dim", str(MIN_DIM),
                         "--serial"]) == 0
     clear_backend_cache()
     for i, (a, b) in enumerate(zip(want, _levels(dst))):
@@ -341,14 +336,14 @@ def test_cli_refuses_a_schedule_that_disagrees_with_disk(tmp_path):
     """A --min-dim differing from the original conversion must not rebuild."""
     dst = _converted(tmp_path)
     with pytest.raises(SystemExit) as e:
-        _cli().main([dst, "--start-level", "1", "--min-dim", "128", "--serial"])
+        _cli_downsample([dst, "--start-level", "1", "--min-dim", "128", "--serial"])
     assert "schedule" in str(e.value) or "exceeds" in str(e.value)
 
 
 def test_cli_refuses_a_seed_level_beyond_the_schedule(tmp_path):
     dst = _converted(tmp_path)
     with pytest.raises(SystemExit, match="exceeds the deepest level"):
-        _cli().main([dst, "--start-level", "99", "--min-dim", str(MIN_DIM), "--serial"])
+        _cli_downsample([dst, "--start-level", "99", "--min-dim", str(MIN_DIM), "--serial"])
 
 
 def test_cli_refuses_a_seed_level_that_is_absent_on_disk(tmp_path):
@@ -361,4 +356,4 @@ def test_cli_refuses_a_seed_level_that_is_absent_on_disk(tmp_path):
     shutil.rmtree(f"{dst}/2")
     clear_backend_cache()
     with pytest.raises(SystemExit, match="does not exist"):
-        _cli().main([dst, "--start-level", "2", "--min-dim", str(MIN_DIM), "--serial"])
+        _cli_downsample([dst, "--start-level", "2", "--min-dim", str(MIN_DIM), "--serial"])

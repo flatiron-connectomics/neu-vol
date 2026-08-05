@@ -24,11 +24,17 @@ dependencies = [
     "em-blockrun",         # shared dask/SLURM chunked-map substrate
 ]
 
+[project.scripts]
+em-vol = "em_volume_tools.cli:main"
+
 [project.optional-dependencies]
 dev = ["pytest"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["em_volume_tools"]
+# No package data here: the dask config templates live in em-blockrun, next to
+# start_dask, and are resolved by name through it. Site-specific configs stay out of
+# the repo entirely — the top-level configs/ is gitignored.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

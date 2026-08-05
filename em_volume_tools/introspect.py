@@ -66,6 +66,45 @@ def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
     return None
 
 
+def read_level_voxel_sizes(spec: Mapping[str, Any]) -> list[tuple[float, ...]] | None:
+    """Each level's own voxel size, from the volume's metadata. ``None`` if absent.
+
+    **Not derived from shape ratios.** Shapes are ceil-divided, so a level-0 extent of
+    13750 over a factor of 4 stores 3438, and 13750/3438 is 3.9994 — deriving from that
+    reports 31.9953 nm for a level that is exactly 32. Real pyramids are also
+    anisotropic, so the ``2**level`` shortcut is wrong for a different reason. Both
+    formats record the true value per level; read it.
+
+    precomputed lists a ``resolution`` per entry of ``info["scales"]``; OME-NGFF lists
+    a scale transform per ``multiscales[0]["datasets"]`` entry. Returned finest-first
+    in ``(z, y, x)``, spatial axes only.
+    """
+    backend = spec.get("backend")
+    if backend == "neuroglancer_precomputed":
+        raw = _read_key(_kvstore_of(spec), "info")
+        if raw is None:
+            return None
+        scales = json.loads(raw)["scales"]
+        ordered = sorted(scales, key=lambda s: tuple(s["resolution"]))
+        return [tuple(float(v) for v in s["resolution"][::-1]) for s in ordered]
+    if backend == "zarr3":
+        raw = _read_key(_kvstore_of(spec), "zarr.json")
+        if raw is None:
+            return None
+        ome = json.loads(raw).get("attributes", {}).get("ome")
+        if not ome:
+            return None
+        ms = ome["multiscales"][0]
+        spatial = [i for i, a in enumerate(ms["axes"]) if a.get("type") == "space"]
+        out = []
+        for ds in ms["datasets"]:
+            scale = next(t["scale"] for t in ds["coordinateTransformations"]
+                         if t["type"] == "scale")
+            out.append(tuple(float(scale[i]) for i in spatial))
+        return out
+    return None
+
+
 def _read_zarr_ome(spec: Mapping[str, Any]) -> dict | None:
     raw = _read_key(_kvstore_of(spec), "zarr.json")
     if raw is None:

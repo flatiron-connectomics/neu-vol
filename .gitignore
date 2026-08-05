@@ -18,3 +18,8 @@ dask-job-logs/
 # editor
 .vscode/
 .idea/
+
+# Site-specific dask configs and dataset files live here, untracked. The LEADING
+# SLASH is load-bearing: a bare `configs/` matches at any depth. Generic dask
+# templates ship in em-blockrun (em_blockrun/configs/).
+/configs/
