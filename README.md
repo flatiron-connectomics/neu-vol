@@ -137,3 +137,10 @@ Unrecognised keys raise rather than merging silently. Site-specific configs are
 deliberately not in this repo; the top-level `configs/` is gitignored.
 
 Next: brightness/normalization + morphological transforms. See `docs/DESIGN.md`.
+
+## License
+
+©2026 The Simons Foundation, Inc.
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how contributions are licensed.
