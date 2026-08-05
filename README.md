@@ -94,7 +94,7 @@ All-fill (e.g. all-zero) chunks are **elided** (not written) and recorded as
 Installing the package provides **`em-vol`** (equivalently `python -m em_volume_tools`):
 
 ```bash
-em-vol info    <volume>                      # format, voxel sizes, levels present
+em-vol info    <volume>                      # format, voxel sizes, chunking, levels
 em-vol convert --src ... --dst ...           # build a multiscale volume
 em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
 em-vol progress <volume>                     # chunks written, per level

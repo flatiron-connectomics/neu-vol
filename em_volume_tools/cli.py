@@ -97,23 +97,42 @@ def describe(volume: str) -> dict:
             "levels": existing_levels(volume, fmt)}
 
 
-def existing_levels(volume: str, fmt: str, probe: int = 12) -> dict[int, tuple]:
-    """``{level: shape}`` for the levels that open. Probes upward until one misses.
+def existing_levels(volume: str, fmt: str, probe: int = 12) -> dict[int, dict]:
+    """``{level: {"shape", "chunks", "read_chunks"}}`` for the levels that open.
 
-    The multiscale group metadata is written at the very end of a conversion, so an
-    in-flight volume has levels but no group metadata — probing is what makes this
-    work on a run that is still going.
+    Probes upward until one misses. The multiscale group metadata is written at the
+    very end of a conversion, so an in-flight volume has levels but no group metadata
+    — probing is what makes this work on a run that is still going.
+
+    Chunking is **per level**, not a property of the volume: it lives in each level's
+    own array metadata (zarr's ``zarr.json``, precomputed's per-scale ``chunk_sizes``),
+    and a conversion is free to chunk levels differently. So it is read here, where
+    each level is opened anyway, rather than assumed from level 0.
+
+    ``chunks`` is the *write* chunk and ``read_chunks`` the *read* chunk. They differ
+    only when the level is sharded, where the write chunk is the shard and the read
+    chunk is the unit actually fetched — which is the number that governs read
+    amplification, so both are worth having.
     """
     from em_volume_tools.backends.base import open_backend
 
-    out: dict[int, tuple] = {}
+    out: dict[int, dict] = {}
     for i in range(probe):
         spec = ({"backend": fmt, "path": f"{volume.rstrip('/')}/{i}"} if fmt == "zarr3"
                 else {"backend": fmt, "path": volume, "scale_index": i})
         try:
-            out[i] = tuple(int(s) for s in open_backend(spec).shape)
+            be = open_backend(spec)
+            shape = tuple(int(s) for s in be.shape)
         except Exception:
             break
+        # chunks come from the same open, but a backend need not expose them
+        def _maybe(attr):
+            try:
+                return tuple(int(c) for c in getattr(be, attr))
+            except Exception:
+                return None
+        out[i] = {"shape": shape, "chunks": _maybe("chunks"),
+                  "read_chunks": _maybe("read_chunks")}
     return out
 
 
@@ -143,11 +162,22 @@ def cmd_info(args) -> int:
     # ceil-division makes inexact (32 nm reads back as 31.9953), and never 2**level,
     # which is wrong on the anisotropic pyramids that are common.
     per_level = d["level_voxel_sizes"]
-    print(f"  {'level':>5}  {'shape':>24}  {'voxel nm':>20}")
-    for i, shape in sorted(d["levels"].items()):
+    sharded = any(lv["read_chunks"] and lv["chunks"] != lv["read_chunks"]
+                  for lv in d["levels"].values())
+    header = f"  {'level':>5}  {'shape':>24}  {'voxel nm':>20}  {'chunk':>17}"
+    print(header + (f"  {'shard':>17}" if sharded else ""))
+    for i, lv in sorted(d["levels"].items()):
         vox = ("x".join(f"{v:g}" for v in per_level[i])
                if per_level and i < len(per_level) else "(not recorded)")
-        print(f"  {i:>5}  {str(tuple(shape)):>24}  {vox:>20}")
+        # With sharding the *read* chunk is the unit actually fetched, so that is
+        # what belongs in the "chunk" column; the write chunk is the shard.
+        chunk = lv["read_chunks"] or lv["chunks"]
+        chunk_s = "x".join(str(c) for c in chunk) if chunk else "?"
+        row = f"  {i:>5}  {str(lv['shape']):>24}  {vox:>20}  {chunk_s:>17}"
+        if sharded:
+            shard = lv["chunks"] if lv["chunks"] != lv["read_chunks"] else None
+            row += f"  {('x'.join(str(c) for c in shard) if shard else '—'):>17}"
+        print(row)
     return 0
 
 
@@ -243,7 +273,8 @@ def cmd_downsample(args) -> int:
 
     mismatch = False
     for i, (shape, voxel) in enumerate(zip(shapes, voxels)):
-        on_disk = existing.get(i)
+        level = existing.get(i)
+        on_disk = level["shape"] if level else None
         if on_disk is not None and tuple(on_disk[-len(shape):]) != tuple(shape):
             state, mismatch = f"MISMATCH on disk {on_disk}", True
         elif i < args.start_level:

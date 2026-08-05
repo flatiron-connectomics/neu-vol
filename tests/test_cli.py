@@ -95,7 +95,7 @@ def test_level_voxel_sizes_are_read_not_derived(tmp_path):
 
     # ...and the shape ratio really is inexact here, which is what makes this a trap
     levels = cli.existing_levels(dst, "zarr3")
-    ratio = levels[0][2] / levels[1][2]
+    ratio = levels[0]["shape"][2] / levels[1]["shape"][2]
     assert ratio != 2.0, "fixture no longer exercises the ceil-division case"
 
 
@@ -139,11 +139,77 @@ def test_describe_rejects_a_path_with_no_volume(tmp_path):
         cli.describe(str(tmp_path / "empty"))
 
 
+def test_levels_report_their_own_chunking(tmp_path):
+    """Chunking is per level, in each level's array metadata — not a volume property.
+
+    A conversion is free to chunk levels differently, so it is read per level rather
+    than assumed from level 0.
+    """
+    dst = _pyramid(tmp_path)
+    levels = cli.existing_levels(dst, "zarr3")
+    for i, lv in levels.items():
+        assert lv["chunks"] == (8, 8, 8), f"level {i}: {lv['chunks']}"
+        # unsharded, so the read unit is the write unit
+        assert lv["read_chunks"] == lv["chunks"]
+
+
+def _sharded_pyramid(path):
+    """A real sharded volume — built through `convert` so it has group metadata.
+
+    A hand-made level-0 array is not a volume: `detect_backend` finds nothing without
+    the OME group, so `info` reports "no volume found".
+    """
+    path = str(path)
+    src = path + ".src"
+    data = np.random.default_rng(1).integers(0, 5, (32, 32, 32), dtype=np.uint8)
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, data.shape, "uint8",
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in data.shape), data)
+    convert(src, path, voxel_size=(8, 8, 8), kind="image", profile="local",
+            chunk=(8, 8, 8), shard=(16, 16, 16), min_dim=16, delete_existing=True)
+    return path
+
+
+def test_sharded_levels_distinguish_shard_from_chunk(tmp_path):
+    """With sharding the write chunk is the SHARD and the read chunk the fetch unit.
+
+    Reporting only one of them would misstate read amplification — the number that
+    actually governs how much gets pulled to satisfy a small read.
+    """
+    lv = cli.existing_levels(_sharded_pyramid(tmp_path / "sh.zarr"), "zarr3")[0]
+    assert lv["chunks"] == (16, 16, 16), "write chunk should be the shard"
+    assert lv["read_chunks"] == (8, 8, 8), "read chunk should be the inner chunk"
+
+
 def test_info_runs_against_a_real_pyramid(tmp_path, capsys):
     dst = _pyramid(tmp_path)
     assert cli.cmd_info(cli._parse_args(["info", dst])) == 0
     out = capsys.readouterr().out
     assert "zarr3" in out and "8x8x8" in out and "16x16x16" in out
+    assert "chunk" in out, "chunking is what you need to size a read; show it"
+
+
+def _header(out):
+    """The column header line. Asserting on the whole output is a trap: pytest names
+    tmp_path after the test, so a test with 'shard' in its name puts that word in the
+    printed volume path."""
+    return next(l for l in out.splitlines() if l.strip().startswith("level"))
+
+
+def test_info_only_adds_a_shard_column_when_something_is_sharded(tmp_path, capsys):
+    """An unsharded volume should not carry a column of dashes."""
+    dst = _pyramid(tmp_path)
+    cli.cmd_info(cli._parse_args(["info", dst]))
+    unsharded_header = _header(capsys.readouterr().out)
+    assert "chunk" in unsharded_header and "shard" not in unsharded_header
+
+    path = _sharded_pyramid(tmp_path / "s.zarr")
+    cli.cmd_info(cli._parse_args(["info", path]))
+    out = capsys.readouterr().out
+    assert "shard" in _header(out)
+    assert "16x16x16" in out and "8x8x8" in out
 
 
 # --------------------------------------------------------------------------- #
