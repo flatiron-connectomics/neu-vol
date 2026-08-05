@@ -5,7 +5,7 @@ import numpy as np
 from em_volume_tools import convert
 from em_volume_tools.backends.base import open_backend
 from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.introspect import detect_backend
+from em_volume_tools.source_metadata import detect_backend
 from em_volume_tools.profiles import precomputed_create_spec, zarr3_create_spec
 
 

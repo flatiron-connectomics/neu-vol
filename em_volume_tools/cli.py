@@ -79,8 +79,9 @@ def describe(volume: str) -> dict:
     what is on disk.
     """
     from em_volume_tools.backends.base import open_backend
-    from em_volume_tools.introspect import (detect_backend, read_level_voxel_sizes,
-                                            read_source_metadata)
+    from em_volume_tools.source_metadata import (detect_backend,
+                                                 read_level_voxel_sizes,
+                                                 read_source_metadata)
 
     fmt = detect_backend(volume)
     if fmt is None:

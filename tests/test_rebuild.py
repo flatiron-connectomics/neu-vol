@@ -236,7 +236,7 @@ def _labels(tmp_path, shape=(64, 64, 64)):
 
 def test_kind_is_inferred_from_the_volume(tmp_path):
     """Neither reducer is a safe default, so it comes from what the volume records."""
-    from em_volume_tools.introspect import detect_backend, read_source_metadata
+    from em_volume_tools.source_metadata import detect_backend, read_source_metadata
 
     src = _src(tmp_path, _labels(tmp_path).astype(np.uint8), name="lab.zarr")
     for prof, sub in (("local", "z"), ("s3-neuroglancer", "pc")):

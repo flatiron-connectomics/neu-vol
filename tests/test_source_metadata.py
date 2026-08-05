@@ -5,7 +5,7 @@ import pytest
 
 from em_volume_tools import convert
 from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.introspect import read_source_metadata
+from em_volume_tools.source_metadata import read_source_metadata
 from em_volume_tools.profiles import zarr3_create_spec
 
 

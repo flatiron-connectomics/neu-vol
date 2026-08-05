@@ -11,7 +11,7 @@ import pytest
 
 from em_volume_tools import cli, convert
 from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.introspect import read_level_voxel_sizes
+from em_volume_tools.source_metadata import read_level_voxel_sizes
 from em_volume_tools.profiles import zarr3_create_spec
 
 

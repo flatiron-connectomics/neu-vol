@@ -14,7 +14,7 @@ import logging
 from typing import Any, Sequence
 
 from ..backends.base import open_backend
-from ..introspect import detect_backend, read_source_metadata
+from ..source_metadata import detect_backend, read_source_metadata
 from ._multiscale import materialize_multiscale
 
 logger = logging.getLogger(__name__)

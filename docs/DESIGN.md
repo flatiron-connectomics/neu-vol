@@ -303,7 +303,7 @@ em_volume_tools/                # volume/EM-specific
 ├── meta.py          # VoxelMeta + coordinate/axis conversion
 ├── location.py      # local/s3/gs/kvstore normalization + subpath join
 ├── aws.py           # S3 credential bootstrap (tensorstore profile-provider workaround)
-├── introspect.py    # read source metadata + detect_backend (autodetect format)
+├── source_metadata.py  # read a source's coordinates + detect_backend (autodetect)
 ├── backends/
 │   ├── base.py      # ArrayBackend protocol + spec opener registry
 │   ├── tensorstore.py  # zarr v3 (sharded/unsharded) + precomputed (canonical view)

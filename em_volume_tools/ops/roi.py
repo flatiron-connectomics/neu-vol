@@ -59,7 +59,7 @@ def extract_roi(
     if isinstance(src, dict):
         src_spec = dict(src)
     else:
-        from ..introspect import detect_backend
+        from ..source_metadata import detect_backend
         fmt = src_format or detect_backend(src)
         if fmt is None:
             raise ValueError(f"could not detect source format at {src!r}; pass src_format=")
