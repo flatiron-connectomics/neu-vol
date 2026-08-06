@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from typing import Any, Callable, Sequence
+
+import numpy as np
 
 from em_blockrun import Block, Manifest, block_map, iter_blocks
 
@@ -84,9 +87,60 @@ def _downsampled(shape: Sequence[int], factor: Sequence[int]) -> tuple[int, ...]
     return tuple(-(-s // f) for s, f in zip(shape, factor))
 
 
-def _run_level(manifest, level, backend, worker_factory, *, resume, verify, client, npartitions):
+#: Ceiling on one task's in-memory source array. Tasks are sized from the source and
+#: destination chunkings, and that product can be enormous — a full-width z-slab of a
+#: PNG stack is 28.8 GB — so it is capped and the shortfall paid as bounded re-reads.
+DEFAULT_TASK_BYTES = 4 * 1024 ** 3
+
+
+def plan_task_shape(src_chunks, dst_chunks, dst_shape, itemsize=1,
+                    max_bytes=DEFAULT_TASK_BYTES):
+    """A task shape that covers whole source AND whole destination chunks.
+
+    Tasks used to be one destination chunk each, ignoring the source entirely. When
+    the source's unit is larger, every task re-fetches a source unit its neighbours
+    also need — measured on a CloudVolume source with 128x2048x2048 chunks written to
+    128^3: **256 destination chunks per source chunk, so 256x the reads** (~331 TB for
+    1.5 TB of data). For a PNG stack, where a slice cannot be partially decoded, the
+    same effect was 13,886x.
+
+    The natural unit is the per-axis LCM of the two chunkings, clamped to the volume.
+    Where that exceeds ``max_bytes`` it is halved along its largest axis until it
+    fits, **always staying a multiple of the destination chunk** — that multiple is
+    not negotiable, because two tasks sharing a destination chunk race on a partial
+    write (see CLAUDE.md). Falling below a whole source unit only costs re-reads.
+    """
+    if not src_chunks or len(src_chunks) != len(dst_chunks):
+        return tuple(dst_chunks)                       # nothing to align to
+
+    shape = []
+    for src, dst, extent in zip(src_chunks, dst_chunks, dst_shape):
+        src, dst = max(1, int(src)), max(1, int(dst))
+        unit = src * dst // math.gcd(src, dst)         # lcm
+        # No point exceeding the volume; keep it a dst multiple on the way down.
+        if unit > extent:
+            unit = max(dst, (extent // dst) * dst) if extent >= dst else dst
+        shape.append(unit)
+
+    def nbytes(s):
+        return math.prod(s) * itemsize
+
+    # Halve the largest axis until it fits, never below one destination chunk.
+    while nbytes(shape) > max_bytes:
+        i = max(range(len(shape)),
+                key=lambda k: (shape[k] // dst_chunks[k], shape[k]))
+        dst = max(1, int(dst_chunks[i]))
+        multiples = shape[i] // dst
+        if multiples <= 1:
+            break                                      # cannot shrink further
+        shape[i] = max(dst, (multiples // 2) * dst)
+    return tuple(shape)
+
+
+def _run_level(manifest, level, backend, worker_factory, *, resume, verify, client,
+               npartitions, task_shape=None):
     """Dispatch one level's blocks, filtering already-done ones and recording results."""
-    blocks = list(iter_blocks(backend.shape, backend.chunks))
+    blocks = list(iter_blocks(backend.shape, task_shape or backend.chunks))
     total = len(blocks)
     if resume and not verify:
         done = manifest.done_keys(level)
@@ -169,11 +223,30 @@ def _run_multiscale(
         if start_level == 0:
             lvl0 = create_level(0, src_shape, identity)
             prev_spec = lvl0.to_spec()
+            # Level 0 is the ONLY level that reads a foreign source, so it is the only
+            # one whose task shape has to reconcile two chunkings. Levels above read
+            # the level below, where the two already agree.
+            task_shape = None
+            try:
+                src_chunks = open_backend(src_spec).chunks
+                task_shape = plan_task_shape(
+                    src_chunks, lvl0.chunks, lvl0.shape,
+                    itemsize=np.dtype(out_dtype).itemsize)
+            except Exception:                 # a source need not expose chunking
+                src_chunks = None
+            if task_shape and tuple(task_shape) != tuple(lvl0.chunks):
+                per_task = math.prod(t // c for t, c in zip(task_shape, lvl0.chunks))
+                logger.info(
+                    "level 0 task shape %s (source chunks %s, destination chunks %s): "
+                    "%d destination chunks per task, so each source chunk is read once "
+                    "rather than %d times",
+                    task_shape, tuple(src_chunks), tuple(lvl0.chunks), per_task, per_task)
             _run_level(manifest, 0, lvl0,
                        lambda *, verify: functools.partial(_copy_block, src_spec=src_spec,
                                                             dst_spec=prev_spec, out_dtype=out_dtype,
                                                             verify=verify),
-                       resume=resume, verify=verify, client=client, npartitions=npartitions)
+                       resume=resume, verify=verify, client=client, npartitions=npartitions,
+                       task_shape=task_shape)
         else:
             seed = open_level(start_level, level_shapes[start_level], cum[start_level])
             got = tuple(int(s) for s in seed.shape)

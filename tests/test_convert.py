@@ -1,3 +1,4 @@
+import math
 import os
 
 import numpy as np
@@ -76,3 +77,69 @@ def test_convert_infers_channels_from_ndim(tmp_path):
     summary = convert(src, dst, voxel_size=(8, 8, 8), multiscale=False,
                       profile="local", chunk=(8, 8, 8), delete_existing=True)
     assert summary["level_shapes"] == [(3, 8, 8, 8)]
+
+
+# --------------------------------------------------------------------------- #
+# Task shape: reconcile source and destination chunking (level 0 only)
+# --------------------------------------------------------------------------- #
+def test_plan_task_shape_covers_whole_source_and_destination_chunks():
+    from em_volume_tools.ops._multiscale import plan_task_shape
+
+    # The specimen5 case: a CloudVolume source chunked 128x2048x2048 into 128^3.
+    t = plan_task_shape((128, 2048, 2048), (128, 128, 128), (15401, 13544, 16648))
+    assert t == (128, 2048, 2048), "should land on exactly one source chunk"
+    for a, d in zip(t, (128, 128, 128)):
+        assert a % d == 0, "a task must cover WHOLE destination chunks or writes race"
+
+
+def test_plan_task_shape_respects_a_memory_ceiling():
+    """A PNG slice cannot be partially decoded, so the LCM is the whole plane —
+    28.8 GB for a 128-slab, which no worker can hold. It must be tiled down while
+    staying a destination-chunk multiple."""
+    from em_volume_tools.ops._multiscale import plan_task_shape
+
+    t = plan_task_shape((1, 13544, 16648), (128, 128, 128), (15401, 13544, 16648),
+                        itemsize=1, max_bytes=4 * 1024 ** 3)
+    assert math.prod(t) <= 4 * 1024 ** 3
+    for a, d in zip(t, (128, 128, 128)):
+        assert a % d == 0
+    assert t[0] == 128, "z must stay a whole destination chunk"
+
+
+def test_plan_task_shape_is_a_no_op_when_chunkings_agree():
+    from em_volume_tools.ops._multiscale import plan_task_shape
+
+    assert plan_task_shape((64, 64, 64), (64, 64, 64), (512, 512, 512)) == (64, 64, 64)
+
+
+def test_plan_task_shape_falls_back_when_the_source_has_no_chunking():
+    from em_volume_tools.ops._multiscale import plan_task_shape
+
+    assert plan_task_shape(None, (32, 32, 32), (256, 256, 256)) == (32, 32, 32)
+
+
+def test_larger_tasks_produce_identical_output_and_fewer_of_them(tmp_path):
+    """The whole point: fewer source reads, byte-identical result.
+
+    A source chunked coarser than the destination previously produced one task per
+    destination chunk, each re-fetching the same source chunk.
+    """
+    import json
+
+    vol = np.random.default_rng(7).integers(0, 200, (8, 64, 64), dtype=np.uint8)
+    src = str(tmp_path / "src.zarr")
+    _make_zarr(src, vol, chunk=(8, 64, 64))          # one coarse source chunk
+    dst = str(tmp_path / "out.zarr")
+    progress = str(tmp_path / "p.jsonl")
+
+    convert(src, dst, voxel_size=(8, 8, 8), kind="image", profile="local",
+            chunk=(8, 16, 16), min_dim=64, delete_existing=True,
+            progress_path=progress)
+
+    got = open_backend({"backend": "zarr3", "path": os.path.join(dst, "0")})
+    np.testing.assert_array_equal(_full(got), vol)
+
+    level0 = [json.loads(l) for l in open(progress) if l.strip()]
+    level0 = [r for r in level0 if r.get("group") == 0]
+    # 4x4 = 16 destination chunks, but they all live in one source chunk.
+    assert len(level0) == 1, f"expected 1 task covering the source chunk, got {len(level0)}"
