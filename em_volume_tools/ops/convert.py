@@ -66,9 +66,15 @@ def convert(
         if fmt is None:
             raise ValueError(
                 f"could not detect source format at {src!r} (no info/zarr.json/.zarray); "
-                "pass src_format= explicitly"
+                "pass src_format= explicitly (use 'image_stack' for a directory or "
+                "glob of ordered 2D slices)"
             )
-        src_spec = {"backend": fmt, "path": src}
+        # The image-stack backend addresses its input as `source` (a directory or a
+        # glob), not `path`. It is also never auto-detected — a directory of PNGs is
+        # not distinguishable from any other directory of PNGs — so it only arrives
+        # here when asked for by name.
+        src_spec = ({"backend": fmt, "source": src} if fmt == "image_stack"
+                    else {"backend": fmt, "path": src})
     meta = read_source_metadata(src_spec)
 
     # The array/scale to actually read (level 0 of an OME group / finest precomputed scale).

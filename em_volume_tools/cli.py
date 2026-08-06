@@ -21,9 +21,12 @@ site-specific configs do not belong in this repo.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
+import os
 import sys
+from datetime import datetime
 
 from em_blockrun import bundled_configs, start_dask
 
@@ -319,24 +322,95 @@ def cmd_downsample(args) -> int:
 # --------------------------------------------------------------------------- #
 # progress
 # --------------------------------------------------------------------------- #
+def _manifest_counts(path: str) -> dict[int, dict[str, int]] | None:
+    """``{level: {status: count}}`` from a run's progress manifest, or None if absent.
+
+    **Statuses are kept apart, not summed into a "done" number.** ``empty`` means the
+    block was read and found to be entirely the fill value, so tensorstore wrote no
+    object — a legitimate outcome for sparse data, and an alarm when it is *every*
+    block: that is what a source the reader cannot actually read looks like. Reporting
+    only a total let a conversion of 1.9 M blocks read as all-zeros and still print
+    100%, which is how a whole run was lost.
+
+    **Much cheaper than listing the store.** A LIST over an object store enumerates
+    every chunk — 674k keys for one level of a full-resolution volume, paginated a
+    thousand at a time — while the manifest is a local append-only JSONL the run
+    already wrote. Measured on that volume: 1.5 s for 772k records, against tens of
+    seconds of S3 listing.
+
+    It answers a subtly different question, though, and that is why ``--storage``
+    exists: the manifest is what the *run recorded*, storage is what is *there*. They
+    diverge if objects were deleted underneath, or if a different run wrote the
+    volume. For "how far along is my conversion" the manifest is both faster and more
+    directly the thing you asked.
+
+    A torn final line is normal — the writer may be appending as this reads — so a
+    line that does not parse is skipped rather than fatal.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    counts: dict[int, dict[str, int]] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            group, status = rec.get("group"), str(rec.get("status"))
+            if isinstance(group, int):
+                counts.setdefault(group, {})
+                counts[group][status] = counts[group].get(status, 0) + 1
+    return counts
+
+
+# Statuses meaning the block will not be retried. "failed" is excluded on purpose:
+# em-blockrun's is_done tests key presence, so a resumed run retries failures, and
+# counting them as done would overstate progress.
+_DONE_STATUSES = ("written", "empty", "skipped")
+
+
 def cmd_progress(args) -> int:
     """Written chunks per level, against the expected count.
 
     Counted through the kvstore rather than a filesystem walk, so it is one listing
     per level and works against an object store — the previous version hardcoded the
     ``file`` driver and could not inspect the s3 volumes ``convert`` writes.
+
+    **Every store opened here goes through ``ensure_credentials``.** tensorstore's S3
+    *profile* provider cannot read ``~/.aws/credentials``, so that call copies the
+    profile into the ``AWS_*`` env vars its *environment* provider does read. Skipping
+    it does not fail outright — the credential chain simply falls through to the EC2
+    instance-metadata service, which does not exist off EC2, and each probe waits out
+    a socket timeout while logging
+    ``AWS_AUTH_CREDENTIALS_PROVIDER_IMDS_SOURCE_FAILURE``. That is slow and noisy
+    rather than broken, which is exactly why it survives review; see the S3 bootstrap
+    note in CLAUDE.md.
     """
     import tensorstore as ts
 
-    from em_volume_tools.location import to_kvstore
+    from em_volume_tools.location import (default_progress_path, ensure_credentials,
+                                          to_kvstore)
 
     volume = args.volume.rstrip("/")
-    print(f"{volume}\n{'level':>5} {'shape':>24} {'chunk':>18} "
-          f"{'done/total':>20} {'%':>7}")
-    done_total = expected_total = 0
+    manifest = None if args.storage else _manifest_counts(
+        args.progress_path or default_progress_path(volume))
+
+    # Timestamped because this is a point-in-time count, and the way you get a rate
+    # out of it is to diff two runs — which needs to know how far apart they were.
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    source = "run manifest" if manifest is not None else "storage listing"
+    header = (f"{'level':>5} {'shape':>24} {'chunk':>18} {'done/total':>20} {'%':>7}")
+    if manifest is not None:
+        header += f" {'written':>10} {'empty':>10}"
+    print(f"{volume}\n{stamp}  (counted from the {source})\n{header}")
+
+    done_total = expected_total = written_total = empty_total = 0
     level = 0
     while True:
-        kv = to_kvstore(f"{volume}/{level}")
+        kv = ensure_credentials(to_kvstore(f"{volume}/{level}"))
         try:
             store = ts.open({"driver": "zarr3", "kvstore": kv}).result()
         except Exception:
@@ -344,17 +418,27 @@ def cmd_progress(args) -> int:
         shape = tuple(int(s) for s in store.shape)
         chunk = tuple(int(c) for c in store.chunk_layout.write_chunk.shape)
         expected = math.prod(math.ceil(s / c) for s, c in zip(shape, chunk))
-        # Unsharded zarr v3 puts chunk objects under "c/"; the metadata key is
-        # zarr.json, which must not be counted as data.
-        listing = ts.KvStore.open({**kv, "path": kv.get("path", "").rstrip("/") + "/"}
-                                  ).result().list().result()
-        done = sum(1 for k in listing
-                   if (k.decode() if isinstance(k, bytes) else str(k)).startswith("c/"))
+        extra = ""
+        if manifest is not None:
+            by_status = manifest.get(level, {})
+            done = sum(n for s, n in by_status.items() if s in _DONE_STATUSES)
+            written, empty = by_status.get("written", 0), by_status.get("empty", 0)
+            written_total += written
+            empty_total += empty
+            extra = f" {written:>10,} {empty:>10,}"
+        else:
+            # Unsharded zarr v3 puts chunk objects under "c/"; the metadata key is
+            # zarr.json, which must not be counted as data.
+            listing = ts.KvStore.open(ensure_credentials(
+                {**kv, "path": kv.get("path", "").rstrip("/") + "/"})
+            ).result().list().result()
+            done = sum(1 for k in listing
+                       if (k.decode() if isinstance(k, bytes) else str(k)).startswith("c/"))
         done_total += done
         expected_total += expected
         pct = 100.0 * done / expected if expected else 100.0
         print(f"{level:>5} {str(shape):>24} {str(chunk):>18} "
-              f"{f'{done}/{expected}':>20} {pct:>6.1f}%")
+              f"{f'{done}/{expected}':>20} {pct:>6.1f}%{extra}")
         level += 1
 
     if level == 0:
@@ -362,8 +446,23 @@ def cmd_progress(args) -> int:
               "unsharded zarr v3 — precomputed and sharded volumes are not counted")
         return 1
     pct = 100.0 * done_total / expected_total if expected_total else 100.0
+    total_extra = (f" {written_total:>10,} {empty_total:>10,}"
+                   if manifest is not None else "")
     print(f"{'TOTAL':>5} {'':>24} {'':>18} "
-          f"{f'{done_total}/{expected_total}':>20} {pct:>6.1f}%")
+          f"{f'{done_total}/{expected_total}':>20} {pct:>6.1f}%{total_extra}")
+
+    # An all-empty run is the signature of a source the reader cannot actually read:
+    # every block came back as fill value, so tensorstore wrote no object and the
+    # totals still say 100%. Loud, because it costs a whole conversion to discover.
+    if manifest is not None and done_total and not written_total:
+        print(f"\nWARNING: {empty_total:,} blocks processed, NONE written.\n"
+              f"  Every block read as entirely the fill value, so no chunk objects\n"
+              f"  exist — the destination holds only metadata. Usually this means the\n"
+              f"  SOURCE could not be read: a precomputed volume written by\n"
+              f"  CloudVolume stores '.gz'-suffixed chunks that tensorstore requests\n"
+              f"  without the suffix and reads as zeros. Check with:\n"
+              f"      em-vol info <src>   and   ls <src>/<scale-key> | head")
+        return 1
     return 0
 
 
@@ -405,7 +504,10 @@ def _parse_args(argv=None):
                    help="destination base (path or s3://bucket/prefix). With "
                         "--format both, '.precomputed' and '.zarr' are appended")
     q.add_argument("--src-format", default=None,
-                   help="backend for --src (default: auto-detect)")
+                   help="backend for --src (default: auto-detect). Use 'image_stack' "
+                        "for a directory or glob of ordered 2D slices (PNG/TIFF) — "
+                        "that one is never auto-detected, and needs --voxel-size "
+                        "since image files carry no physical scale")
     q.add_argument("--format", choices=("precomputed", "zarr", "both"),
                    default="precomputed")
     q.add_argument("--kind", choices=("image", "probability", "segmentation"),
@@ -471,10 +573,26 @@ def _parse_args(argv=None):
                                    "v3 volume being written. Reads only; re-run to "
                                    "refresh.")
     q.add_argument("volume", help="the .zarr group (path or s3://...)")
+    q.add_argument("--progress-path", default=None,
+                   help="the run's progress manifest (default: the same path the "
+                        "conversion would have used). Counting from it is far "
+                        "cheaper than listing an object store")
+    q.add_argument("--storage", action="store_true",
+                   help="count what is actually stored instead of what the run "
+                        "recorded — authoritative, but lists every chunk")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_progress)
 
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+
+    # Image files carry no physical scale, and the op would otherwise fail deep inside
+    # the conversion rather than here. Everything else can read it from the source.
+    if (getattr(args, "src_format", None) == "image_stack"
+            and not getattr(args, "voxel_size", None)):
+        p.error("--src-format image_stack requires --voxel-size: image files record "
+                "no physical scale, so it cannot be read from the source "
+                "(e.g. --voxel-size 8,8,8 for 8 nm isotropic)")
+    return args
 
 
 def main(argv=None) -> int:

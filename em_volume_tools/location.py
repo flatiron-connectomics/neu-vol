@@ -145,6 +145,26 @@ def write_bytes(location: str | Mapping[str, Any], data: bytes, *parts: str) -> 
     store.write(key, bytes(data)).result()
 
 
+def list_keys(location: str | Mapping[str, Any], *parts: str,
+              limit: int | None = None) -> list[str]:
+    """Key names directly under a prefix. ``limit`` stops early.
+
+    Goes through the cached, credential-bootstrapped opener like every other access
+    here. ``limit`` matters on an object store, where an unbounded list enumerates
+    every object under the prefix — hundreds of thousands for one pyramid level.
+    """
+    kv = join(to_kvstore(location), *parts) if parts else dict(to_kvstore(location))
+    if "path" in kv and not str(kv["path"]).endswith("/"):
+        kv["path"] = str(kv["path"]) + "/"
+    store = _open_store(kv)
+    out: list[str] = []
+    for key in store.list().result():
+        out.append(key.decode() if isinstance(key, bytes) else str(key))
+        if limit is not None and len(out) >= limit:
+            break
+    return out
+
+
 def exists(location: str | Mapping[str, Any], *parts: str) -> bool:
     """True if the object exists. One request; safe against object stores."""
     store, key = _kv(location, *parts)

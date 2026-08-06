@@ -45,6 +45,24 @@ def _list_files(source: str) -> list[str]:
     return sorted(files, key=_natural_key)
 
 
+def _lift_pillow_bomb_guard() -> None:
+    """Let Pillow open slices larger than its 179 Mpx "decompression bomb" limit.
+
+    That guard exists to stop a small hostile file from expanding to gigabytes in a
+    web service. An EM section is legitimately far past it — a 16648x13544 slice is
+    225 Mpx — so with the guard in place every read of a real dataset fails with
+    ``DecompressionBombError`` and no conversion is possible.
+
+    This is a deliberate trade for trusted, local scientific data, and it is scoped to
+    this reader rather than set process-wide by a caller who may not expect it.
+    """
+    try:
+        from PIL import Image
+    except ImportError:      # tifffile-only install; nothing to lift
+        return
+    Image.MAX_IMAGE_PIXELS = None
+
+
 def _read_image(path: str) -> np.ndarray:
     if path.lower().endswith((".tif", ".tiff")):
         import tifffile
@@ -53,6 +71,7 @@ def _read_image(path: str) -> np.ndarray:
     else:
         import imageio.v3 as iio
 
+        _lift_pillow_bomb_guard()      # imageio delegates PNG decoding to Pillow
         arr = iio.imread(path)
     if arr.ndim != 2:
         raise ValueError(
