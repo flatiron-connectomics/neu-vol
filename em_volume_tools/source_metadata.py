@@ -18,16 +18,57 @@ from typing import Any, Mapping
 from .location import join, spec_kvstore, to_kvstore
 
 
+#: Precomputed written by CloudVolume, whose chunk keys carry a ``.gz`` suffix.
+#: tensorstore requests the *unsuffixed* key, finds nothing, and returns the fill
+#: value — so the volume reads as all zeros with no error anywhere. A full 1.9 M-block
+#: conversion was lost to exactly this before it was detected.
+PRECOMPUTED_GZ = "neuroglancer_precomputed_gz"
+
+
+def precomputed_chunks_are_gzipped(location: str | Mapping[str, Any],
+                                   scale_key: str) -> bool:
+    """True if this precomputed scale's chunk objects are ``.gz``-suffixed.
+
+    CloudVolume gzips chunks and appends ``.gz`` to the key, which is legal for
+    something that serves them over HTTP with ``Content-Encoding: gzip`` but is not
+    what the precomputed spec addresses. Detected by listing a couple of keys under
+    the scale prefix — bounded, so it costs one small request rather than a full
+    enumeration.
+    """
+    from .location import list_keys
+
+    for key in list_keys(location, scale_key, limit=4):
+        name = key.rsplit("/", 1)[-1]
+        if not name:
+            continue
+        # A chunk key looks like `0-2048_0-2048_0-128`; anything else (a shard
+        # index, a stray file) is not evidence either way.
+        if "_" in name and "-" in name:
+            return name.endswith(".gz")
+    return False
+
+
 def detect_backend(location: str | Mapping[str, Any]) -> str | None:
     """Detect a source's format from its marker file (no data read).
 
     ``info`` -> neuroglancer-precomputed; ``zarr.json`` -> zarr v3;
     ``.zarray``/``.zgroup`` -> zarr v2. Returns ``None`` if none match.
+
+    Precomputed whose chunks are ``.gz``-suffixed reports :data:`PRECOMPUTED_GZ`
+    instead, so callers fail loudly rather than reading zeros.
     """
     kv = to_kvstore(location)
     if "path" in kv and not str(kv["path"]).endswith("/"):
         kv["path"] = str(kv["path"]) + "/"
-    if _read_key(kv, "info") is not None:
+    raw = _read_key(kv, "info")
+    if raw is not None:
+        try:
+            scales = json.loads(raw)["scales"]
+            finest = min(scales, key=lambda s: tuple(s["resolution"]))["key"]
+        except Exception:
+            return "neuroglancer_precomputed"
+        if precomputed_chunks_are_gzipped(kv, finest):
+            return PRECOMPUTED_GZ
         return "neuroglancer_precomputed"
     if _read_key(kv, "zarr.json") is not None:
         return "zarr3"
@@ -61,7 +102,11 @@ def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
     backend = spec.get("backend")
     if backend == "zarr3":
         return _read_zarr_ome(spec)
-    if backend == "neuroglancer_precomputed":
+    # PRECOMPUTED_GZ reads the SAME `info` document — only the chunk keys differ, and
+    # metadata does not live in chunks. Omitting it here silently loses voxel_size,
+    # offset and kind, which makes `convert` demand --voxel-size and, worse, lose the
+    # image/segmentation distinction that decides mean vs mode downsampling.
+    if backend in ("neuroglancer_precomputed", PRECOMPUTED_GZ):
         return _read_precomputed(spec)
     return None
 
@@ -80,7 +125,7 @@ def read_level_voxel_sizes(spec: Mapping[str, Any]) -> list[tuple[float, ...]] |
     in ``(z, y, x)``, spatial axes only.
     """
     backend = spec.get("backend")
-    if backend == "neuroglancer_precomputed":
+    if backend in ("neuroglancer_precomputed", PRECOMPUTED_GZ):   # same `info`
         raw = _read_key(_kvstore_of(spec), "info")
         if raw is None:
             return None
@@ -151,7 +196,12 @@ def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
     offset = tuple(float(o) * v for o, v in zip(voxel_offset_xyz[::-1], voxel_size))
     nch = int(info.get("num_channels", 1))
     return {
-        "data_spec": {"backend": "neuroglancer_precomputed",
+        # Carry the CALLER's backend through. Hardcoding "neuroglancer_precomputed"
+        # here silently routed .gz volumes back to tensorstore — detection said
+        # PRECOMPUTED_GZ, but the spec the workers actually read through said
+        # otherwise, so every block read as zeros. `data_spec` selects the reader;
+        # it must not contradict what detection decided.
+        "data_spec": {"backend": spec.get("backend") or "neuroglancer_precomputed",
                       "kvstore": spec_kvstore(spec), "scale_index": idx},
         "voxel_size": voxel_size,
         "offset": offset,
