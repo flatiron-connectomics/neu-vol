@@ -139,7 +139,12 @@ def test_larger_tasks_produce_identical_output_and_fewer_of_them(tmp_path):
     got = open_backend({"backend": "zarr3", "path": os.path.join(dst, "0")})
     np.testing.assert_array_equal(_full(got), vol)
 
-    level0 = [json.loads(l) for l in open(progress) if l.strip()]
-    level0 = [r for r in level0 if r.get("group") == 0]
+    records = [json.loads(l) for l in open(progress) if l.strip()]
+    level0 = [r for r in records if r.get("group") == 0 and "status" in r]
     # 4x4 = 16 destination chunks, but they all live in one source chunk.
     assert len(level0) == 1, f"expected 1 task covering the source chunk, got {len(level0)}"
+
+    # ...and the run must SAY so, or a reader counting the 16 chunks reports 6%.
+    meta = [r["meta"] for r in records if r.get("group") == 0 and "meta" in r]
+    assert meta and meta[-1]["total"] == 1
+    assert tuple(meta[-1]["task_shape"]) == (8, 64, 64)

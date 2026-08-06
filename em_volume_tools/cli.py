@@ -322,8 +322,18 @@ def cmd_downsample(args) -> int:
 # --------------------------------------------------------------------------- #
 # progress
 # --------------------------------------------------------------------------- #
-def _manifest_counts(path: str) -> dict[int, dict[str, int]] | None:
-    """``{level: {status: count}}`` from a run's progress manifest, or None if absent.
+def _manifest_counts(path: str) -> dict[int, dict] | None:
+    """Per-level progress from a run's manifest, or None if absent.
+
+    ``{level: {"counts": {status: n}, "total": int|None, "task_shape": [...]|None,
+    "grid": (max index + 1 per axis)}}``.
+
+    **The unit is the task, which is not always the chunk.** ``plan_task_shape``
+    sizes a task to cover whole source *and* destination chunks, so one manifest
+    record can stand for 256 destination chunks; the driver records the level's task
+    ``total`` for exactly this reason. ``grid`` is the fallback for manifests written
+    before it did — the largest block index seen per axis, which pins the task grid
+    once a level is complete and lower-bounds it before that.
 
     **Statuses are kept apart, not summed into a "done" number.** ``empty`` means the
     block was read and found to be entirely the fill value, so tensorstore wrote no
@@ -349,7 +359,7 @@ def _manifest_counts(path: str) -> dict[int, dict[str, int]] | None:
     """
     if not path or not os.path.exists(path):
         return None
-    counts: dict[int, dict[str, int]] = {}
+    out: dict[int, dict] = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -359,11 +369,65 @@ def _manifest_counts(path: str) -> dict[int, dict[str, int]] | None:
                 rec = json.loads(line)
             except ValueError:
                 continue
-            group, status = rec.get("group"), str(rec.get("status"))
-            if isinstance(group, int):
-                counts.setdefault(group, {})
-                counts[group][status] = counts[group].get(status, 0) + 1
-    return counts
+            group = rec.get("group", rec.get("level"))
+            if not isinstance(group, int):
+                continue
+            lv = out.setdefault(group, {"counts": {}, "total": None,
+                                        "task_shape": None, "grid": None})
+            if "status" not in rec:                      # a meta line: the denominator
+                meta = rec.get("meta") or {}
+                if isinstance(meta.get("total"), int):
+                    lv["total"] = meta["total"]
+                if meta.get("task_shape"):
+                    lv["task_shape"] = tuple(meta["task_shape"])
+                continue
+            status = str(rec["status"])
+            lv["counts"][status] = lv["counts"].get(status, 0) + 1
+            key = rec.get("key", rec.get("index"))
+            if isinstance(key, list) and all(isinstance(i, int) for i in key):
+                lv["grid"] = (tuple(key) if lv["grid"] is None else
+                              tuple(max(a, b) for a, b in zip(lv["grid"], key)))
+    for lv in out.values():
+        if lv["grid"] is not None:
+            lv["grid"] = tuple(i + 1 for i in lv["grid"])
+    return out
+
+
+def _task_total(lv: dict, chunk_total: int, chunk: tuple, level: int) -> tuple[int, str]:
+    """The denominator for a level's manifest count, and a note if it isn't the chunk grid.
+
+    The manifest counts **tasks**; ``chunk_total`` is the destination *chunk* grid.
+    They are equal for every level a pyramid derives from the level below, and
+    differ at level 0 whenever the source's natural read unit is coarser than the
+    destination chunk — specimen5's is 128x2048x2048 against 128^3, so 7,623 tasks
+    against 1,680,206 chunks, and dividing one by the other reported 0.17% for a
+    run that was 36% done.
+
+    Order of preference:
+      1. the ``total`` the driver recorded — exact, and known before dispatch;
+      2. the grid implied by the largest recorded block index, for manifests from
+         before that was recorded. It is exact for a level that finished and a
+         lower bound for one still running, so the percentage is an upper bound;
+      3. the chunk grid, which is right whenever a task *is* a chunk.
+    """
+    if lv.get("total"):
+        total = lv["total"]
+        task = lv.get("task_shape")
+        if total != chunk_total and task:
+            per = math.prod(max(1, t // c) for t, c in zip(task, chunk))
+            return total, (f"level {level} is counted in tasks of "
+                           f"{tuple(task)}, {per} destination chunks each "
+                           f"({chunk_total:,} chunks in {total:,} tasks)")
+        return total, ""
+    grid = lv.get("grid")
+    if grid and math.prod(grid) < chunk_total:
+        implied = math.prod(grid)
+        return implied, (
+            f"level {level}: this manifest predates the recorded task total, so "
+            f"{implied:,} is inferred from the recorded block indices (grid {grid}, "
+            f"against {chunk_total:,} chunks). Exact if the level finished, a lower "
+            f"bound if it is still running — so the % is an upper bound")
+    return chunk_total, ""
 
 
 # Statuses meaning the block will not be retried. "failed" is excluded on purpose:
@@ -373,7 +437,12 @@ _DONE_STATUSES = ("written", "empty", "skipped")
 
 
 def cmd_progress(args) -> int:
-    """Written chunks per level, against the expected count.
+    """Blocks done per level, against the number the level has.
+
+    The unit differs by source: from the manifest it is the **task** the run
+    dispatched (see ``_task_total``), from ``--storage`` it is the stored chunk
+    object. They coincide except at level 0 of a conversion whose source reads in
+    units coarser than the destination chunk.
 
     Counted through the kvstore rather than a filesystem walk, so it is one listing
     per level and works against an object store — the previous version hardcoded the
@@ -395,8 +464,8 @@ def cmd_progress(args) -> int:
                                           to_kvstore)
 
     volume = args.volume.rstrip("/")
-    manifest = None if args.storage else _manifest_counts(
-        args.progress_path or default_progress_path(volume))
+    manifest_path = args.progress_path or default_progress_path(volume)
+    manifest = None if args.storage else _manifest_counts(manifest_path)
 
     # Timestamped because this is a point-in-time count, and the way you get a rate
     # out of it is to diff two runs — which needs to know how far apart they were.
@@ -405,9 +474,17 @@ def cmd_progress(args) -> int:
     header = (f"{'level':>5} {'shape':>24} {'chunk':>18} {'done/total':>20} {'%':>7}")
     if manifest is not None:
         header += f" {'written':>10} {'empty':>10}"
-    print(f"{volume}\n{stamp}  (counted from the {source})\n{header}")
+    print(f"{volume}\n{stamp}  (counted from the {source})")
+    # Falling back to storage because no manifest was found used to be indistinguishable
+    # from --storage: same header, no other tell. Say it, and say where it looked.
+    if manifest is None and not args.storage:
+        print(f"  no run manifest at {manifest_path}\n"
+              f"  (pass --progress-path if the run wrote it elsewhere; a remote --dst "
+              f"defaults it to the launching directory)")
+    print(header)
 
     done_total = expected_total = written_total = empty_total = 0
+    notes: list[str] = []
     level = 0
     while True:
         kv = ensure_credentials(to_kvstore(f"{volume}/{level}"))
@@ -420,12 +497,16 @@ def cmd_progress(args) -> int:
         expected = math.prod(math.ceil(s / c) for s, c in zip(shape, chunk))
         extra = ""
         if manifest is not None:
-            by_status = manifest.get(level, {})
+            lv = manifest.get(level, {})
+            by_status = lv.get("counts", {})
             done = sum(n for s, n in by_status.items() if s in _DONE_STATUSES)
             written, empty = by_status.get("written", 0), by_status.get("empty", 0)
             written_total += written
             empty_total += empty
             extra = f" {written:>10,} {empty:>10,}"
+            expected, note = _task_total(lv, expected, chunk, level)
+            if note:
+                notes.append(note)
         else:
             # Unsharded zarr v3 puts chunk objects under "c/"; the metadata key is
             # zarr.json, which must not be counted as data.
@@ -450,6 +531,8 @@ def cmd_progress(args) -> int:
                    if manifest is not None else "")
     print(f"{'TOTAL':>5} {'':>24} {'':>18} "
           f"{f'{done_total}/{expected_total}':>20} {pct:>6.1f}%{total_extra}")
+    for note in notes:
+        print(f"\n  {note}")
 
     # An all-empty run is the signature of a source the reader cannot actually read:
     # every block came back as fill value, so tensorstore wrote no object and the

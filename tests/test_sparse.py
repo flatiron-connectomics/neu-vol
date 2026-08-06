@@ -52,7 +52,8 @@ def test_empty_chunks_elided_but_recorded(tmp_path):
 
     # manifest recorded all 8 blocks (1 written + 7 empty) as done
     prog = summary["progress_path"]
-    statuses = [json.loads(l)["status"] for l in open(prog) if l.strip()]
+    records = [json.loads(l) for l in open(prog) if l.strip()]
+    statuses = [r["status"] for r in records if "status" in r]  # skip the meta line
     assert statuses.count("written") == 1
     assert statuses.count("empty") == 7
 

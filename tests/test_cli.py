@@ -4,6 +4,7 @@ The inspection tests matter most. `info` and `downsample` both have to agree wit
 is actually on disk, and both used to be separate scripts that could drift.
 """
 
+import json
 import os
 
 import numpy as np
@@ -258,3 +259,94 @@ def test_downsample_refuses_when_disk_disagrees_with_the_schedule(tmp_path):
                             "--factors", "1,4,4", "--min-dim", "1", "--dry-run"])
     with pytest.raises(SystemExit, match="disagrees with the computed schedule"):
         cli.cmd_downsample(args)
+
+
+# --------------------------------------------------------------------------- #
+# progress — the manifest counts TASKS, and a task is not always a chunk
+# --------------------------------------------------------------------------- #
+def _write_manifest(path, lines):
+    with open(path, "w") as f:
+        for rec in lines:
+            f.write(json.dumps(rec) + "\n")
+    return str(path)
+
+
+def test_manifest_counts_separates_meta_from_tasks(tmp_path):
+    p = _write_manifest(tmp_path / "p.jsonl", [
+        {"group": 0, "meta": {"total": 4, "task_shape": [8, 32, 32]}},
+        {"group": 0, "key": [0, 0, 0], "status": "written"},
+        {"group": 0, "key": [0, 1, 1], "status": "empty"},
+        {"group": 1, "key": [0, 0, 0], "status": "written"},
+    ])
+    m = cli._manifest_counts(p)
+    assert m[0]["counts"] == {"written": 1, "empty": 1}
+    assert m[0]["total"] == 4 and m[0]["task_shape"] == (8, 32, 32)
+    assert m[0]["grid"] == (1, 2, 2)          # max index + 1, per axis
+    assert m[1]["total"] is None
+
+
+def test_manifest_counts_is_none_when_there_is_no_manifest(tmp_path):
+    assert cli._manifest_counts(str(tmp_path / "nope.jsonl")) is None
+
+
+def test_task_total_prefers_the_recorded_total_over_the_chunk_grid():
+    """The bug: 7,623 tasks divided by 1,680,206 chunks reported 0.17% for a run
+    that was 36% done."""
+    lv = {"total": 7623, "task_shape": (128, 2048, 2048), "grid": (121, 7, 9)}
+    total, note = cli._task_total(lv, 1680206, (128, 128, 128), 0)
+    assert total == 7623
+    assert "256 destination chunks each" in note
+
+
+def test_task_total_says_nothing_when_a_task_is_a_chunk():
+    lv = {"total": 213378, "task_shape": (128, 128, 128), "grid": (61, 53, 66)}
+    total, note = cli._task_total(lv, 213378, (128, 128, 128), 1)
+    assert total == 213378 and note == ""
+
+
+def test_task_total_infers_the_grid_for_a_manifest_written_before_totals():
+    """Runs that finished before the total was recorded must still read correctly —
+    the recorded block indices pin the task grid once a level is complete."""
+    lv = {"total": None, "task_shape": None, "grid": (121, 7, 9)}
+    total, note = cli._task_total(lv, 1680206, (128, 128, 128), 0)
+    assert total == 7623
+    assert "inferred" in note and "upper bound" in note
+
+
+def test_task_total_falls_back_to_the_chunk_grid():
+    lv = {"total": None, "task_shape": None, "grid": (2, 2, 2)}
+    assert cli._task_total(lv, 8, (8, 8, 8), 0) == (8, "")
+
+
+def test_progress_reports_100pct_when_tasks_are_coarser_than_chunks(tmp_path, capsys):
+    """End to end: a source chunked coarser than the destination.
+
+    16 destination chunks at level 0, covered by one task. Before the fix this
+    printed 1/16 = 6% for a finished conversion.
+    """
+    vol = np.random.default_rng(3).integers(0, 200, (8, 64, 64), dtype=np.uint8)
+    src = str(tmp_path / "src.zarr")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, vol.shape, "uint8",
+                          dimension_names=("z", "y", "x"), chunk=(8, 64, 64)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in vol.shape), vol)
+
+    dst = str(tmp_path / "out.zarr")
+    convert(src, dst, voxel_size=(8, 8, 8), kind="image", profile="local",
+            chunk=(8, 16, 16), min_dim=64, delete_existing=True)
+
+    assert cli.cmd_progress(cli._parse_args(["progress", dst])) == 0
+    out = capsys.readouterr().out
+    level0 = next(l for l in out.splitlines() if l.split()[:1] == ["0"])
+    assert "1/1" in level0 and "100.0%" in level0
+    assert "destination chunks each" in out, "say what the unit is when it isn't a chunk"
+
+
+def test_progress_says_so_when_the_manifest_is_missing(tmp_path, capsys):
+    """Silently falling back to a storage listing looked identical to --storage."""
+    dst = _pyramid(tmp_path)
+    os.remove(dst + ".progress.jsonl")
+    assert cli.cmd_progress(cli._parse_args(["progress", dst])) == 0
+    out = capsys.readouterr().out
+    assert "no run manifest at" in out and "storage listing" in out

@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import time
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -137,19 +138,42 @@ def plan_task_shape(src_chunks, dst_chunks, dst_shape, itemsize=1,
     return tuple(shape)
 
 
+def _elapsed(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}h{m:02d}m{s:02d}s" if h else (f"{m:d}m{s:02d}s" if m else f"{s:d}s")
+
+
 def _run_level(manifest, level, backend, worker_factory, *, resume, verify, client,
                npartitions, task_shape=None):
-    """Dispatch one level's blocks, filtering already-done ones and recording results."""
-    blocks = list(iter_blocks(backend.shape, task_shape or backend.chunks))
+    """Dispatch one level's blocks, filtering already-done ones and recording results.
+
+    The task total goes into the manifest **before** dispatch. It is the only place
+    it is known — a task may span many destination chunks (see ``plan_task_shape``),
+    so a reader counting the chunk grid gets a denominator up to 256x too large, and
+    `em-vol progress` did exactly that. Logging is likewise before *and* after: the
+    single after-the-fact line this replaced arrived only once the level finished,
+    reporting "0 already done" about work that had by then all been done.
+    """
+    unit = tuple(int(c) for c in (task_shape or backend.chunks))
+    blocks = list(iter_blocks(backend.shape, unit))
     total = len(blocks)
+    manifest.record_meta(level, total=total, task_shape=list(unit),
+                         shape=[int(s) for s in backend.shape],
+                         chunks=[int(c) for c in backend.chunks])
     if resume and not verify:
         done = manifest.done_keys(level)
         blocks = [b for b in blocks if b.index not in done]
+    logger.info("level %d: %d of %d tasks of %s to run (%d already done, "
+                "shape=%s chunks=%s)",
+                level, len(blocks), total, unit, total - len(blocks),
+                tuple(int(s) for s in backend.shape), tuple(int(c) for c in backend.chunks))
     on_result = lambda res, lvl=level: manifest.record(lvl, res)  # noqa: E731
+    t0 = time.monotonic()
     block_map(blocks, worker_factory(verify=verify), client=client,
               npartitions=npartitions, on_result=on_result)
-    logger.info("level %d: %d blocks (%d already done, shape=%s chunks=%s)",
-                level, total, total - len(blocks), backend.shape, backend.chunks)
+    logger.info("level %d finished in %s: %s", level, _elapsed(time.monotonic() - t0),
+                manifest.counts(level) or "nothing to do")
 
 
 def _run_multiscale(
