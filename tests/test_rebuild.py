@@ -27,7 +27,7 @@ def _src(tmp_path, vol, name="src.zarr"):
 
     path = str(tmp_path / name)
     be = TensorStoreBackend.create(
-        zarr3_create_spec("local", path, vol.shape, "uint8",
+        zarr3_create_spec("local", path, vol.shape, str(vol.dtype),
                           dimension_names=("z", "y", "x"), chunk=(32, 32, 32)),
         delete_existing=True)
     be.write_region(tuple(slice(0, s) for s in vol.shape), vol)
@@ -265,6 +265,68 @@ def test_segmentation_rebuild_does_not_average_labels(tmp_path):
     for lvl in _levels(dst)[1:]:
         stray = set(np.unique(lvl)) - {0, 100, 200}
         assert not stray, f"downsampling invented labels {stray}"
+
+
+def test_rebuild_from_level_0_seeds_from_it_instead_of_recreating_it(tmp_path):
+    """Level 0 is a legitimate seed — rebuilding the whole pyramid is the ordinary
+    repair, and it is now the CLI's default.
+
+    It used to die with ALREADY_EXISTS: `_run_multiscale` read ``start_level == 0`` as
+    "there is no seed, create level 0 and copy the source into it", which is the
+    *conversion* path. On a volume being repaired, that level already exists. The
+    printed plan even said "level 0  SEED (read only)" immediately before trying to
+    create it.
+    """
+    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+
+    vol = _volume()
+    dst = str(tmp_path / "v.zarr")
+    convert(_src(tmp_path, vol), dst, profile="local", kind="image",
+            voxel_size=(8.0, 8.0, 8.0), chunk=(32, 32, 32), min_dim=MIN_DIM, client=None)
+    before = _levels(dst)
+    assert len(before) >= 3
+
+    for i in range(1, len(before)):                     # wreck everything above 0
+        be = open_backend({"backend": "zarr3", "path": f"{dst}/{i}"})
+        be.write_region(tuple(slice(0, s) for s in be.shape), np.zeros(be.shape, np.uint8))
+    clear_backend_cache()
+
+    rebuild_pyramid(dst, start_level=0, kind="image", chunk=(32, 32, 32),
+                    min_dim=MIN_DIM, client=None)
+    clear_backend_cache()
+    got = _levels(dst)
+    assert len(got) == len(before)
+    np.testing.assert_array_equal(got[0], before[0], "level 0 must be read, not written")
+    for i in range(1, len(before)):
+        np.testing.assert_array_equal(got[i], before[i], f"level {i} not rebuilt")
+
+
+def test_rebuild_from_level_0_works_on_precomputed_too(tmp_path):
+    """The format the failure was reported on. Its scales share one `info`, so a
+    create against an existing scale key is what raised ALREADY_EXISTS."""
+    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from em_volume_tools.profiles import StorageProfile
+
+    labels = np.zeros((64, 64, 64), np.uint64)
+    labels[16:32, 16:32, 16:32] = 7                     # sparse, like a GT volume
+    dst = str(tmp_path / "gt.precomputed")
+    convert(_src(tmp_path, labels, name="lab.zarr"), dst, kind="segmentation",
+            voxel_size=(8.0, 8.0, 8.0), chunk=(16, 16, 16), min_dim=MIN_DIM,
+            profile=StorageProfile("neuroglancer_precomputed", chunk=(16, 16, 16),
+                                   compressor="gzip"),
+            client=None)
+    clear_backend_cache()
+
+    out = rebuild_pyramid(dst, start_level=0, chunk=(16, 16, 16), min_dim=MIN_DIM,
+                          client=None)
+    assert out["num_levels"] >= 3
+    clear_backend_cache()
+    for i in range(1, out["num_levels"]):
+        be = open_backend({"backend": "neuroglancer_precomputed", "path": dst,
+                           "scale_index": i})
+        got = set(np.unique(be.read_region(tuple(slice(0, s) for s in be.shape))).tolist())
+        assert got <= {0, 7}, f"level {i} invented labels {got - {0, 7}}"
+        assert 7 in got, f"level {i} lost the only label in the volume"
 
 
 def test_kind_must_be_given_when_the_volume_records_none(tmp_path):

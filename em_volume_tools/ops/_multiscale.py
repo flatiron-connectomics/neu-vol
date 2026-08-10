@@ -215,17 +215,24 @@ def _run_multiscale(
     resume: bool,
     verify: bool,
     progress_path: str | None,
-    start_level: int = 0,
+    seed_level: int | None = None,
     open_level: Callable[[int, Sequence[int], Sequence[int]], TensorStoreBackend] | None = None,
 ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]], dict[str, int]]:
     """Create + fill each level. Returns (level_shapes, cumulative_factors, status_counts).
 
-    ``start_level`` > 0 rebuilds an **existing** pyramid in place: levels at or
-    below it are left alone and the cascade is seeded from level ``start_level``
-    instead of from a fresh copy of ``src_spec``. The schedule is still computed
-    from level 0, so the regenerated levels keep the factors the original run
-    used — ``downsample_schedule`` is iterative, so its tail from ``start_level``
-    is what a schedule rooted there would produce anyway, and computing the whole
+    ``seed_level=None`` is a conversion: level 0 is **created** and ``src_spec`` is
+    copied into it, then the pyramid cascades from there.
+
+    An integer ``seed_level`` rebuilds an **existing** pyramid in place: that level is
+    read as the input, levels below it are left alone, and everything above is
+    regenerated. **Zero is a legitimate seed** — rebuilding the whole pyramid from
+    level 0 is the ordinary repair — which is why this is a separate parameter rather
+    than ``start_level == 0`` doing double duty. It did once, and a rebuild from level
+    0 took the conversion path and died trying to create a level that already existed.
+
+    The schedule is still computed from level 0, so regenerated levels keep the factors
+    the original run used — ``downsample_schedule`` is iterative, so its tail from the
+    seed is what a schedule rooted there would produce anyway, and computing the whole
     thing also yields the shapes needed to rewrite complete metadata.
 
     The seed is obtained through ``open_level``, never ``create_level``: opening
@@ -241,12 +248,12 @@ def _run_multiscale(
                             max_levels=max_levels, min_dim=min_dim)
         if multiscale else []
     )
-    if start_level < 0 or start_level > len(schedule):
+    if seed_level is not None and not 0 <= seed_level <= len(schedule):
         raise ValueError(
-            f"start_level {start_level} out of range: this volume's schedule has "
+            f"start_level {seed_level} out of range: this volume's schedule has "
             f"levels 0..{len(schedule)}")
-    if start_level and open_level is None:
-        raise ValueError("start_level > 0 requires open_level")
+    if seed_level is not None and open_level is None:
+        raise ValueError("seeding from an existing level requires open_level")
 
     # Shapes/cumulative factors for EVERY level, including the ones left alone —
     # the caller needs them to write metadata describing the whole pyramid.
@@ -264,7 +271,7 @@ def _run_multiscale(
         manifest.reset()
 
     try:
-        if start_level == 0:
+        if seed_level is None:
             lvl0 = create_level(0, src_shape, identity)
             prev_spec = lvl0.to_spec()
             # Level 0 is the ONLY level that reads a foreign source, so it is the only
@@ -292,20 +299,21 @@ def _run_multiscale(
                        resume=resume, verify=verify, client=client, npartitions=npartitions,
                        task_shape=task_shape)
         else:
-            seed = open_level(start_level, level_shapes[start_level], cum[start_level])
+            seed = open_level(seed_level, level_shapes[seed_level], cum[seed_level])
             got = tuple(int(s) for s in seed.shape)
-            want = tuple(int(s) for s in level_shapes[start_level])
+            want = tuple(int(s) for s in level_shapes[seed_level])
             if got != want:
                 raise ValueError(
-                    f"level {start_level} has shape {got}, but the pyramid schedule "
+                    f"level {seed_level} has shape {got}, but the pyramid schedule "
                     f"predicts {want}. Regenerating on top of it would produce a "
                     f"volume whose levels disagree; check voxel_size/factors, or "
                     f"rebuild from a level that matches.")
             prev_spec = seed.to_spec()
-            logger.info("rebuilding from existing level %d %s (levels 0-%d untouched)",
-                        start_level, got, start_level)
+            logger.info("rebuilding from existing level %d %s (level%s below it "
+                        "untouched)", seed_level, got,
+                        f"s 0-{seed_level - 1}" if seed_level else " 0 is the seed; none")
 
-        for i in range(start_level + 1, len(schedule) + 1):
+        for i in range((0 if seed_level is None else seed_level) + 1, len(schedule) + 1):
             ff = _full_factor(schedule[i - 1], has_channels)
             lvl = create_level(i, level_shapes[i], cum[i])
             lvl_spec = lvl.to_spec()
@@ -329,7 +337,7 @@ def materialize_zarr_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
-    resume=False, verify=False, progress_path=None, start_level=0,
+    resume=False, verify=False, progress_path=None, seed_level=None,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),  # precomputed-only; ignored here
 ) -> dict:
     prof = get_profile(profile)
@@ -347,7 +355,7 @@ def materialize_zarr_multiscale(
         # A rebuild targets levels that already exist, so it must reopen them
         # rather than create: creating over an existing level is an error.
         return TensorStoreBackend.open_or_create(
-            _level_spec(i, shape), resume=resume or verify or bool(start_level),
+            _level_spec(i, shape), resume=resume or verify or seed_level is not None,
             delete_existing=delete_existing)
 
     def open_level(i, shape, cum):
@@ -361,7 +369,7 @@ def materialize_zarr_multiscale(
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
         resume=resume, verify=verify, progress_path=progress_path,
-        start_level=start_level, open_level=open_level,
+        seed_level=seed_level, open_level=open_level,
     )
 
     datasets, scales = [], []
@@ -398,7 +406,7 @@ def materialize_precomputed_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
-    resume=False, verify=False, progress_path=None, start_level=0,
+    resume=False, verify=False, progress_path=None, seed_level=None,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),
 ) -> dict:
     prof = get_profile(profile)
@@ -428,7 +436,7 @@ def materialize_precomputed_multiscale(
         # For precomputed, delete_existing must apply only to scale 0 (shared volume).
         # A rebuild reopens existing scales; creating over one is an error.
         return TensorStoreBackend.open_or_create(
-            spec, resume=resume or verify or bool(start_level),
+            spec, resume=resume or verify or seed_level is not None,
             delete_existing=(delete_existing and i == 0))
 
     def open_level(i, shape, cum):
@@ -442,7 +450,7 @@ def materialize_precomputed_multiscale(
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
         resume=resume, verify=verify, progress_path=progress_path,
-        start_level=start_level, open_level=open_level,
+        seed_level=seed_level, open_level=open_level,
     )
     scales = [[float(v * c) for v, c in zip(voxel_size, F)] for F in cum]
     logger.info("wrote precomputed multiscale info: %d scales (encoding=%s)", len(level_shapes), encoding)

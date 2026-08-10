@@ -59,7 +59,8 @@ def rebuild_pyramid(
 ) -> dict:
     """Rebuild levels ``start_level+1 …`` of the volume at ``dst``, in place.
 
-    ``start_level`` is the level to derive from — it is read, never written.
+    ``start_level`` is the level to derive from — it is read, never written. **0 is
+    valid and is the ordinary case**: rebuild the whole pyramid from full resolution.
 
     ``kind`` picks the reducer: ``"image"`` is a mask-weighted mean (anti-aliased),
     ``"segmentation"`` a label-preserving mode. It defaults to whatever the volume
@@ -127,7 +128,9 @@ def rebuild_pyramid(
                 dst, start_level, tuple(level0.shape), voxel_size, kind)
 
     return materialize_multiscale(
-        src_spec=level0_spec,          # unused when start_level > 0 (no level-0 copy)
+        # Never read: a rebuild seeds from a level that already exists, so there is no
+        # level-0 copy. It is passed because the signature is shared with `convert`.
+        src_spec=level0_spec,
         src_shape=level0.shape,
         src_dtype=str(level0.dtype),
         dst=dst,
@@ -155,5 +158,9 @@ def rebuild_pyramid(
         verify=verify,
         progress_path=progress_path,
         validate=validate,
-        start_level=start_level,
+        # An int, never None: every level of a rebuild is seeded from one that exists,
+        # including level 0. None would mean "convert" — create level 0 and copy a
+        # source into it — which is how `--start-level 0` used to die with
+        # ALREADY_EXISTS on a volume it was supposed to be repairing.
+        seed_level=start_level,
     )
