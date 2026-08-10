@@ -11,6 +11,7 @@ continues where it stopped rather than starting over.
     em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
     em-vol write   <volume> --src ... --offset   # put one subvolume into it
     em-vol annotations <volume>                  # a viewer layer marking where data is
+    em-vol relabel <volume> --out ...            # one id range per occupied region
 
 ``create`` + ``write`` are the small-pieces path, and they are not block-mapped:
 ``create`` lays out an empty volume (optionally copying a reference's frame exactly),
@@ -788,6 +789,72 @@ def cmd_annotations(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# relabel
+# --------------------------------------------------------------------------- #
+def cmd_relabel(args) -> int:
+    """Give each occupied region of a sparse volume its own range of label ids.
+
+    Runs in this process, no dask: the regions are renumbered in order because each
+    range starts where the last ended, so there is nothing to parallelise.
+    """
+    from em_volume_tools.ops.relabel import (apply_relabel, default_map_path,
+                                             plan_relabel)
+
+    try:
+        plan = plan_relabel(args.volume, out=args.out, in_place=args.in_place,
+                            level=args.level, block_size=args.block_size)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+
+    where = ("in place" if plan["in_place"] else f"-> {plan['destination']}")
+    print(f"{plan['volume']}  {where}")
+    print(f"  level {plan['level']}, dtype {plan['dtype']}, chunk {plan['chunk']}: "
+          f"{plan['n_chunks']} stored chunks in {len(plan['regions'])} region(s)")
+    if plan["block_size"]:
+        print(f"  region k numbered from {plan['block_size']}*k+1, so the region is "
+              f"readable off the id")
+    else:
+        print(f"  numbered consecutively from 1, each region continuing the last")
+
+    map_path = args.map or default_map_path(plan["destination"], plan["level"])
+    try:
+        result = apply_relabel(plan, dry_run=args.dry_run, overwrite=args.overwrite,
+                               map_path=map_path)
+    except (FileExistsError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+
+    print(f"\n{'#':>3} {'chunks':>7} {'labels':>7} {'new ids':>17}  box zyx")
+    for e in result["regions"]:
+        rng = "-" if not e["new_id_range"] else \
+            f"{e['new_id_range'][0]}-{e['new_id_range'][1]}"
+        box = " ".join(f"{lo}-{hi}" for lo, hi in zip(e["lo_zyx"], e["hi_zyx"]))
+        print(f"{e['index']:>3} {e['chunks']:>7} {e['n_labels']:>7} {rng:>17}  {box}")
+
+    print(f"\n{result['n_labels_in']} label-instances, "
+          f"{result['n_distinct_in']} distinct before, "
+          f"{result['n_labels_out']} after")
+    if result["collisions_resolved"]:
+        # The whole point of the operation, so it is stated as a number rather than
+        # left for the reader to infer from the two totals.
+        print(f"  {result['collisions_resolved']} id(s) were shared by more than one "
+              f"region and are now distinct")
+    else:
+        print(f"  no id was shared between regions — this volume did not need it")
+    if result["stale_levels"]:
+        print(f"\n  WARNING: level(s) {result['stale_levels']} still hold the OLD ids "
+              f"and now disagree with level {plan['level']}.\n"
+              f"      em-vol downsample {plan['destination']} "
+              f"--start-level {plan['level']}")
+
+    if args.dry_run:
+        print(f"\nDRY RUN: nothing written. The regions were read — the mapping is only "
+              f"knowable from the voxels — so a real run repeats those reads.")
+    else:
+        print(f"\nwrote the old->new mapping to {result['map_path']}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
 def _maybe_cluster(args):
@@ -1080,6 +1147,51 @@ def _parse_args(argv=None):
                         "usable one the layer is unitless and will not line up")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_annotations)
+
+    # --- relabel ------------------------------------------------------------
+    q = sub.add_parser(
+        "relabel", help="give each occupied region its own range of label ids",
+        description="Renumber a SPARSE segmentation volume so each occupied region gets "
+                    "a disjoint range of ids.\n\n"
+                    "Ground truth annotated chunk by chunk usually numbers every chunk "
+                    "from 1, so one integer means a different cell in each — meshed, "
+                    "that becomes a single body with components scattered across the "
+                    "volume. This walks the regions in order and gives each its own "
+                    "range, so an id identifies one cell in one region.\n\n"
+                    "Regions come from stored-chunk occupancy (as `em-vol "
+                    "annotations`), so they are disjoint and chunk-aligned: no write is "
+                    "a partial-chunk update. Serial by construction — each range starts "
+                    "where the last ended — so it runs in this process, no dask.\n\n"
+                    "SINGLE-SCALE, like `em-vol write`: run `em-vol downsample "
+                    "--start-level <level>` afterwards, then re-mesh.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("volume", help="the volume to read (path or s3://...)")
+    dest = q.add_mutually_exclusive_group(required=True)
+    dest.add_argument("--out", default=None, metavar="VOLUME",
+                      help="write the renumbered volume here instead, created empty "
+                           "with `--like <volume>` so a voxel index means the same "
+                           "thing in both. Preferred: a sparse copy is nearly free and "
+                           "the original stays as the record of the raw annotation")
+    dest.add_argument("--in-place", action="store_true",
+                      help="overwrite the ids in the volume itself. Recoverable only "
+                           "through the mapping file")
+    q.add_argument("--level", type=int, default=0,
+                   help="which level to renumber (default: 0)")
+    q.add_argument("--block-size", type=int, default=None, metavar="N",
+                   help="number region k from N*k+1 instead of consecutively, so the "
+                        "region a label came from is readable off the id. Refuses if a "
+                        "region holds more than N labels")
+    q.add_argument("--map", default=None, metavar="PATH",
+                   help="where to write the old->new mapping (default: "
+                        "'<destination>.relabel-<level>.json' here). It is the only way "
+                        "back from a new id to the region and label it came from")
+    q.add_argument("--overwrite", action="store_true",
+                   help="allow --out to replace an existing volume")
+    q.add_argument("--dry-run", action="store_true",
+                   help="report the regions and the ranges they would get; write "
+                        "nothing. Still reads them, since the ids come from the voxels")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_relabel)
 
     args = p.parse_args(argv)
 

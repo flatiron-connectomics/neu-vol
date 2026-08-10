@@ -480,9 +480,57 @@ anyway, because unlike meshes and skeletons annotations cannot be named from a v
 own `info` — a viewer must add them as a separate source regardless, so a state file is
 the distribution unit either way.
 
+**Relabelling reuses the region finder, and that is the point of §12.**
+
 **The layer declares its own `outputDimensions`.** Annotation coordinates are read in
 the layer's frame rather than the viewer's, which is what lets one layer be pasted into
 any state of the same volume. That needs a real unit: precomputed always records nm and
 OME-NGFF spells its units out, but an unrecognised one leaves the layer unitless and
 misaligned, so it warns and points at `--voxel-size` rather than inventing a scale — a
 wrong scale would place every box somewhere plausible and wrong.
+
+
+## 12. `relabel`: one id range per occupied region
+
+Ground truth annotated chunk by chunk comes back with every chunk numbered from 1, so an
+integer names a different cell in each. Measured on sample3's gt_v1 at scale 0: 3,832
+label-instances across 12 regions but only **1,901 distinct ids, 508 of them used by more
+than one region**. Nothing downstream can tell — it meshes into one body whose components
+are scattered across the volume, correct for the label and useless as ground truth.
+
+The operation is a walk over the occupied regions giving each its own range. Two
+properties from §11 make it almost free of design:
+
+- Regions come from **stored-chunk occupancy**, so they are pairwise disjoint by
+  construction. No voxel belongs to two, so no id assignment can conflict.
+- It is **serial by construction** — the next range begins where the last ended — so
+  there is nothing to parallelise and nothing to coordinate. That is why this is a
+  calling-process op like `create`/`write` rather than a block-mapped one.
+
+**Boxes are deliberately not tightened**, which is the one place §11's default is wrong
+here. A tightened box is the bounding box of nonzero voxels seen at a *coarse* level, and
+mode downsampling can drop a stray voxel — so it can exclude scale-0 data that really is
+there. Renumbering inside it would then leave that data holding an old id, silently
+mixing two numbering schemes in one volume, and the volume would look fine. The
+chunk-aligned box provably covers every stored chunk. It also sits on the destination's
+chunk grid, so no write is a partial-chunk read-modify-write (§10's hazard never arises).
+
+**The mapping is an output, not a side effect**, and is written by default to a path
+derived from the destination. Once ids are overwritten it is the only route from a new id
+back to the region and original label, so losing it by forgetting a flag is not a failure
+mode worth having. It also carries each region's box, which makes it a complete record
+without the volume.
+
+**No default destination.** `--out` and `--in-place` are both reasonable and neither is
+safe to assume: one publishes a second volume, the other overwrites the ids it is derived
+from. `--out` is documented as preferred because a sparse copy is nearly free (324 chunk
+objects for gt_v1) and it leaves the raw annotation intact, but the choice is stated
+explicitly at the call site.
+
+**Single-scale, for §10's reason.** Renumbering level 0 leaves the levels above holding
+the old ids. Coarsening relabelled ids is a mode downsample like any other, but it is a
+separate decision and a separate run, so this reports the stale levels and names the
+`downsample` command rather than doing it. `--block-size N` numbers region *k* from
+`N*k+1`, trading id density for being able to read the source region off the id, and
+refuses rather than letting a region overflow into the next range — which would recreate
+the exact collision the operation exists to remove.

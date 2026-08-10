@@ -134,6 +134,7 @@ em-vol progress <volume>                     # chunks written, per level
 em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
 em-vol annotations <volume>                  # a viewer layer marking where data is
+em-vol relabel <volume> --out ...            # one id range per occupied region
 ```
 
 `info`, `progress` and `annotations` read only. `downsample` rebuilds a pyramid **in place** from a
@@ -197,6 +198,31 @@ annotation layer, because neuroglancer does not *list* precomputed annotations: 
 builds the annotation panel by iterating the layer's source, and the class behind every
 precomputed annotation source defines that iterator as empty. Those annotations render
 in the viewport but cannot be clicked through, which defeats the purpose here.
+
+### Ground truth annotated chunk by chunk
+
+Annotation tools usually number each chunk from 1, so the same integer means a different
+cell in every chunk. Meshed, that becomes one body with components scattered across the
+volume — correct for the label, useless as ground truth. `relabel` gives each occupied
+region its own range:
+
+```bash
+em-vol relabel s3://.../gt_v1 --out s3://.../gt_v2 --dry-run   # reads, writes nothing
+em-vol relabel s3://.../gt_v1 --out s3://.../gt_v2             # then --start-level 0
+em-vol downsample s3://.../gt_v2 --start-level 0
+```
+
+Regions are the same stored-chunk footprints `annotations` uses, so they are pairwise
+disjoint and chunk-aligned — no write is a partial-chunk update. It is serial by
+construction, since each range begins where the last ended, so it runs in the calling
+process with no dask. `--block-size N` numbers region *k* from `N*k+1` instead, making
+the source region readable off the id.
+
+The old→new mapping is written to `<destination>.relabel-<level>.json` (`--map` to
+place it) — the only way back from a new id to the region and original label it came
+from. `--out` is preferred over `--in-place`: a sparse copy is nearly free and the
+original stays as the record of the raw annotation. Single-scale, like `write`, so the
+levels above are stale until `downsample` re-runs; it says so.
 
 ```bash
 # smoke test locally, then launch on SLURM surviving logout:
