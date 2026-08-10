@@ -376,3 +376,105 @@ def test_progress_says_so_when_the_manifest_is_missing(tmp_path, capsys):
     assert cli.cmd_progress(cli._parse_args(["progress", dst])) == 0
     out = capsys.readouterr().out
     assert "no run manifest at" in out and "storage listing" in out
+
+
+def test_progress_points_at_a_rebuilds_differently_named_manifest(tmp_path, capsys):
+    """A rebuild's manifest is named apart from a conversion's on purpose — reusing
+    that name would mark the levels being rebuilt as already done. The cost is that
+    the default `progress` looks for is then the wrong file, with nothing to say the
+    right one is sitting next to it.
+    """
+    dst = _pyramid(tmp_path)
+    os.rename(dst + ".progress.jsonl", dst + ".regen-from-0.progress.jsonl")
+    assert cli.cmd_progress(cli._parse_args(["progress", dst])) == 0
+    out = capsys.readouterr().out
+    assert "no run manifest at" in out
+    assert "--progress-path" in out and "regen-from-0" in out
+
+
+# --------------------------------------------------------------------------- #
+# progress — precomputed, whose scales are not directories
+# --------------------------------------------------------------------------- #
+def _level_row(text, level=0):
+    """The printed row for one level. Shapes contain spaces, so index from the left."""
+    return next(l for l in text.splitlines() if l.split()[:1] == [str(level)])
+
+
+def _done_total(row):
+    """``(done, total)`` from the one 'a/b' token in a row."""
+    done, total = next(t for t in row.split() if "/" in t).split("/")
+    return int(done.replace(",", "")), int(total.replace(",", ""))
+
+
+def _precomputed(tmp_path, *, labels=True):
+    """A real precomputed volume, built by `convert`."""
+    from em_volume_tools.profiles import StorageProfile
+
+    shape = (32, 32, 32)
+    data = np.zeros(shape, np.uint64)
+    data[8:24, 8:24, 8:24] = 5                  # sparse, so `empty` blocks are real
+    src = str(tmp_path / "pc.src.zarr")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, shape, "uint64",
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in shape), data)
+    dst = str(tmp_path / "pc.precomputed")
+    convert(src, dst, voxel_size=(8, 8, 8), kind="segmentation", chunk=(8, 8, 8),
+            min_dim=8, delete_existing=True,
+            profile=StorageProfile("neuroglancer_precomputed", chunk=(8, 8, 8),
+                                   compressor="gzip"))
+    return dst
+
+
+def test_progress_counts_a_precomputed_volume(tmp_path, capsys):
+    """It used to print "no levels found yet" for every precomputed volume.
+
+    Levels came from opening `<volume>/<level>` with the zarr v3 driver in a loop;
+    precomputed keeps its scales under one `info` with keys like `8_8_8`, so the
+    level-0 open failed and the loop ended before it began — for the manifest path
+    too, since the loop was shared.
+    """
+    dst = _precomputed(tmp_path)
+    assert cli.cmd_progress(cli._parse_args(["progress", dst])) == 0
+    out = capsys.readouterr().out
+    assert "no levels found" not in out
+    assert "run manifest" in out
+    level0 = _level_row(out)
+    assert "(32, 32, 32)" in level0 and "100.0%" in level0
+    assert _done_total(level0) == (64, 64), "every level-0 block was processed"
+
+
+def test_progress_storage_counts_precomputed_chunk_objects(tmp_path, capsys):
+    """--storage has to look under each scale key, not under a level directory."""
+    dst = _precomputed(tmp_path)
+    assert cli.cmd_progress(cli._parse_args(["progress", dst, "--storage"])) == 0
+    out = capsys.readouterr().out
+    assert "storage listing" in out and "no levels found" not in out
+    stored, total = _done_total(_level_row(out))
+    assert total == 64
+    assert 0 < stored < 64, f"expected some but not all of the 64 chunks, got {stored}"
+
+
+def test_progress_storage_and_manifest_disagree_on_sparse_data_by_design(tmp_path, capsys):
+    """The gap is information, not a bug: an all-fill block writes no object.
+
+    So on sparse data the manifest runs ahead of storage — which is why `--storage`
+    percentages look alarming on a ground-truth volume that is mostly background.
+    """
+    dst = _precomputed(tmp_path)
+    cli.cmd_progress(cli._parse_args(["progress", dst]))
+    from_manifest = capsys.readouterr().out
+    cli.cmd_progress(cli._parse_args(["progress", dst, "--storage"]))
+    from_storage = capsys.readouterr().out
+
+    done_manifest, total = _done_total(_level_row(from_manifest))
+    done_storage, total_storage = _done_total(_level_row(from_storage))
+    assert total == total_storage, "both count against the same denominator"
+    assert done_manifest == total, "the manifest saw every block"
+    assert done_storage < done_manifest, "only the non-empty blocks wrote objects"
+
+
+def test_progress_reports_nothing_at_a_path_with_no_volume(tmp_path, capsys):
+    assert cli.cmd_progress(cli._parse_args(["progress", str(tmp_path / "no")])) == 1
+    assert "no volume found" in capsys.readouterr().out

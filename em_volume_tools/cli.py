@@ -543,6 +543,50 @@ def _task_total(lv: dict, chunk_total: int, chunk: tuple, level: int) -> tuple[i
 _DONE_STATUSES = ("written", "empty", "skipped")
 
 
+def _other_manifests(manifest_path: str) -> list[str]:
+    """Manifests sitting beside the one we looked for, for the message when it is absent.
+
+    A rebuild names its manifest ``<name>.regen-from-<n>.progress.jsonl`` — deliberately,
+    so it cannot be mistaken for a conversion's and mark the levels being rebuilt as
+    already done. The cost is that the default `progress` looks for is then the wrong
+    file, and "no run manifest" alone gives no hint that the right one is right there.
+    """
+    import glob as _glob
+
+    suffix = ".progress.jsonl"
+    stem = manifest_path[: -len(suffix)] if manifest_path.endswith(suffix) else manifest_path
+    return sorted(p for p in _glob.glob(f"{stem}*{suffix}") if p != manifest_path)
+
+
+def _stored_chunks(volume: str, fmt: str, level: int, scale_key: str | None) -> int:
+    """Count the chunk objects actually stored for one level.
+
+    The two formats put them in different places, which is the whole reason this used
+    to report "no levels found" for precomputed: zarr v3 gives each level its own
+    subdirectory with data under ``c/`` (one object per chunk, or per *shard* when
+    sharded), while precomputed keys every scale's chunks under its own scale key
+    (``8_8_8/…``) beside one shared ``info``.
+    """
+    from em_volume_tools.location import list_keys
+
+    if fmt == "zarr3":
+        keys = list_keys(volume, str(level))
+        return sum(1 for k in keys if k.startswith("c/"))
+    keys = list_keys(volume, scale_key or "")
+    # A precomputed chunk key looks like `0-128_0-128_0-128`; anything else under the
+    # prefix (a stray file) is not a chunk.
+    return sum(1 for k in keys if "_" in k.rsplit("/", 1)[-1] and "-" in k.rsplit("/", 1)[-1])
+
+
+def _precomputed_scale_keys(volume: str) -> dict[int, str]:
+    """``{level: scale key}`` finest-first, matching how levels are numbered elsewhere."""
+    from em_volume_tools.location import read_json
+
+    info = read_json(volume.rstrip("/") + "/info") or {}
+    ordered = sorted(info.get("scales", []), key=lambda s: tuple(s["resolution"]))
+    return {i: s["key"] for i, s in enumerate(ordered)}
+
+
 def cmd_progress(args) -> int:
     """Blocks done per level, against the number the level has.
 
@@ -555,24 +599,41 @@ def cmd_progress(args) -> int:
     per level and works against an object store — the previous version hardcoded the
     ``file`` driver and could not inspect the s3 volumes ``convert`` writes.
 
-    **Every store opened here goes through ``ensure_credentials``.** tensorstore's S3
-    *profile* provider cannot read ``~/.aws/credentials``, so that call copies the
-    profile into the ``AWS_*`` env vars its *environment* provider does read. Skipping
-    it does not fail outright — the credential chain simply falls through to the EC2
-    instance-metadata service, which does not exist off EC2, and each probe waits out
-    a socket timeout while logging
+    **Levels come from the shared inspection, so every format `info` understands works
+    here too.** They used to come from opening ``<volume>/<level>`` with the zarr v3
+    driver in a loop, which meant precomputed — whose scales live under one ``info`` —
+    broke out at level 0 and reported "no levels found yet", and said so for the
+    manifest path as well, since the loop was shared.
+
+    **Every store opened here still goes through ``ensure_credentials``**, now by
+    construction rather than by remembering: reads go via ``location`` and
+    ``open_backend``, which both bootstrap. tensorstore's S3 *profile* provider cannot
+    read ``~/.aws/credentials``, so that call copies the profile into the ``AWS_*`` env
+    vars its *environment* provider does read. Skipping it does not fail outright — the
+    credential chain simply falls through to the EC2 instance-metadata service, which
+    does not exist off EC2, and each probe waits out a socket timeout while logging
     ``AWS_AUTH_CREDENTIALS_PROVIDER_IMDS_SOURCE_FAILURE``. That is slow and noisy
     rather than broken, which is exactly why it survives review; see the S3 bootstrap
     note in CLAUDE.md.
     """
-    import tensorstore as ts
-
-    from em_volume_tools.location import (default_progress_path, ensure_credentials,
-                                          to_kvstore)
+    from em_volume_tools.location import default_progress_path
+    from em_volume_tools.source_metadata import PRECOMPUTED_GZ, detect_backend
 
     volume = args.volume.rstrip("/")
     manifest_path = args.progress_path or default_progress_path(volume)
     manifest = None if args.storage else _manifest_counts(manifest_path)
+
+    fmt = detect_backend(volume)
+    if fmt == PRECOMPUTED_GZ:
+        # Only the chunk KEYS differ, and nothing here reads a chunk — shapes and
+        # scale keys come from `info`, which is the same document either way.
+        fmt = "neuroglancer_precomputed"
+    if fmt is None:
+        print(f"no volume found at {volume}")
+        return 1
+    levels = existing_levels(volume, fmt)
+    scale_keys = (_precomputed_scale_keys(volume)
+                  if fmt == "neuroglancer_precomputed" else {})
 
     # Timestamped because this is a point-in-time count, and the way you get a rate
     # out of it is to diff two runs — which needs to know how far apart they were.
@@ -585,22 +646,24 @@ def cmd_progress(args) -> int:
     # Falling back to storage because no manifest was found used to be indistinguishable
     # from --storage: same header, no other tell. Say it, and say where it looked.
     if manifest is None and not args.storage:
-        print(f"  no run manifest at {manifest_path}\n"
-              f"  (pass --progress-path if the run wrote it elsewhere; a remote --dst "
-              f"defaults it to the launching directory)")
+        print(f"  no run manifest at {manifest_path}")
+        nearby = _other_manifests(manifest_path)
+        if nearby:
+            print(f"  but these are beside it — a rebuild names its own:\n"
+                  + "".join(f"      --progress-path {p}\n" for p in nearby), end="")
+        else:
+            print(f"  (pass --progress-path if the run wrote it elsewhere; a remote "
+                  f"--dst defaults it to the launching directory)")
     print(header)
 
     done_total = expected_total = written_total = empty_total = 0
     notes: list[str] = []
-    level = 0
-    while True:
-        kv = ensure_credentials(to_kvstore(f"{volume}/{level}"))
-        try:
-            store = ts.open({"driver": "zarr3", "kvstore": kv}).result()
-        except Exception:
-            break
-        shape = tuple(int(s) for s in store.shape)
-        chunk = tuple(int(c) for c in store.chunk_layout.write_chunk.shape)
+    for level, lv_info in sorted(levels.items()):
+        shape = lv_info["shape"]
+        chunk = lv_info["chunks"]
+        if not chunk:
+            print(f"{level:>5} {str(shape):>24} {'(chunking unknown)':>18}")
+            continue
         expected = math.prod(math.ceil(s / c) for s, c in zip(shape, chunk))
         extra = ""
         if manifest is not None:
@@ -615,23 +678,15 @@ def cmd_progress(args) -> int:
             if note:
                 notes.append(note)
         else:
-            # Unsharded zarr v3 puts chunk objects under "c/"; the metadata key is
-            # zarr.json, which must not be counted as data.
-            listing = ts.KvStore.open(ensure_credentials(
-                {**kv, "path": kv.get("path", "").rstrip("/") + "/"})
-            ).result().list().result()
-            done = sum(1 for k in listing
-                       if (k.decode() if isinstance(k, bytes) else str(k)).startswith("c/"))
+            done = _stored_chunks(volume, fmt, level, scale_keys.get(level))
         done_total += done
         expected_total += expected
         pct = 100.0 * done / expected if expected else 100.0
         print(f"{level:>5} {str(shape):>24} {str(chunk):>18} "
               f"{f'{done}/{expected}':>20} {pct:>6.1f}%{extra}")
-        level += 1
 
-    if level == 0:
-        print("no levels found yet (level 0 not created), or this is not "
-              "unsharded zarr v3 — precomputed and sharded volumes are not counted")
+    if not levels:
+        print("no levels found yet — level 0 has not been created")
         return 1
     pct = 100.0 * done_total / expected_total if expected_total else 100.0
     total_extra = (f" {written_total:>10,} {empty_total:>10,}"
@@ -879,15 +934,21 @@ def _parse_args(argv=None):
     q.set_defaults(func=cmd_write)
 
     # --- progress -----------------------------------------------------------
-    q = sub.add_parser("progress", help="chunks written per level, for a live run",
-                       description="Point-in-time chunk counts for a multiscale zarr "
-                                   "v3 volume being written. Reads only; re-run to "
-                                   "refresh.")
-    q.add_argument("volume", help="the .zarr group (path or s3://...)")
+    q = sub.add_parser("progress", help="blocks done per level, for a live run",
+                       description="Point-in-time counts for a multiscale volume being "
+                                   "written, zarr v3 or precomputed. Reads only; "
+                                   "re-run to refresh.\n\nOn sparse data the manifest "
+                                   "runs ahead of --storage and that gap is real: an "
+                                   "all-fill block is elided, so it writes no object. "
+                                   "Use the manifest to answer 'how far along is my "
+                                   "run'.",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("volume", help="the volume (path or s3://...)")
     q.add_argument("--progress-path", default=None,
                    help="the run's progress manifest (default: the same path the "
-                        "conversion would have used). Counting from it is far "
-                        "cheaper than listing an object store")
+                        "conversion would have used — note a REBUILD names its own "
+                        "'<name>.regen-from-<n>.progress.jsonl'). Counting from it is "
+                        "far cheaper than listing an object store")
     q.add_argument("--storage", action="store_true",
                    help="count what is actually stored instead of what the run "
                         "recorded — authoritative, but lists every chunk")
