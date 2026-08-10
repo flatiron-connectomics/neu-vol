@@ -133,9 +133,10 @@ em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted on
 em-vol progress <volume>                     # chunks written, per level
 em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
+em-vol annotations <volume>                  # a viewer layer marking where data is
 ```
 
-`info` and `progress` read only. `downsample` rebuilds a pyramid **in place** from a
+`info`, `progress` and `annotations` read only. `downsample` rebuilds a pyramid **in place** from a
 level you trust — cascaded downsampling means a bad level poisons everything above it
 — and `--dry-run` prints the schedule beside what is on disk, refusing if they
 disagree rather than leaving the pyramid inconsistent. Use `convert` to build a *new*
@@ -170,6 +171,32 @@ schedule, so the two volumes cannot drift a voxel apart partway up the pyramid.
 `write` reports whether the region is aligned to the destination's chunk grid: an
 unaligned edge means those chunks are read-modify-written, which is correct on its
 own but loses one of two updates if overlapping writes ever run at once.
+
+### Finding the data in a sparse volume
+
+A volume holding a few labeled boxes inside a large empty frame is hard to *view* —
+the boxes are needles in the frame. `annotations` emits a neuroglancer annotation
+layer with one bounding box per written region, giving a clickable list that jumps
+between them:
+
+```bash
+em-vol annotations s3://.../gt_v1 --label gt        # layer JSON to stdout, table to stderr
+em-vol annotations s3://.../gt_v1 --out layer.json  # paste into a state's `layers`
+em-vol annotations s3://.../gt_v1 --state --out state.json   # a whole loadable state
+```
+
+The boxes come from the volume itself, so they cannot drift from the data: an all-fill
+chunk is never stored, so *which chunk objects exist* is the occupancy question exactly
+— no voxel reads. Those cells are then covered with maximal boxes (not connected
+components: two regions written face to face merge into one, plus the empty corner
+between them), and each box is tightened to its nonzero voxels with one read at
+`--tighten-level`, cheap because a 384-voxel box is 96 voxels at 32 nm.
+
+The annotations are **local** — inline in the state — rather than a precomputed
+annotation layer, because neuroglancer does not *list* precomputed annotations: it
+builds the annotation panel by iterating the layer's source, and the class behind every
+precomputed annotation source defines that iterator as empty. Those annotations render
+in the viewport but cannot be clicked through, which defeats the purpose here.
 
 ```bash
 # smoke test locally, then launch on SLURM surviving logout:

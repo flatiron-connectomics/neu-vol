@@ -10,6 +10,7 @@ continues where it stopped rather than starting over.
     em-vol progress <volume>                     # chunks written, per level
     em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
     em-vol write   <volume> --src ... --offset   # put one subvolume into it
+    em-vol annotations <volume>                  # a viewer layer marking where data is
 
 ``create`` + ``write`` are the small-pieces path, and they are not block-mapped:
 ``create`` lays out an empty volume (optionally copying a reference's frame exactly),
@@ -712,6 +713,81 @@ def cmd_progress(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# annotations
+# --------------------------------------------------------------------------- #
+def cmd_annotations(args) -> int:
+    """A neuroglancer annotation layer marking where a sparse volume's data is.
+
+    The JSON goes to **stdout** and the human summary to **stderr**, so
+    ``em-vol annotations vol > layer.json`` works and so does reading the table while
+    it runs. ``--out`` writes the JSON to a file instead.
+
+    Reads only, and barely: the boxes come from listing which chunk objects exist,
+    which on a sparse volume is the occupancy question exactly, plus one coarse read
+    per region to tighten it. See :mod:`em_volume_tools.ops.annotate` for why the
+    annotations are local rather than a precomputed annotation layer.
+    """
+    from em_volume_tools.ops.annotate import (NoOccupancy, annotation_layer,
+                                              labeled_regions, output_dimensions,
+                                              render, viewer_state)
+
+    volume = args.volume.rstrip("/")
+    tighten = None if args.no_tighten else args.tighten_level
+    try:
+        regions, ctx = labeled_regions(volume, level=args.level, tighten_level=tighten)
+    except (FileNotFoundError, ValueError, NoOccupancy) as e:
+        raise SystemExit(str(e)) from None
+
+    d = _describe(volume)
+    meta = d["meta"] or {}
+    voxel = _ftriple(args.voxel_size, "voxel-size") or meta.get("voxel_size")
+    units = "nm" if args.voxel_size else meta.get("units")
+    dims, warning = output_dimensions(voxel, units)
+
+    err = sys.stderr
+    print(f"{volume}", file=err)
+    print(f"  {ctx['n_chunks']} chunk objects at level {ctx['level']} "
+          f"(cell {ctx['cell']}) -> {len(regions)} region(s)", file=err)
+    tighten = ctx["tighten_level"]
+    if tighten is not None:
+        nm = (f" ({ctx['voxel_sizes'][tighten][0]:g} nm)"
+              if ctx["voxel_sizes"] else "")
+        clamped = ("" if ctx["tighten_clamped_from"] is None else
+                   f", the deepest there is — level {ctx['tighten_clamped_from']} was "
+                   f"asked for but does not exist, so this is exact and slower")
+        print(f"  tightened at level {tighten}{nm}{clamped}", file=err)
+    if not regions:
+        print("  nothing is stored — no annotations to make", file=err)
+        return 1
+    print(f"\n{'#':>3}  {'z':>15} {'y':>15} {'x':>15}  {'extent zyx':>18} "
+          f"{'labels':>7}", file=err)
+    for i, r in enumerate(regions):
+        span = " ".join(f"{r['lo'][a]:6d}-{r['hi'][a]:6d}" for a in range(3))
+        ext = "x".join(str(r["hi"][a] - r["lo"][a]) for a in range(3))
+        n = "-" if r["n_labels"] is None else f"{r['n_labels']:,}"
+        print(f"{i:>3}  {span}  {ext:>18} {n:>7}", file=err)
+    if warning:
+        print(f"\n  WARNING: {warning}", file=err)
+
+    layer = annotation_layer(regions, dims, name=args.name or f"{volume.rsplit('/', 1)[-1]}-regions",
+                             color=args.color, kind=args.kind,
+                             label=args.label or "r")
+    obj = (viewer_state(volume, ctx["format"], layer, regions, dims, meta.get("kind"))
+           if args.state else layer)
+    text = render(obj)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(text + "\n")
+        print(f"\nwrote {args.out} — paste it into the `layers` array of a "
+              f"neuroglancer state" if not args.state else
+              f"\nwrote {args.out} — load it with neuroglancer's {{}} JSON editor",
+              file=err)
+    else:
+        print(text)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
 def _maybe_cluster(args):
@@ -954,6 +1030,56 @@ def _parse_args(argv=None):
                         "recorded — authoritative, but lists every chunk")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_progress)
+
+    # --- annotations --------------------------------------------------------
+    q = sub.add_parser(
+        "annotations", help="a neuroglancer layer marking where the data is",
+        description="Emit a neuroglancer annotation layer with one bounding box per "
+                    "written region of a SPARSE volume — a ground-truth volume, an "
+                    "ROI export — so the viewer gets a clickable list that jumps "
+                    "between them.\n\n"
+                    "The annotations are LOCAL (inline in the state), not a "
+                    "precomputed annotation layer, because neuroglancer does not list "
+                    "precomputed annotations: it builds the list by iterating the "
+                    "source, and the class behind every precomputed annotation source "
+                    "defines that iterator as empty. Those render but cannot be "
+                    "clicked through.\n\n"
+                    "JSON to stdout, summary to stderr, so `> layer.json` works. "
+                    "Reads only; writes nothing to the volume.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("volume", help="the volume (path or s3://...)")
+    q.add_argument("--out", default=None, metavar="PATH",
+                   help="write the JSON here instead of to stdout")
+    q.add_argument("--state", action="store_true",
+                   help="emit a complete loadable viewer state (volume layer + "
+                        "annotations) rather than just the layer to paste")
+    q.add_argument("--level", type=int, default=0,
+                   help="the level whose chunk objects define the footprint. Coarser "
+                        "is a cheaper listing and a blockier box; coordinates are "
+                        "reported in level-0 voxels either way (default: 0)")
+    q.add_argument("--tighten-level", type=int, default=2, metavar="N",
+                   help="shrink each box to its nonzero voxels by reading it at this "
+                        "level. Cheap — a 384-voxel box is 96 voxels at 32 nm — and "
+                        "exact to one voxel there, so a coarser level gives a looser "
+                        "box and 0 gives the exact one (default: 2)")
+    q.add_argument("--no-tighten", action="store_true",
+                   help="skip the reads entirely: boxes stay chunk-aligned and no "
+                        "label counts are reported")
+    q.add_argument("--kind", choices=("box", "point"), default="box",
+                   help="bounding boxes, or one point at each region's centre — "
+                        "points stay clickable when zoomed out (default: box)")
+    q.add_argument("--name", default=None,
+                   help="layer name (default: '<volume>-regions')")
+    q.add_argument("--label", default=None, metavar="PREFIX",
+                   help="prefix for annotation ids and descriptions, numbered from 00 "
+                        "(default: r)")
+    q.add_argument("--color", default="#ffee00", help="annotation colour")
+    q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
+                   help="level-0 voxel size in nm, when the volume records none or "
+                        "records it in units this does not recognise. Without a "
+                        "usable one the layer is unitless and will not line up")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_annotations)
 
     args = p.parse_args(argv)
 

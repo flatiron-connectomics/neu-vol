@@ -430,3 +430,59 @@ tiling anchors to the global grid (never to the region's own start, which would 
 interior boundaries mid-chunk), and the alignment of the caller's own region is
 reported rather than silently accepted. These ops run in the calling process, no dask,
 which is also what keeps that hazard confined to what the user does across invocations.
+
+
+## 11. Finding the data again: `annotations`
+
+Create-then-write produces a volume that is mostly empty on purpose, and that makes it
+hard to *look at*: twelve labeled boxes in an 11260×9000×13750 frame are needles.
+`em-vol annotations` closes that loop by emitting a neuroglancer annotation layer with
+one box per written region, so the viewer gets a list to click through.
+
+**Occupancy comes from chunk presence, not from voxels.** TensorStore never persists a
+chunk that is entirely the fill value, so on a sparse volume the set of stored objects
+*is* the footprint. One listing per level answers the question with no reads at all,
+and it cannot disagree with the data the way a record of what was written could. The
+two formats key their chunks differently — precomputed's `x0-x1_y0-y1_z0-z1` (xyz, and
+`.gz`-suffixed when CloudVolume wrote it) against zarr v3's `c/z/y/x` — so parsing is
+per-format and the result is normalised to zyx cell indices immediately.
+
+**Maximal boxes, not connected components.** This is the one decision with a wrong
+answer that looks right. Two regions written face to face have chunk-aligned footprints
+that touch, so components merge them into a single region spanning both *and the empty
+corner between them* — measured on sample3's gt_v1, where it turned 12 GT chunks into
+11. Growing a box greedily from the lexicographically smallest free cell, axis by axis,
+recovers the blocks, and it can never emit a box containing an absent cell — which is
+the property that matters, since a box is a claim that there is data there. Regions that
+are genuinely contiguous *do* merge, correctly: nothing in the stored chunks
+distinguishes that from one write of twice the size.
+
+**Tightening is an optimisation, so a missing level is not an error.** Chunk-aligned
+boxes are blocky (a 256³ region rounds out to 384³ at 128³ chunks), so each box is
+shrunk to its nonzero voxels by one read at `--tighten-level` — nearly free, because a
+384-voxel box is 96 voxels at 32 nm, at the cost of quantizing the bound to one coarse
+voxel. When that level does not exist the level clamps *finer* rather than raising: a
+single-level volume is the normal state of one `create` made and `write` filled, and
+refusing to annotate exactly those would be absurd. Finer means more exact and only
+slower, bounded by the occupied footprint — but it is reported, or an unexplained slow
+run looks like a hang.
+
+**The annotations are local, and that is forced by the viewer, not chosen.**
+Neuroglancer builds its annotation list by iterating the layer's source, and
+`MultiscaleAnnotationSource` — the class behind every *precomputed* annotation source —
+defines `[Symbol.iterator]` as an empty generator. So a precomputed annotation layer
+renders in the viewport and contributes **no rows** to the Annotations tab: nothing to
+click, and `[`/`]` do not step. Since the whole purpose here is navigation, the layer is
+emitted as inline `local://annotations` in the state instead. Two consequences worth
+recording: nothing is written to the store (this op is read-only, unlike every other
+write path in the package), and a precomputed annotation layer would not have helped
+anyway, because unlike meshes and skeletons annotations cannot be named from a volume's
+own `info` — a viewer must add them as a separate source regardless, so a state file is
+the distribution unit either way.
+
+**The layer declares its own `outputDimensions`.** Annotation coordinates are read in
+the layer's frame rather than the viewer's, which is what lets one layer be pasted into
+any state of the same volume. That needs a real unit: precomputed always records nm and
+OME-NGFF spells its units out, but an unrecognised one leaves the layer unitless and
+misaligned, so it warns and points at `--voxel-size` rather than inventing a scale — a
+wrong scale would place every box somewhere plausible and wrong.
