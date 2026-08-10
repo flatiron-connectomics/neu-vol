@@ -8,6 +8,14 @@ continues where it stopped rather than starting over.
     em-vol convert --src ... --dst ...           # build a multiscale volume
     em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
     em-vol progress <volume>                     # chunks written, per level
+    em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
+    em-vol write   <volume> --src ... --offset   # put one subvolume into it
+
+``create`` + ``write`` are the small-pieces path, and they are not block-mapped:
+``create`` lays out an empty volume (optionally copying a reference's frame exactly),
+then each ``write`` places one image stack / HDF5 / array into one level of it at a
+voxel offset. Single-scale by design — run ``downsample`` afterwards if the result
+needs a pyramid.
 
 ``python -m em_volume_tools`` is equivalent. Run ``em-vol <subcommand> --help`` for the
 arguments of each.
@@ -61,6 +69,24 @@ def _triple(value, name):
     return parts
 
 
+def _ftriple(value, name):
+    """'z,y,x' -> a 3-tuple of floats, or None. Voxel sizes are not always integral."""
+    if value is None:
+        return None
+    parts = tuple(float(v) for v in value.replace("x", ",").split(","))
+    if len(parts) != 3:
+        raise SystemExit(f"--{name} needs 3 comma-separated values, got {value!r}")
+    return parts
+
+
+def _human_bytes(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
 def _factor_list(value):
     """'1,2,2;1,2,2' -> [(1,2,2), (1,2,2)], or None for auto."""
     if value is None:
@@ -72,78 +98,26 @@ def _configs(args):
     return args.config or ["dask-local"]
 
 
-# --------------------------------------------------------------------------- #
-# shared inspection: what is this volume, and which levels exist
-# --------------------------------------------------------------------------- #
-def describe(volume: str) -> dict:
-    """Detected format, coordinate metadata and the levels actually present.
-
-    Shared by ``info`` and ``downsample``'s plan, so the two cannot disagree about
-    what is on disk.
-    """
-    from em_volume_tools.backends.base import open_backend
-    from em_volume_tools.source_metadata import (detect_backend,
-                                                 read_level_voxel_sizes,
-                                                 read_source_metadata)
-
-    fmt = detect_backend(volume)
-    if fmt is None:
-        raise SystemExit(f"no volume found at {volume}")
-    spec = {"backend": fmt, "path": volume}
-    meta = read_source_metadata(spec)
-    level0 = open_backend(meta["data_spec"] if meta else spec)
-    shape = tuple(int(s) for s in level0.shape)
-    return {"format": fmt, "meta": meta, "shape": shape,
-            "dtype": str(getattr(level0, "dtype", "?")),
-            "has_channels": bool(meta["has_channels"]) if meta else False,
-            "level_voxel_sizes": read_level_voxel_sizes(spec),
-            "levels": existing_levels(volume, fmt)}
+# Volume inspection lives in source_metadata (it composes that module's readers, and
+# the ops need it too — `create --like` and `write` both do). Re-exported here because
+# `cli.describe` is where callers and tests already look for it.
+from em_volume_tools.source_metadata import (describe, existing_levels,  # noqa: E402
+                                             level_spec)
 
 
-def existing_levels(volume: str, fmt: str, probe: int = 12) -> dict[int, dict]:
-    """``{level: {"shape", "chunks", "read_chunks"}}`` for the levels that open.
-
-    Probes upward until one misses. The multiscale group metadata is written at the
-    very end of a conversion, so an in-flight volume has levels but no group metadata
-    — probing is what makes this work on a run that is still going.
-
-    Chunking is **per level**, not a property of the volume: it lives in each level's
-    own array metadata (zarr's ``zarr.json``, precomputed's per-scale ``chunk_sizes``),
-    and a conversion is free to chunk levels differently. So it is read here, where
-    each level is opened anyway, rather than assumed from level 0.
-
-    ``chunks`` is the *write* chunk and ``read_chunks`` the *read* chunk. They differ
-    only when the level is sharded, where the write chunk is the shard and the read
-    chunk is the unit actually fetched — which is the number that governs read
-    amplification, so both are worth having.
-    """
-    from em_volume_tools.backends.base import open_backend
-
-    out: dict[int, dict] = {}
-    for i in range(probe):
-        spec = ({"backend": fmt, "path": f"{volume.rstrip('/')}/{i}"} if fmt == "zarr3"
-                else {"backend": fmt, "path": volume, "scale_index": i})
-        try:
-            be = open_backend(spec)
-            shape = tuple(int(s) for s in be.shape)
-        except Exception:
-            break
-        # chunks come from the same open, but a backend need not expose them
-        def _maybe(attr):
-            try:
-                return tuple(int(c) for c in getattr(be, attr))
-            except Exception:
-                return None
-        out[i] = {"shape": shape, "chunks": _maybe("chunks"),
-                  "read_chunks": _maybe("read_chunks")}
-    return out
+def _describe(volume: str) -> dict:
+    """``describe`` with a missing volume turned into a clean CLI exit."""
+    try:
+        return describe(volume)
+    except FileNotFoundError as e:
+        raise SystemExit(str(e)) from None
 
 
 # --------------------------------------------------------------------------- #
 # info
 # --------------------------------------------------------------------------- #
 def cmd_info(args) -> int:
-    d = describe(args.volume)
+    d = _describe(args.volume)
     meta = d["meta"] or {}
     print(f"{args.volume}")
     print(f"  format      {d['format']}")
@@ -157,6 +131,13 @@ def cmd_info(args) -> int:
         print(f"  offset      {tuple(meta['offset'])}")
     if d["has_channels"]:
         print("  channels    yes (leading axis)")
+    if d["other_markers"]:
+        # Two volumes in one directory. Whichever loses the detection order is
+        # unreachable through every path in this package, but still occupies the store.
+        print(f"\n  WARNING: this directory also contains "
+              f"{', '.join(d['other_markers'])} — a second volume of another format "
+              f"is shadowed\n  here and cannot be opened while {d['format']} wins "
+              f"detection. Move or delete one of them.\n")
 
     if not d["levels"]:
         print("  levels      none found")
@@ -244,7 +225,7 @@ def _downsample_plan(args):
     """
     from em_volume_tools.pyramid import downsample_schedule
 
-    d = describe(args.volume)
+    d = _describe(args.volume)
     meta = d["meta"] or {}
     if not meta.get("voxel_size") and args.voxel_size is None:
         raise SystemExit(f"{args.volume} has no coordinate metadata; pass --voxel-size")
@@ -316,6 +297,132 @@ def cmd_downsample(args) -> int:
              summary["num_levels"] - 1, args.volume)
     log.info("status counts: %s", summary["status_counts"])
     log.info("progress: %s", summary["progress_path"])
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# create (an empty volume) + write (one subvolume into it)
+# --------------------------------------------------------------------------- #
+def cmd_create(args) -> int:
+    from em_volume_tools.ops.create import create_volume, plan_volume
+
+    dst = args.dst.rstrip("/")
+    kw = dict(like=args.like, shape=_triple(args.shape, "shape"), dtype=args.dtype,
+              voxel_size=_ftriple(args.voxel_size, "voxel-size"),
+              offset=_ftriple(args.offset_nm, "offset-nm"), units=args.units,
+              format=args.format, profile=args.profile,
+              chunk=_triple(args.chunk, "chunk"),
+              shard=_triple(args.shard, "shard"), levels=args.levels,
+              factors=_factor_list(args.factors), max_levels=args.max_levels,
+              min_dim=args.min_dim, kind=args.kind, name=args.name,
+              encoding=args.encoding)
+    try:
+        plan = (plan_volume(dst, **kw) if args.dry_run else
+                create_volume(dst, overwrite=args.overwrite,
+                              validate=not args.no_validate, **kw))
+    except (FileNotFoundError, FileExistsError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+
+    precomputed = plan["format"] == "neuroglancer_precomputed"
+    print(f"{dst}")
+    print(f"  format      {plan['format']}"
+          f"{'' if precomputed else ' (OME-NGFF 0.5)'}")
+    print(f"  dtype       {plan['dtype']}")
+    print(f"  kind        {plan['kind']}")
+    if precomputed:
+        print(f"  encoding    {plan['encoding']}")
+    print(f"  voxel size  {'x'.join(f'{v:g}' for v in plan['voxel_size'])} {plan['units']}")
+    print(f"  origin      {tuple(plan['offset'])}")
+    if plan["like"]:
+        print(f"  geometry    {'copied from' if plan['mirrored'] else 'partly from'} "
+              f"{plan['like']}")
+    sharded = any(lv["shard"] for lv in plan["levels"])
+    header = f"  {'level':>5}  {'shape':>24}  {'voxel nm':>20}  {'chunk':>17}"
+    print(header + (f"  {'shard':>17}" if sharded else ""))
+    for lv in plan["levels"]:
+        chunk = "x".join(str(c) for c in lv["chunk"]) if lv["chunk"] else "(profile default)"
+        row = (f"  {lv['level']:>5}  {str(tuple(lv['shape'])):>24}  "
+               f"{'x'.join(f'{v:g}' for v in lv['voxel_size']):>20}  {chunk:>17}")
+        if sharded:
+            row += f"  {('x'.join(str(c) for c in lv['shard']) if lv['shard'] else '—'):>17}"
+        print(row)
+    print("--dry-run: nothing created" if args.dry_run else
+          f"created {plan['num_levels']} empty level(s); fill them with `em-vol write`")
+    return 0
+
+
+def _source_label(spec: dict) -> str:
+    """How a resolved source spec should be shown: where it is, and what was read."""
+    where = spec.get("path", spec.get("source", "?"))
+    return f"{where}  [{spec['backend']}" + \
+           (f":{spec['dataset']}]" if spec.get("dataset") else "]")
+
+
+def _print_one_write(r: dict) -> None:
+    print(f"  source   {_source_label(r['src_spec'])}  "
+          f"{r['src_shape']} {r['src_dtype']}")
+    print(f"  offset   {r['offset']} ({r['offset_from']})")
+    print("  region   " + "  ".join(
+        f"{ax} {a}:{b}" for ax, a, b in zip("zyx", r["start"], r["stop"])))
+    print(f"  tiles    {r['num_tiles']} of {r['task_shape']}  "
+          f"({_human_bytes(r['nbytes'])}, level-{r['level']} chunk {r['dst_chunk']})")
+
+
+def _print_write_table(results: list[dict]) -> None:
+    """One row per source. A per-source block would be a screenful for a batch."""
+    print(f"  {'source':<34} {'shape':>16} {'offset':>18}  {'tiles':>5}  {'size':>9}")
+    for r in results:
+        name = os.path.basename(str(r["src_spec"].get("path")
+                                    or r["src_spec"].get("source", "?")).rstrip("/"))
+        print(f"  {name[:34]:<34} {str(r['src_shape']):>16} "
+              f"{str(tuple(r['start'])):>18}  {r['num_tiles']:>5}  "
+              f"{_human_bytes(r['nbytes']):>9}")
+
+
+def cmd_write(args) -> int:
+    from em_volume_tools.ops.write import write_subvolumes
+
+    offsets = ([_triple(o, "offset") for o in args.offset] if args.offset else None)
+    if offsets is not None and len(offsets) != len(args.src):
+        raise SystemExit(
+            f"{len(args.src)} --src but {len(offsets)} --offset: give one --offset per "
+            f"--src, or none and let each source supply its own (see --offset-field)")
+    try:
+        results = write_subvolumes(
+            args.volume, args.src, offsets, level=args.level,
+            offset_level=args.offset_level, offset_field=args.offset_field,
+            offset_order=args.offset_order, src_format=args.src_format,
+            dataset=args.dataset, cast=args.cast, dry_run=args.dry_run)
+    except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+        raise SystemExit(str(e).strip("'")) from None
+
+    first = results[0]
+    print(f"{first['volume']}  level {first['level']}  "
+          f"{str(first['dst_shape'])} {first['dst_dtype']}  "
+          f"chunk {first['dst_chunk']}")
+    if len(results) == 1:
+        _print_one_write(first)
+    else:
+        _print_write_table(results)
+
+    unaligned = [i for i, r in enumerate(results) if r["misaligned_axes"]]
+    if unaligned:
+        which = "the region" if len(results) == 1 else f"{len(unaligned)} of the regions"
+        print(f"  NOTE     {which} end inside a chunk, so those chunks are "
+              f"read-modify-written —\n           the data already in them is kept. "
+              f"Never run two such writes at once into\n           chunks they share; "
+              f"one update would be lost silently.")
+    for i, j in first.get("overlaps") or []:
+        print(f"  WARNING  sources {i} and {j} overlap; the later one wins where "
+              f"they meet")
+
+    tiles = sum(r["num_tiles"] for r in results)
+    if args.dry_run:
+        print(f"--dry-run: nothing written ({len(results)} source(s), {tiles} tile(s), "
+              f"{_human_bytes(sum(r['nbytes'] for r in results))})")
+    else:
+        print(f"wrote {len(results)} source(s), {tiles} tile(s) in "
+              f"{sum(r['seconds'] for r in results):.1f}s")
     return 0
 
 
@@ -649,6 +756,127 @@ def _parse_args(argv=None):
                    help="report the plan and exit, touching nothing")
     _add_cluster_args(q)
     q.set_defaults(func=cmd_downsample)
+
+    # --- create -------------------------------------------------------------
+    q = sub.add_parser(
+        "create", help="lay out an EMPTY multiscale volume",
+        description="Create an empty zarr v3 or neuroglancer-precomputed volume — "
+                    "every level exists, no chunk data.\n\nUse it when several small "
+                    "pieces (image stacks, HDF5 files) belong at known positions "
+                    "inside one frame: create the frame, then `em-vol write` each "
+                    "piece into it.\n\n--like copies "
+                    "a reference volume's geometry (level shapes, per-level voxel "
+                    "sizes and chunking, dtype, origin), so a voxel index means the "
+                    "same thing in both. Its level shapes are copied verbatim rather "
+                    "than recomputed, unless --shape or --factors overrides them. "
+                    "Anything you pass explicitly wins over the reference.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("dst", help="where to create it (path or s3://bucket/prefix)")
+    q.add_argument("--like", default=None, metavar="VOLUME",
+                   help="reference volume to copy the frame from (zarr or "
+                        "precomputed, local or remote)")
+    q.add_argument("--shape", default=None,
+                   help="z,y,x level-0 shape (default: --like's). Overriding it means "
+                        "the pyramid is recomputed rather than copied")
+    q.add_argument("--dtype", default=None,
+                   help="e.g. uint8, uint64 (default: --like's). Worth setting when "
+                        "the frame comes from an image volume but the pieces are labels")
+    q.add_argument("--voxel-size", default=None, help="z,y,x nm (default: --like's)")
+    q.add_argument("--offset-nm", default=None,
+                   help="z,y,x physical origin of the volume (default: --like's, else 0)")
+    q.add_argument("--units", default=None, help="default: --like's, else nm")
+    q.add_argument("--kind", choices=("image", "segmentation"), default=None,
+                   help="recorded in the metadata and read back by `downsample` to "
+                        "pick its reducer (default: --like's, else image). For "
+                        "precomputed it also picks the default encoding")
+    q.add_argument("--format", choices=("zarr", "precomputed"), default=None,
+                   help="target format (default: --like's format, else zarr). "
+                        "precomputed keeps its scales in one intrinsic `info`; zarr "
+                        "gets OME-NGFF 0.5 group metadata")
+    q.add_argument("--encoding", default=None,
+                   help="precomputed chunk encoding: raw, jpeg, "
+                        "compressed_segmentation (default: compressed_segmentation "
+                        "for --kind segmentation, raw otherwise)")
+    q.add_argument("--chunk", default=None,
+                   help="z,y,x, all levels (default: --like's per-level chunking)")
+    q.add_argument("--shard", default=None, help="z,y,x shard")
+    q.add_argument("--levels", type=int, default=None,
+                   help="how many levels to create, counting level 0 "
+                        "(default: as many as --like has, else the auto schedule). "
+                        "--levels 1 for a single-scale volume")
+    q.add_argument("--factors", default=None,
+                   help="explicit per-level factors, e.g. '1,2,2;1,2,2'; forces the "
+                        "pyramid to be computed rather than copied")
+    q.add_argument("--max-levels", type=int, default=8)
+    q.add_argument("--min-dim", type=int, default=128)
+    q.add_argument("--profile", default=None,
+                   help="storage profile name, overriding --format and its chunk/"
+                        "compressor defaults (local, ceph, local-neuroglancer, "
+                        "s3-neuroglancer)")
+    q.add_argument("--name", default="image", help="OME multiscales name (zarr only)")
+    q.add_argument("--overwrite", action="store_true",
+                   help="replace an existing volume at --dst (DESTROYS its data)")
+    q.add_argument("--no-validate", action="store_true",
+                   help="skip OME metadata validation")
+    q.add_argument("--dry-run", action="store_true",
+                   help="print the layout and exit, creating nothing")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_create)
+
+    # --- write --------------------------------------------------------------
+    q = sub.add_parser(
+        "write", help="write one subvolume into an existing volume",
+        description="Place a subvolume — an image stack, an HDF5 dataset, a region "
+                    "of another volume — into an existing volume at a voxel offset.\n\n"
+                    "SINGLE-SCALE on purpose: it writes --level and touches no other, "
+                    "because how a patch should look when coarsened is a separate "
+                    "decision (averaging label ids invents ids). Run `em-vol "
+                    "downsample` afterwards if the result needs a pyramid.\n\n"
+                    "Runs in this process — no dask. For anything big enough to need "
+                    "a cluster, use `em-vol convert`.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("volume", help="the destination volume (path or s3://...)")
+    q.add_argument("--src", required=True, action="append",
+                   help="an .h5/.hdf5 file, a directory or glob of ordered 2D slices, "
+                        "or another volume. REPEATABLE: pass several to write a batch "
+                        "in one go. All of them are checked — offsets, bounds, dtype "
+                        "— before any is written, so a mistake in the last one does "
+                        "not leave the earlier ones half-applied")
+    q.add_argument("--offset", default=None, action="append",
+                   help="z,y,x voxel offset of the subvolume's origin, in --level's "
+                        "voxels unless --offset-level says otherwise. OPTIONAL: with "
+                        "no --offset the source is asked for one, which an HDF5 file "
+                        "often records (see --offset-field). With several --src, give "
+                        "either no --offset at all or one per --src, in order")
+    q.add_argument("--offset-field", default="voxel_offset", metavar="NAME",
+                   help="what the source calls its stored offset, used when --offset "
+                        "is omitted. In an HDF5 file this is looked for in the "
+                        "dataset's attributes, the root group's attributes, and a "
+                        "top-level dataset of that name (default: voxel_offset)")
+    q.add_argument("--offset-order", choices=("zyx", "xyz"), default="zyx",
+                   help="axis order of the offset, whether typed or read from the "
+                        "source. Worth checking on a stored one: 'voxel_offset' is "
+                        "precomputed's field name and precomputed means XYZ, while "
+                        "everything in this package is zyx — reversed, the piece "
+                        "lands mirrored through the z=x diagonal (default: zyx)")
+    q.add_argument("--level", type=int, default=0, help="which level to write into")
+    q.add_argument("--offset-level", type=int, default=None,
+                   help="the level whose voxels --offset is expressed in, when that "
+                        "is not --level (e.g. coordinates read off level 0 while "
+                        "writing level 2). Converted with the recorded per-level "
+                        "voxel sizes; a non-integral result is an error")
+    q.add_argument("--src-format", default=None,
+                   help="backend for --src (default: guessed from the path — .h5 is "
+                        "hdf5, a directory/glob/image file is image_stack, anything "
+                        "with an info or zarr.json is detected properly)")
+    q.add_argument("--dataset", default=None,
+                   help="HDF5 dataset path (default: the file's only 3D+ dataset)")
+    q.add_argument("--cast", action="store_true",
+                   help="allow a lossy dtype conversion into the destination")
+    q.add_argument("--dry-run", action="store_true",
+                   help="report the region, tiles and alignment; write nothing")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_write)
 
     # --- progress -----------------------------------------------------------
     q = sub.add_parser("progress", help="chunks written per level, for a live run",

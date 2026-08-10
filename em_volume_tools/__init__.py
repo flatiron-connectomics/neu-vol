@@ -16,7 +16,10 @@ from .backends.base import (ArrayBackend, clear_backend_cache, open_backend,
                             register_backend)
 from .retry import is_transient, with_retry
 from .profiles import StorageProfile, PROFILES, get_profile
-from .ops import ingest_image_stack, convert, extract_roi, rebuild_pyramid
+from .ops import (convert, create_volume, extract_roi, ingest_image_stack,
+                  plan_subvolume_write, plan_volume, rebuild_pyramid,
+                  write_subvolume, write_subvolumes)
+from .source_metadata import describe, existing_levels, level_spec
 # Location handling + byte/JSON I/O that works the same for local paths and
 # object stores, so consumers never branch on the destination.
 from .location import (exists, is_local, local_path, read_bytes, read_json,
@@ -44,6 +47,14 @@ __all__ = [
     "convert",
     "extract_roi",
     "rebuild_pyramid",
+    "create_volume",
+    "plan_volume",
+    "write_subvolume",
+    "write_subvolumes",
+    "plan_subvolume_write",
+    "describe",
+    "existing_levels",
+    "level_spec",
     "to_kvstore",
     "is_local",
     "local_path",

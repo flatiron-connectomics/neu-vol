@@ -303,7 +303,9 @@ em_volume_tools/                # volume/EM-specific
 ├── meta.py          # VoxelMeta + coordinate/axis conversion
 ├── location.py      # local/s3/gs/kvstore normalization + subpath join
 ├── aws.py           # S3 credential bootstrap (tensorstore profile-provider workaround)
-├── source_metadata.py  # read a source's coordinates + detect_backend (autodetect)
+├── source_metadata.py  # read a source's coordinates + detect_backend (autodetect);
+│                    #   describe/existing_levels compose those into a whole-volume
+│                    #   picture (opens every level — the expensive tier)
 ├── backends/
 │   ├── base.py      # ArrayBackend protocol + spec opener registry
 │   ├── tensorstore.py  # zarr v3 (sharded/unsharded) + precomputed (canonical view)
@@ -318,7 +320,10 @@ em_volume_tools/                # volume/EM-specific
 │   ├── _multiscale.py  # shared copy+pyramid loop; zarr3 & precomputed targets
 │   ├── ingest.py    # image stack -> multiscale volume
 │   ├── convert.py   # any source backend -> multiscale volume
-│   └── roi.py       # extract_roi: crop / pad (-> multiscale)
+│   ├── roi.py       # extract_roi: crop / pad (-> multiscale)
+│   ├── create.py    # create_volume: an EMPTY volume (zarr3 or precomputed), specced
+│   │                #   by hand or `like=` a reference (§10) — no source, no data
+│   └── write.py     # write_subvolume: one piece into one level, at a voxel offset
 └── cli.py           # (later)
 
 ../em-blockrun/em_blockrun/      # shared dask/SLURM substrate (no EM deps)
@@ -327,5 +332,101 @@ em_volume_tools/                # volume/EM-specific
 ├── manifest.py      # Manifest (single-writer resume/intent log)
 └── configs/         # dask config templates (local / slurm-gen / slurm-any)
 
-em_volume_tools/cli.py          # the `em-vol` command: info / convert / downsample / progress
+em_volume_tools/cli.py          # the `em-vol` command:
+                                #   info / convert / downsample / progress / create / write
 ```
+
+---
+
+## 10. Create-then-write: several small pieces into one frame
+
+`ingest`/`convert`/`extract_roi` all have the same shape — *one* source, materialized
+wholesale, block-mapped over dask. The other real workflow does not fit that: a
+handful of small subvolumes (image stacks, HDF5 files) that belong at known positions
+inside one larger volume, arriving at different times. Forcing it through `convert`
+would mean one volume per piece, or a source backend that stitches them, and neither
+is what the coordinates actually say.
+
+So it splits into two ops, and the split is the design:
+
+- **`create_volume` lays out an empty volume.** Every level exists; no chunk data does.
+  This is nearly free because an unwritten chunk reads back as the fill value — a whole
+  empty pyramid is a few JSON documents regardless of its nominal size (for
+  precomputed, literally one `info`).
+- **`write_subvolume` places one piece into one level**, at a voxel offset.
+
+Both formats are targets. `create` dispatches on the profile's format exactly as
+`materialize_multiscale` does, and the difference is where multiscale metadata lives:
+zarr gets an OME-NGFF group document written after the levels, while precomputed's
+scales accumulate in one intrinsic `info` as each is created. That sharing has one
+sharp edge — `delete_existing` may apply to **scale 0 only**, since every scale lives
+under the same prefix and deleting on scale 1 would take scale 0 with it. Precomputed
+also carries the origin as a per-scale integer `voxel_offset` rather than a
+translation transform, and cannot shard (`precomputed_create_spec` has no shard
+support; §"open items"), which is refused rather than ignored.
+
+Decisions worth recording:
+
+**With no format given, `like=` decides it too.** Mirroring a precomputed frame and
+silently getting zarr is the sort of thing you discover when the viewer cannot open the
+result. `profile_for` is shared with the CLI so `--format` cannot come to mean
+something different there.
+
+**`like=` copies the reference's level shapes verbatim, not its schedule.** The point
+of a reference is that a voxel index means the same thing in both volumes. Recomputing
+the pyramid from level 0 would usually agree — and when it did not (shapes are
+ceil-divided, so one differing `min_dim`/`max_levels`/`factors` is enough) the two
+volumes would be a voxel apart partway up, silently. Per-level voxel sizes are read
+from the reference's own metadata for the same reason `read_level_voxel_sizes` exists:
+never `2**level`, never a shape ratio.
+
+**Creating over a volume of the *other* format is refused.** Each format writes only
+its own marker, so making a precomputed volume where a zarr one lives leaves `info` and
+`zarr.json` in one directory — and `detect_backend` checks `info` first, so the zarr
+becomes unreachable through every path in this package while its chunks still occupy
+the store. `--overwrite` cannot fix it either, and asymmetrically: precomputed's
+`delete_existing` wipes the prefix (taking the zarr with it, unannounced), zarr's
+deletes only its own level arrays and leaves a stale `info` in charge. So it refuses and
+says to delete the destination. `describe` reports the condition too, for directories
+already in it.
+
+**The offset may come from the source.** Writers record where a subvolume came from
+beside the array; HDF5 files routinely carry a `voxel_offset`. Re-typing that is tedious
+and a chance to mistype a coordinate, so a backend may expose an optional
+`stored_offset(name)` and `write` uses it when no offset is passed — an optional backend
+capability, not an HDF5 branch in the op, even though HDF5 is the only backend that
+answers today. **The axis order is asked for, not guessed**: `voxel_offset` is
+precomputed's field name and precomputed means xyz, while a canonical `(z, y, x)` array
+suggests zyx, and nothing in the file distinguishes them. Reversed, the piece lands
+mirrored through the z=x diagonal (CLAUDE.md invariant 2) with nothing downstream able
+to tell — so the default is zyx and the provenance and any reversal are printed.
+
+**A batch is planned in full before any of it is written.** Planning resolves offsets
+and checks bounds, dtype and level, and touches nothing; doing all of it up front means
+a mistyped offset in the last file is caught while the volume is still clean rather than
+after three pieces have landed. Writing then fails fast, because a failure there is a
+storage problem and continuing would bury it. Pieces that overlap each other are
+reported rather than refused — doing it deliberately is legitimate, but the result looks
+identical either way, so silence would hide a mistyped offset that buries an earlier
+piece.
+
+**Writes are single-scale, deliberately.** Coarsening a patch is a separate decision
+from placing it — averaging label ids invents ids, and a patch's correct coarse
+representation may depend on what surrounds it, which the patch does not know. Run
+`downsample` afterwards if the result needs a pyramid.
+
+**Tiles are cut on the destination's global chunk grid.** A write that does not start
+and end on that grid makes TensorStore read-modify-write the boundary chunks: it
+fetches what is stored, overlays the new region, and writes the whole chunk back, so a
+partially-covered chunk **keeps** the data already in it — including data a previous
+`write` invocation put there. Nothing here implements that, but everything here depends
+on it, and if it ever stopped being true the loss would be invisible (the piece just
+written looks perfect; its neighbours are gone), so it is pinned by tests across a
+plain chunk, a shard's inner chunk and a compressed_segmentation block — three
+different merge paths inside TensorStore. Serially that is all fine; it is a lost
+update the moment two pieces sharing a boundary chunk are written concurrently, with
+nothing left behind to detect it. So
+tiling anchors to the global grid (never to the region's own start, which would put
+interior boundaries mid-chunk), and the alignment of the caller's own region is
+reported rather than silently accepted. These ops run in the calling process, no dask,
+which is also what keeps that hazard confined to what the user does across invocations.

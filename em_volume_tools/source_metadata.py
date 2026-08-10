@@ -8,6 +8,13 @@ without reliable metadata (image stacks, bare arrays, HDF5) return ``None``.
 Returned dict keys: ``data_spec`` (the array/scale spec to actually read),
 ``voxel_size``/``offset`` (canonical z,y,x), ``units``, ``spatial_axes``,
 ``has_channels``.
+
+**Two tiers, and the difference is cost.** Everything above ``describe`` reads only
+small metadata documents through the kvstore — one object per call. ``describe`` and
+``existing_levels`` at the bottom compose those into a whole-volume picture, and to do
+it they *open every level* through a backend. That is not free: measured on an
+8-level S3 zarr, the array opens took 15.8 s against 1.4 s for the metadata. Ask the
+narrow question when the narrow answer will do.
 """
 
 from __future__ import annotations
@@ -46,6 +53,30 @@ def precomputed_chunks_are_gzipped(location: str | Mapping[str, Any],
         if "_" in name and "-" in name:
             return name.endswith(".gz")
     return False
+
+
+#: The object whose presence identifies each volume format at a location. Order
+#: matters and matches :func:`detect_backend`: ``info`` is checked first, so a
+#: directory holding both markers reads as precomputed.
+FORMAT_MARKERS = {"neuroglancer_precomputed": "info", "zarr3": "zarr.json"}
+
+
+def other_format_markers(location: str | Mapping[str, Any], fmt: str) -> list[str]:
+    """Markers of volume formats *other* than ``fmt`` already present at ``location``.
+
+    Two volumes in one directory is not hypothetical: creating a volume writes only
+    its own marker, so making a precomputed volume where a zarr one already lives
+    leaves ``info`` and ``zarr.json`` side by side. :func:`detect_backend` checks
+    ``info`` first, so from then on the zarr is unreachable through every path in this
+    package while its chunks still occupy the store — and nothing says so.
+    """
+    kv = to_kvstore(location)
+    if "path" in kv and not str(kv["path"]).endswith("/"):
+        kv["path"] = str(kv["path"]) + "/"
+    fmt = "neuroglancer_precomputed" if str(fmt).startswith("neuroglancer_precomputed") \
+        else fmt
+    return [marker for f, marker in FORMAT_MARKERS.items()
+            if f != fmt and _read_key(kv, marker) is not None]
 
 
 def detect_backend(location: str | Mapping[str, Any]) -> str | None:
@@ -212,3 +243,84 @@ def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
         # whether downsampling may average (image) or must take a mode (labels).
         "kind": "segmentation" if info.get("type") == "segmentation" else "image",
     }
+
+
+# --------------------------------------------------------------------------- #
+# The whole-volume picture: format + coordinates + the levels actually present.
+#
+# These compose the readers above and additionally OPEN each level, which is the
+# expensive part (see the module docstring). `info`, `downsample`, `create --like`
+# and `write` all go through here, so none of them can disagree about what is on disk.
+# --------------------------------------------------------------------------- #
+def level_spec(volume: str, fmt: str, level: int) -> dict[str, Any]:
+    """The backend spec for one level of a multiscale volume.
+
+    The two formats address a level differently: zarr v3 puts each level in its own
+    subdirectory, while precomputed keeps every scale under one ``info`` and selects
+    with ``scale_index``. Everything that opens a level goes through here rather than
+    building the path itself.
+    """
+    if fmt == "zarr3":
+        return {"backend": fmt, "path": f"{volume.rstrip('/')}/{level}"}
+    return {"backend": fmt, "path": volume, "scale_index": int(level)}
+
+
+def describe(volume: str) -> dict:
+    """Detected format, coordinate metadata and the levels actually present.
+
+    Raises ``FileNotFoundError`` if nothing at ``volume`` looks like a volume.
+    """
+    from .backends.base import open_backend
+
+    fmt = detect_backend(volume)
+    if fmt is None:
+        raise FileNotFoundError(f"no volume found at {volume}")
+    spec = {"backend": fmt, "path": volume}
+    meta = read_source_metadata(spec)
+    level0 = open_backend(meta["data_spec"] if meta else spec)
+    shape = tuple(int(s) for s in level0.shape)
+    return {"format": fmt, "meta": meta, "shape": shape,
+            "dtype": str(getattr(level0, "dtype", "?")),
+            "has_channels": bool(meta["has_channels"]) if meta else False,
+            "level_voxel_sizes": read_level_voxel_sizes(spec),
+            "levels": existing_levels(volume, fmt),
+            # One extra small read, against several array opens — worth it to notice
+            # a second volume shadowed underneath this one.
+            "other_markers": other_format_markers(volume, fmt)}
+
+
+def existing_levels(volume: str, fmt: str, probe: int = 12) -> dict[int, dict]:
+    """``{level: {"shape", "chunks", "read_chunks"}}`` for the levels that open.
+
+    Probes upward until one misses. The multiscale group metadata is written at the
+    very end of a conversion, so an in-flight volume has levels but no group metadata
+    — probing is what makes this work on a run that is still going.
+
+    Chunking is **per level**, not a property of the volume: it lives in each level's
+    own array metadata (zarr's ``zarr.json``, precomputed's per-scale ``chunk_sizes``),
+    and a conversion is free to chunk levels differently. So it is read here, where
+    each level is opened anyway, rather than assumed from level 0.
+
+    ``chunks`` is the *write* chunk and ``read_chunks`` the *read* chunk. They differ
+    only when the level is sharded, where the write chunk is the shard and the read
+    chunk is the unit actually fetched — which is the number that governs read
+    amplification, so both are worth having.
+    """
+    from .backends.base import open_backend
+
+    out: dict[int, dict] = {}
+    for i in range(probe):
+        try:
+            be = open_backend(level_spec(volume, fmt, i))
+            shape = tuple(int(s) for s in be.shape)
+        except Exception:
+            break
+        # chunks come from the same open, but a backend need not expose them
+        def _maybe(attr):
+            try:
+                return tuple(int(c) for c in getattr(be, attr))
+            except Exception:
+                return None
+        out[i] = {"shape": shape, "chunks": _maybe("chunks"),
+                  "read_chunks": _maybe("read_chunks")}
+    return out

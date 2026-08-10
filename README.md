@@ -56,10 +56,43 @@ convert("in.zarr", "out.precomputed",           # voxel_size read from in.zarr's
 
 `extract_roi()` crops/pads a region (and can pyramid it) into either format.
 
+`create_volume()` + `write_subvolume()` are the other shape of the problem: several
+small pieces that belong at known positions inside one frame, rather than one source
+converted wholesale. Create the (empty) frame — optionally copying a reference
+volume's geometry exactly — then place each piece into one level of it.
+
+```python
+from em_volume_tools import create_volume, write_subvolume, write_subvolumes
+
+create_volume("annotations.precomputed", like="s3://.../image.zarr",  # same frame, so
+              dtype="uint64", kind="segmentation")                    # a voxel index
+write_subvolume("annotations.precomputed", "piece.h5", (1024, 4096, 4096))  # matches
+write_subvolumes("annotations.precomputed", glob("pieces/*.h5"))  # offsets from the files
+```
+
+An offset may be **omitted** when the source records one — an HDF5 file's
+`voxel_offset`, looked for in the dataset's attributes, the root group's attributes,
+and a top-level dataset of that name. Any backend may supply one by implementing
+`stored_offset`. Check `offset_order=` if the value came from a precomputed-flavoured
+writer: that field name means *xyz* there, and everything here is zyx.
+
+`write_subvolumes` plans **every** source — offsets, bounds, dtype — before writing
+any of them, so a mistyped offset in the last file is caught while the volume is still
+untouched. Pieces that overlap each other are reported, not refused.
+
+Either format: `format="zarr"` or `"precomputed"`, defaulting to the reference's own —
+"like this volume" includes what kind of volume it is. Creating a level costs one
+`zarr.json` (an unwritten zarr array reads back as the fill value), and an empty
+precomputed volume is a single `info` listing every scale — so the frame is a few
+hundred bytes either way. The writes are **single-scale by design**: how a patch
+should look when coarsened is a separate decision (averaging label ids invents ids),
+so run `downsample` afterwards if the result needs a pyramid.
+
 Implemented: `VoxelMeta`, `Volume`, block-map engine, `start_dask`, TensorStore
 zarr v3 (sharded/unsharded) **and** precomputed (canonical-axis view + multiscale
 `info`), image-stack / HDF5 / crop-view sources, type-aware pyramids, storage
-profiles, OME-NGFF 0.5 metadata, and the `ingest` / `convert` / `extract_roi` ops.
+profiles, OME-NGFF 0.5 metadata, and the `ingest` / `convert` / `extract_roi` /
+`create_volume` / `write_subvolume` ops.
 Outputs verified via ngff-zarr's reader (zarr) and TensorStore round-trip
 (precomputed); the distributed path is exercised over a real `LocalCluster`.
 
@@ -98,6 +131,8 @@ em-vol info    <volume>                      # format, voxel sizes, chunking, le
 em-vol convert --src ... --dst ...           # build a multiscale volume
 em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
 em-vol progress <volume>                     # chunks written, per level
+em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
+em-vol write   <volume> --src ... --offset   # put one subvolume into it
 ```
 
 `info` and `progress` read only. `downsample` rebuilds a pyramid **in place** from a
@@ -105,6 +140,36 @@ level you trust — cascaded downsampling means a bad level poisons everything a
 — and `--dry-run` prints the schedule beside what is on disk, refusing if they
 disagree rather than leaving the pyramid inconsistent. Use `convert` to build a *new*
 volume.
+
+`create` and `write` are the small-pieces path and are **not** block-mapped — they run
+in the calling process, no dask. Both take `--dry-run`.
+
+```bash
+em-vol create /abs/annotations.precomputed --like s3://.../image.precomputed \
+    --dtype uint64 --kind segmentation            # empty; same frame as the image
+em-vol write /abs/annotations.precomputed --src piece.h5 --offset 1024,4096,4096
+em-vol write /abs/annotations.precomputed --src slices/ --offset 4096,16384,16384 \
+    --level 2 --offset-level 0                    # coords read off level 0
+em-vol write /abs/annotations.precomputed \
+    --src a.h5 --src b.h5 --src c.h5              # each file's own voxel_offset
+```
+
+`--src` is repeatable and `--offset` is optional: with none given, each source is asked
+for its own (`--offset-field`, default `voxel_offset`). Every source in a batch is
+checked before any is written. `--offset-order xyz` if the stored numbers are xyz — the
+field name is precomputed's, where it is, and reversed the piece lands mirrored through
+the z=x diagonal.
+
+`--format zarr|precomputed` picks the target (default: the reference's own).
+Precomputed keeps its scales in one intrinsic `info` and takes `--encoding`
+(`compressed_segmentation` for `--kind segmentation`, else `raw`); it cannot shard,
+and says so rather than dropping `--shard` on the floor.
+
+`--like` copies the reference's level shapes verbatim rather than recomputing a
+schedule, so the two volumes cannot drift a voxel apart partway up the pyramid.
+`write` reports whether the region is aligned to the destination's chunk grid: an
+unaligned edge means those chunks are read-modify-written, which is correct on its
+own but loses one of two updates if overlapping writes ever run at once.
 
 ```bash
 # smoke test locally, then launch on SLURM surviving logout:

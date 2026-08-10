@@ -40,6 +40,8 @@ def test_every_subcommand_parses():
         (["convert", "--src", "a", "--dst", "b"], cli.cmd_convert),
         (["downsample", "/v", "--start-level", "2"], cli.cmd_downsample),
         (["progress", "/v"], cli.cmd_progress),
+        (["create", "/v", "--like", "/r"], cli.cmd_create),
+        (["write", "/v", "--src", "a.h5", "--offset", "0,0,0"], cli.cmd_write),
     ]:
         assert cli._parse_args(argv).func is expected
 
@@ -153,8 +155,15 @@ def test_existing_levels_stops_at_the_first_gap(tmp_path):
 
 
 def test_describe_rejects_a_path_with_no_volume(tmp_path):
-    with pytest.raises(SystemExit, match="no volume found"):
+    """FileNotFoundError, not SystemExit: `describe` is a library call now.
+
+    The ops use it too (`create --like`, `write`), and a library function that kills
+    the interpreter is not usable from a notebook. The CLI turns it back into an exit.
+    """
+    with pytest.raises(FileNotFoundError, match="no volume found"):
         cli.describe(str(tmp_path / "empty"))
+    with pytest.raises(SystemExit, match="no volume found"):
+        cli.cmd_info(cli._parse_args(["info", str(tmp_path / "empty")]))
 
 
 def test_levels_report_their_own_chunking(tmp_path):
