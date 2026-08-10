@@ -735,8 +735,8 @@ def _parse_args(argv=None):
                     "not create a new volume — use `convert` for that.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume", help="the multiscale volume to repair (path or s3://...)")
-    q.add_argument("--start-level", type=int, required=True,
-                   help="level to derive from; it is read, never written")
+    q.add_argument("--start-level", type=int, default=0,
+                   help="level to derive from; it is read, never written (default: 0)")
     q.add_argument("--kind", choices=("image", "segmentation"), default=None,
                    help="reducer (default: read from the volume)")
     q.add_argument("--min-dim", type=int, default=128)
