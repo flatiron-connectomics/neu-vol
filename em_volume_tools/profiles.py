@@ -4,11 +4,11 @@ Decouples the viewer-facing *read chunk* from the on-disk *file/object* size and
 picks sensible defaults per destination (docs/DESIGN.md §5). All values are
 overridable at call sites.
 
-  - ``local``           : zarr v3, 128^3 chunks, unsharded  (dev / smoke test)
-  - ``ceph``            : zarr v3, 128^3 read chunks packed into ~1024^3 shards
-                          (sharding codec) -> few inodes, quota-safe intermediates
-  - ``s3-neuroglancer`` : precomputed, small unsharded chunks (web viewing)
-                          [create not implemented yet; zarr3 is the v1 target]
+  - ``local``              : zarr v3, 128^3 chunks, unsharded  (dev / smoke test)
+  - ``ceph``               : zarr v3, 128^3 read chunks packed into ~1024^3 shards
+                             (sharding codec) -> few inodes, quota-safe intermediates
+  - ``s3-neuroglancer``    : precomputed, gzip, unsharded (web viewing)
+  - ``local-neuroglancer`` : the same, on a filesystem
 """
 
 from __future__ import annotations
@@ -34,6 +34,13 @@ PROFILES: dict[str, StorageProfile] = {
     "local": StorageProfile("zarr3", chunk=(128, 128, 128), shard=None),
     "ceph": StorageProfile("zarr3", chunk=(128, 128, 128), shard=(1024, 1024, 1024)),
     "s3-neuroglancer": StorageProfile(
+        "neuroglancer_precomputed", chunk=(128, 128, 128), shard=None, compressor="gzip"
+    ),
+    # Same target on a filesystem. It is a separate name because the two are chosen by
+    # destination (see the CLI's --format handling) and are free to diverge — but the
+    # entry was missing for long enough that `convert --format precomputed` to a local
+    # path failed outright with "unknown profile 'local-neuroglancer'".
+    "local-neuroglancer": StorageProfile(
         "neuroglancer_precomputed", chunk=(128, 128, 128), shard=None, compressor="gzip"
     ),
 }

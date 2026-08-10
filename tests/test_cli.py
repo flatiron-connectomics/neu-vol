@@ -44,6 +44,23 @@ def test_every_subcommand_parses():
         assert cli._parse_args(argv).func is expected
 
 
+def test_a_local_precomputed_target_has_a_profile_to_use(tmp_path):
+    """`convert --format precomputed` to a local path asks for 'local-neuroglancer'.
+
+    That profile was referenced by the CLI but never registered, so the whole path
+    failed with "unknown profile" — and it survived because every test that wanted
+    precomputed passed 's3-neuroglancer' explicitly, local destination or not.
+    """
+    from em_volume_tools.profiles import get_profile
+
+    assert get_profile("local-neuroglancer").format == "neuroglancer_precomputed"
+    src, dst = _pyramid(tmp_path), str(tmp_path / "pc_out")
+    assert cli.cmd_convert(cli._parse_args(
+        ["convert", "--src", src, "--dst", dst, "--format", "precomputed",
+         "--serial", "--chunk", "8,8,8", "--min-dim", "8"])) == 0
+    assert cli.describe(dst)["format"] == "neuroglancer_precomputed"
+
+
 def test_a_subcommand_is_required():
     with pytest.raises(SystemExit):
         cli._parse_args([])
