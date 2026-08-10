@@ -8,6 +8,10 @@ while precomputed's multiscale ``info`` is written incrementally at scale create
 See docs/DESIGN.md §6-7. A leading channel axis ``(c, z, y, x)`` is supported and
 never downsampled.
 
+Every per-block worker is wrapped in :func:`em_volume_tools.retry.with_retry`. At this
+scale transient object-store failures are not hypothetical — one bad connection or DNS
+lookup among tens of thousands of tasks would otherwise end a run that is succeeding.
+
 Resume + sparsity: each block worker returns ``(index, status)`` where status is
 ``written`` / ``empty`` (equalled fill value, elided) / ``skipped`` (verify found
 it present). The driver records these to a single-writer Manifest; on resume the
@@ -34,6 +38,7 @@ from ..location import default_progress_path, join, to_kvstore
 from ..ngff import build_dataset, build_multiscales_attrs, ome_unit, validate_attrs, write_group_metadata
 from ..profiles import get_profile, precomputed_create_spec, zarr3_create_spec
 from ..pyramid import cumulative_factors, downsample_schedule, get_reducer, level_scale_translation
+from ..retry import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -48,33 +53,48 @@ def _input_region(out_region: Region, factor: Sequence[int], src_shape: Sequence
     )
 
 
+# Per-block work is wrapped in `with_retry`, and the whole block is the retry unit:
+# open, read and write are all idempotent for a fixed region, so repeating them
+# produces the same result. Blocks fail fast (CLAUDE.md invariant 5) and that stays
+# true — retry only removes the failures that would have fixed themselves. Without it
+# a single transient network error anywhere across tens of thousands of tasks kills a
+# run that is otherwise succeeding: observed as a connection reset on an 11 TB copy,
+# and again as one worker failing to resolve the S3 hostname (curl_code=6) two seconds
+# into an 85,536-task level. A permanent error (403, malformed spec) is re-raised
+# immediately — see retry.is_transient, which checks permanent markers first.
 def _copy_block(block: Block, *, src_spec: dict, dst_spec: dict, out_dtype: str,
                 verify: bool = False) -> tuple:
-    dst = open_backend(dst_spec)
-    if verify and dst.is_region_stored(block.region):
-        return (block.index, "skipped")
-    src = open_backend(src_spec)
-    data = src.read_region(block.region)
-    if str(data.dtype) != out_dtype:
-        data = data.astype(out_dtype)
-    if not data.any():                      # all fill value -> elide (sparse-friendly)
-        return (block.index, "empty")
-    dst.write_region(block.region, data)
-    return (block.index, "written")
+    def once():
+        dst = open_backend(dst_spec)
+        if verify and dst.is_region_stored(block.region):
+            return (block.index, "skipped")
+        src = open_backend(src_spec)
+        data = src.read_region(block.region)
+        if str(data.dtype) != out_dtype:
+            data = data.astype(out_dtype)
+        if not data.any():                  # all fill value -> elide (sparse-friendly)
+            return (block.index, "empty")
+        dst.write_region(block.region, data)
+        return (block.index, "written")
+
+    return with_retry(once, label=f"copy block {block.index}")
 
 
 def _downsample_block(block: Block, *, src_spec: dict, dst_spec: dict,
                       factor: tuple, kind: str, verify: bool = False) -> tuple:
-    dst = open_backend(dst_spec)
-    if verify and dst.is_region_stored(block.region):
-        return (block.index, "skipped")
-    src = open_backend(src_spec)
-    data = src.read_region(_input_region(block.region, factor, src.shape))
-    out = get_reducer(kind)(data, factor)
-    if not out.any():
-        return (block.index, "empty")
-    dst.write_region(block.region, out)
-    return (block.index, "written")
+    def once():
+        dst = open_backend(dst_spec)
+        if verify and dst.is_region_stored(block.region):
+            return (block.index, "skipped")
+        src = open_backend(src_spec)
+        data = src.read_region(_input_region(block.region, factor, src.shape))
+        out = get_reducer(kind)(data, factor)
+        if not out.any():
+            return (block.index, "empty")
+        dst.write_region(block.region, out)
+        return (block.index, "written")
+
+    return with_retry(once, label=f"downsample block {block.index}")
 
 
 # --------------------------------------------------------------------------- #

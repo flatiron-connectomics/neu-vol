@@ -10,6 +10,13 @@ REAL_TRANSIENT = (
     '"sample3/seg/info": CURL error SSL connect error: Recv failure: Connection '
     "reset by peer [curl_code='35']"
 )
+# Verbatim from a downsample that died two seconds into an 85,536-task level: one
+# worker could not resolve the S3 hostname.
+REAL_DNS = (
+    'UNAVAILABLE: Error opening "neuroglancer_precomputed" driver: Error reading '
+    '"sample3/gt_v1/info": CURL error Could not resolve hostname: Could not resolve '
+    "host: my-bucket.s3.amazonaws.com [curl_code='6']"
+)
 # Verbatim from the run where workers lacked bootstrapped credentials.
 REAL_PERMANENT = (
     "PERMISSION_DENIED: AccessDenied: Access Denied "
@@ -19,6 +26,7 @@ REAL_PERMANENT = (
 
 def test_classifies_the_real_errors_we_have_seen():
     assert is_transient(ValueError(REAL_TRANSIENT))
+    assert is_transient(ValueError(REAL_DNS))
     assert not is_transient(ValueError(REAL_PERMANENT))
 
 
@@ -90,6 +98,90 @@ def test_backoff_grows_and_is_bounded(monkeypatch):
 # --------------------------------------------------------------------------- #
 # Backend cache — an uncached open costs a TLS handshake per block
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# the block workers, which are where this actually has to be wired in
+# --------------------------------------------------------------------------- #
+def _flaky_open(monkeypatch, error, fail_times):
+    """Make the next ``fail_times`` open_backend calls raise ``error``."""
+    from em_volume_tools.ops import _multiscale
+
+    real = _multiscale.open_backend
+    state = {"left": fail_times, "calls": 0}
+
+    def fake(spec):
+        state["calls"] += 1
+        if state["left"] > 0:
+            state["left"] -= 1
+            raise ValueError(error)
+        return real(spec)
+
+    monkeypatch.setattr(_multiscale, "open_backend", fake)
+    return state
+
+
+def _one_block_volume(tmp_path, name):
+    """A source and a destination array, and the single block that spans them."""
+    import numpy as np
+    from em_blockrun import iter_blocks
+    from em_volume_tools.backends.tensorstore import TensorStoreBackend
+    from em_volume_tools.profiles import zarr3_create_spec
+
+    shape = (8, 8, 8)
+    src = TensorStoreBackend.create(
+        zarr3_create_spec("local", str(tmp_path / f"{name}.src"), shape, "uint8",
+                          dimension_names=("z", "y", "x"), chunk=shape),
+        delete_existing=True)
+    src.write_region(tuple(slice(0, s) for s in shape),
+                     np.ones(shape, np.uint8))
+    dst = TensorStoreBackend.create(
+        zarr3_create_spec("local", str(tmp_path / f"{name}.dst"), shape, "uint8",
+                          dimension_names=("z", "y", "x"), chunk=shape),
+        delete_existing=True)
+    block = next(iter(iter_blocks(shape, shape)))
+    return src.to_spec(), dst.to_spec(), block
+
+
+@pytest.mark.parametrize("worker", ["copy", "downsample"])
+def test_a_block_survives_a_transient_failure(tmp_path, monkeypatch, worker):
+    """The gap this closes: `with_retry` existed but the block workers never used it.
+
+    A run is tens of thousands of tasks; at that scale one bad connection is close to
+    certain, and fail-fast turned it into a lost run twice — a TLS reset 11 TB into a
+    copy, and a DNS lookup two seconds into a downsample.
+    """
+    import numpy as np
+    from em_volume_tools.backends.base import open_backend
+    from em_volume_tools.ops._multiscale import _copy_block, _downsample_block
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)      # no real backoff
+    src_spec, dst_spec, block = _one_block_volume(tmp_path, worker)
+    state = _flaky_open(monkeypatch, REAL_DNS, fail_times=2)
+
+    if worker == "copy":
+        index, status = _copy_block(block, src_spec=src_spec, dst_spec=dst_spec,
+                                    out_dtype="uint8")
+    else:
+        index, status = _downsample_block(block, src_spec=src_spec, dst_spec=dst_spec,
+                                          factor=(1, 1, 1), kind="image")
+    assert status == "written" and state["left"] == 0
+    out = open_backend(dst_spec).read_region(block.region)
+    assert np.array_equal(out, np.ones((8, 8, 8), np.uint8)), "the retry wrote nothing"
+
+
+def test_a_block_does_not_retry_a_permanent_failure(tmp_path, monkeypatch):
+    """A 403 must fail on the first attempt — retrying it burns the backoff budget on
+    every task of a misconfigured run before failing anyway."""
+    from em_volume_tools.ops._multiscale import _copy_block
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    src_spec, dst_spec, block = _one_block_volume(tmp_path, "perm")
+    state = _flaky_open(monkeypatch, REAL_PERMANENT, fail_times=99)
+
+    with pytest.raises(ValueError, match="PERMISSION_DENIED"):
+        _copy_block(block, src_spec=src_spec, dst_spec=dst_spec, out_dtype="uint8")
+    assert state["calls"] == 1, f"retried a permanent error {state['calls']} times"
+
+
 def test_backends_are_cached_per_spec(tmp_path):
     import numpy as np
 
