@@ -59,3 +59,33 @@ jobs:
           assert 'dask-local' in bundled_configs(), bundled_configs()
           print('bundled dask templates resolve:', resolve_config('dask-local'))
           "
+
+  # Ask the documentation site to rebuild, so the published CLI reference follows this
+  # commit. `main` only, and only once the tests pass: the reference is generated from
+  # the live parsers, so publishing from a red commit would document code nobody should
+  # be running.
+  docs:
+    needs: pytest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rebuild flatiron-connectomics/em-libraries
+        env:
+          # The workflow's own GITHUB_TOKEN is scoped to THIS repository and cannot
+          # dispatch to another one, so this needs a separate token with contents:write
+          # on em-libraries. When it is absent the step says so and succeeds — a docs
+          # refresh that did not happen must not turn a green test run red, and the
+          # site rebuilds on its nightly schedule regardless.
+          TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::DOCS_DISPATCH_TOKEN is not set; skipping. The site will pick this commit up on its next scheduled build."
+            exit 0
+          fi
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/flatiron-connectomics/em-libraries/dispatches \
+            -d "{\"event_type\":\"package-updated\",\"client_payload\":{\"repo\":\"$GITHUB_REPOSITORY\",\"sha\":\"$GITHUB_SHA\"}}"
+          echo "::notice::asked em-libraries to rebuild its docs for $GITHUB_SHA"
