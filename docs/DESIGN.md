@@ -323,8 +323,14 @@ em_volume_tools/                # volume/EM-specific
 │   ├── roi.py       # extract_roi: convert + the crop-AND-PAD policy
 │   ├── create.py    # create_volume: an EMPTY volume (zarr3 or precomputed), specced
 │   │                #   by hand or `like=` a reference (§10) — no source, no data
-│   └── write.py     # write_subvolume: one piece into one level, at a voxel offset
-└── cli.py           # (later)
+│   ├── write.py     # write_subvolume: one piece into one level, at a voxel offset
+│   ├── rebuild.py   # rebuild_pyramid: levels above a trusted one, in place
+│   ├── relabel.py   # one disjoint id range per occupied region
+│   ├── annotate.py  # neuroglancer annotation layers: from occupancy (bboxes-json)
+│   │                #   or from supplied coordinates (annotate-json). LOCAL only —
+│   │                #   the precomputed annotation format is em-annotate's job
+│   └── ngurl.py     # a whole viewer state, and the URL that carries it
+└── cli.py           # the `em-vol` command (below)
 
 ../em-blockrun/em_blockrun/      # shared dask/SLURM substrate (no EM deps)
 ├── dask_runner.py   # start_dask (LocalCluster / SLURMCluster from one config)

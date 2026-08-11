@@ -155,11 +155,12 @@ em-vol progress <volume>                     # chunks written, per level
 em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
 em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
+em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates
 em-vol relabel <volume> --out ...            # one id range per occupied region
 em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 ```
 
-`info`, `progress`, `bboxes-json` and `ng-url-gen` read only. `downsample` rebuilds a pyramid **in place** from a
+`info`, `progress`, `bboxes-json`, `annotate-json` and `ng-url-gen` read only. `downsample` rebuilds a pyramid **in place** from a
 level you trust — cascaded downsampling means a bad level poisons everything above it
 — and `--dry-run` prints the schedule beside what is on disk, refusing if they
 disagree rather than leaving the pyramid inconsistent. Use `convert` to build a *new*
@@ -220,11 +221,38 @@ Raise it when the occupied footprint is large — each level is a factor smaller
 at the price of quantizing every bound to one voxel there. `--no-tighten` leaves the
 boxes on the chunk grid and reads nothing.
 
-The annotations are **local** — inline in the state — rather than a precomputed
-annotation layer, because neuroglancer does not *list* precomputed annotations: it
-builds the annotation panel by iterating the layer's source, and the class behind every
-precomputed annotation source defines that iterator as empty. Those annotations render
-in the viewport but cannot be clicked through, which defeats the purpose here.
+### Annotating coordinates you already have
+
+`annotate-json` is the counterpart: points, boxes, lines and ellipsoids you supply, in
+the same kind of layer. CSV columns are read **by name** (`z,y,x`; `z0,y0,x0,z1,y1,x1`;
+`z,y,x,rz,ry,rx`, plus optional `id`, `description` and `segments`), so a synapse table
+with its own column order and extra columns needs no preparation, and one layer may mix
+kinds. `-` reads stdin; `--point`/`--box`/`--line`/`--ellipsoid` take one inline.
+
+```bash
+em-vol annotate-json --volume s3://.../seg --points synapses.csv --out syn.json
+em-vol ng-url-gen --seg s3://.../seg --layer syn.json --select-last
+```
+
+Coordinates are **level-0 voxels** unless `--scale N` (converted with the volume's real
+per-level voxel sizes, never `2**N`) or `--nm` says otherwise. That is the one mistake
+worth guarding: a coordinate in the wrong unit is still a valid annotation, just
+somewhere else, so anything landing outside the volume's extent is reported.
+
+### Local annotations, and when to reach for the precomputed format
+
+The annotations both commands emit are **local** — inline in the state — because
+neuroglancer does not *list* precomputed annotations: it builds the annotation panel by
+iterating the layer's source, and the class behind every precomputed annotation source
+defines that iterator as empty. Those render in the viewport but cannot be clicked
+through, and there is no reverse "annotations on this segment" panel either.
+
+That bounds a local layer to what a state can carry — thousands. Beyond that,
+`neuroglancer_annotations_v1` is a real on-store format and the right answer: one
+annotation type per source, spatial index levels that subsample so a zoomed-out view
+draws a scattering rather than everything, and a relationship index keyed on segment id
+that makes "this body's synapses" a keyed fetch. Nothing here writes it — see the
+`em-annotate` design note in `NOTES-TODO.md`.
 
 ### Sharing a view
 

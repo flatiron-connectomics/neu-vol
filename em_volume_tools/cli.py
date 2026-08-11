@@ -12,6 +12,7 @@ continues where it stopped rather than starting over.
     em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
     em-vol write   <volume> --src ... --offset   # put one subvolume into it
     em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
+    em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates
     em-vol relabel <volume> --out ...            # one id range per occupied region
     em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 
@@ -1114,6 +1115,178 @@ def cmd_bboxes_json(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# annotate-json
+# --------------------------------------------------------------------------- #
+#: ``--points FILE`` / ``--point z,y,x`` per kind. One flag per kind rather than
+#: ``--csv`` plus ``--kind``, so a file's kind is visible in the command line and one
+#: layer can mix kinds — which local annotations allow and a precomputed source does not.
+_ANN_FLAGS = (("points", "point"), ("boxes", "box"), ("lines", "line"),
+              ("ellipsoids", "ellipsoid"))
+
+#: The same column spec as ``ops.annotate.CSV_COLUMNS``, repeated here because the
+#: parser needs it at build time and importing ``ops`` at module scope would pull
+#: tensorstore into every `em-vol --help` (see test_cli_contract). A test asserts the
+#: two agree, which is the only thing keeping the duplication honest.
+_ANN_CSV_COLUMNS = {
+    "point": (("z", "y", "x"),),
+    "box": (("z0", "y0", "x0"), ("z1", "y1", "x1")),
+    "line": (("z0", "y0", "x0"), ("z1", "y1", "x1")),
+    "ellipsoid": (("z", "y", "x"), ("rz", "ry", "rx")),
+}
+
+
+def _read_ann_file(path: str) -> str:
+    """CSV text from a path, an object-store URL, or ``-`` for stdin."""
+    if path == "-":
+        return sys.stdin.read()
+    from em_volume_tools.location import read_bytes
+
+    data = read_bytes(path)
+    if data is None:
+        raise SystemExit(f"could not read {path}")
+    return data.decode()
+
+
+def _inline_records(args) -> list[dict]:
+    """Records from the repeatable inline flags, in the order they were given."""
+    records = []
+    for _plural, kind in _ANN_FLAGS:
+        for value in getattr(args, kind) or []:
+            n = 3 * len(_ANN_CSV_COLUMNS[kind])
+            parts = [p for p in value.replace(" ", "").split(",") if p]
+            if len(parts) != n:
+                raise SystemExit(
+                    f"--{kind} needs {n} comma-separated numbers "
+                    f"({', '.join(c for g in _ANN_CSV_COLUMNS[kind] for c in g)}), "
+                    f"got {value!r}")
+            try:
+                flat = [float(p) for p in parts]
+            except ValueError:
+                raise SystemExit(f"--{kind} {value!r}: not all numbers") from None
+            records.append({"kind": kind,
+                            "coords": tuple(tuple(flat[i:i + 3])
+                                            for i in range(0, n, 3))})
+    return records
+
+
+def _ann_frame(args):
+    """``(voxel_size_zyx, units, level-0 spatial shape or None)`` for the layer's frame.
+
+    The frame is what makes the coordinates mean anything: an annotation layer declares
+    its own ``outputDimensions``, and one that disagrees with the volume puts every
+    annotation in the wrong place while still loading.
+    """
+    voxel = _ftriple(args.voxel_size, "voxel-size")
+    if not args.volume:
+        return voxel, ("nm" if voxel else None), None
+    d = _describe(args.volume)
+    meta = d["meta"] or {}
+    shape = tuple(d["shape"][1:] if d["has_channels"] else d["shape"])
+    return (voxel or (meta.get("voxel_size") and tuple(meta["voxel_size"])),
+            "nm" if voxel else meta.get("units"), shape)
+
+
+def cmd_annotate_json(args) -> int:
+    """A neuroglancer annotation layer built from coordinates you supply.
+
+    The JSON goes to **stdout** and the summary to **stderr**, as with ``bboxes-json``,
+    so ``em-vol annotate-json ... > layer.json`` works. Pass the result to
+    ``em-vol ng-url-gen --layer`` for a link.
+
+    Reads nothing but the volume's metadata — and only to get the frame right.
+    """
+    from em_volume_tools.ops.annotate import (build_annotation, local_layer,
+                                              output_dimensions,
+                                              read_annotation_csv, render, rescale)
+
+    records = []
+    for plural, kind in _ANN_FLAGS:
+        for path in getattr(args, plural) or []:
+            try:
+                records += read_annotation_csv(_read_ann_file(path), kind, source=path)
+            except ValueError as e:
+                raise SystemExit(str(e)) from None
+    records += _inline_records(args)
+    if not records:
+        raise SystemExit(
+            "nothing to annotate: give at least one of --points/--boxes/--lines/"
+            "--ellipsoids (a CSV path, a URL, or - for stdin) or an inline "
+            "--point/--box/--line/--ellipsoid")
+
+    voxel, units, shape = _ann_frame(args)
+    err = sys.stderr
+    print(f"{args.volume or '(no volume: frame from --voxel-size)'}", file=err)
+    if voxel:
+        print(f"  frame       {'x'.join(f'{v:g}' for v in voxel)} {units or '?'} "
+              f"per level-0 voxel", file=err)
+
+    # Coordinates land in the layer as level-0 voxels, because that is the frame
+    # `outputDimensions` states. Both other input units are one per-axis scaling.
+    if args.scale:
+        if not args.volume:
+            raise SystemExit("--scale needs --volume: the conversion uses the volume's "
+                             "own per-level voxel sizes, which cannot be guessed")
+        factor = _level0_factor(args.volume, args.scale)
+        records = rescale(records, factor)
+        print(f"  scale {args.scale}     x{factor} (zyx) -> level-0 voxels", file=err)
+    elif args.nm:
+        if not voxel:
+            raise SystemExit("--nm needs the level-0 voxel size: pass --voxel-size or "
+                             "a --volume that records one")
+        records = rescale(records, tuple(1.0 / v for v in voxel))
+        print(f"  nm          /{tuple(voxel)} (zyx) -> level-0 voxels", file=err)
+
+    ids, annotations = set(), []
+    for i, r in enumerate(records):
+        ident = str(r.get("id") or f"{args.label}{i:03d}")
+        if ident in ids:
+            raise SystemExit(f"duplicate annotation id {ident!r}: neuroglancer keys its "
+                             f"annotations by id, so duplicates collide. Fix the `id` "
+                             f"column, or drop it and let them be numbered.")
+        ids.add(ident)
+        annotations.append(build_annotation(r, ident))
+
+    dims, warning = output_dimensions(voxel, units)
+    counts: dict[str, int] = {}
+    for r in records:
+        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+    print(f"  annotations {len(annotations)}: "
+          + ", ".join(f"{n} {k}" for k, n in sorted(counts.items())), file=err)
+    n_seg = sum(1 for r in records if r.get("segments"))
+    if n_seg:
+        print(f"  segments    {n_seg} annotation(s) linked to body ids", file=err)
+
+    # A wrong unit is the failure mode here, and it does not look like one: coordinates
+    # 8x off are still valid annotations, just somewhere else. The volume's extent is
+    # the only check available, so make it loudly.
+    if shape:
+        from em_volume_tools.ops.annotate import positions
+
+        outside = [i for i, r in enumerate(records)
+                   if any(not (0 <= c <= shape[a])
+                          for g in positions(r) for a, c in enumerate(g))]
+        where = f"the level-0 extent {shape} (zyx)"
+        if outside:
+            print(f"\n  WARNING: {len(outside)} annotation(s) fall outside {where} — "
+                  f"first at index {outside[0]}. Check whether the coordinates are in "
+                  f"another scale's voxels (--scale N) or in nm (--nm).", file=err)
+        else:
+            print(f"  bounds      all inside {where}", file=err)
+    if warning:
+        print(f"\n  WARNING: {warning}", file=err)
+
+    layer = local_layer(annotations, dims, name=args.name, color=args.color)
+    text = render(layer)
+    if args.out:
+        _write_text(args.out, text + "\n")
+        print(f"\nwrote {args.out} — paste it into the `layers` array of a neuroglancer "
+              f"state, or pass it to `em-vol ng-url-gen --layer`", file=err)
+    else:
+        print(text)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # relabel
 # --------------------------------------------------------------------------- #
 def cmd_relabel(args) -> int:
@@ -1598,6 +1771,67 @@ def build_parser() -> argparse.ArgumentParser:
                         "usable one the layer is unitless and will not line up")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_bboxes_json)
+
+    # --- annotate-json ------------------------------------------------------
+    q = sub.add_parser(
+        "annotate-json", help="a neuroglancer annotation layer from coordinates you give",
+        description="Emit a neuroglancer annotation layer from coordinates you supply — "
+                    "points, boxes, lines, ellipsoids — as CSV files or inline flags. "
+                    "The counterpart to `bboxes-json`, which derives its boxes from "
+                    "where a volume's data is; this one annotates what you already "
+                    "know, such as a synapse table.\n\n"
+                    "CSV columns are addressed BY NAME, so a table with its own column "
+                    "order and extra columns works untouched: z,y,x for points, "
+                    "z0,y0,x0,z1,y1,x1 for boxes and lines, z,y,x,rz,ry,rx for "
+                    "ellipsoids, plus optional id, description and segments (whitespace-"
+                    " or comma-separated body ids, which make the annotation select "
+                    "those bodies when you click it).\n\n"
+                    "Coordinates are LEVEL-0 VOXELS unless you say otherwise: --scale N "
+                    "converts from scale-N voxels using the volume's own per-level "
+                    "voxel sizes, --nm from physical nanometres. Getting this wrong is "
+                    "the failure mode of the whole command and does not look like an "
+                    "error — coordinates 8x off are still valid annotations, just "
+                    "somewhere else — so annotations landing outside the volume are "
+                    "reported.\n\n"
+                    "The annotations are LOCAL (inline in the state), which is what "
+                    "makes them appear in the Annotations tab and step with [ and ]. "
+                    "That also bounds how many are practical: a state carries them all. "
+                    "For a whole volume's worth of synapses the answer is the "
+                    "precomputed annotation format, which is not this command.\n\n"
+                    "JSON to stdout, summary to stderr, so `> layer.json` works.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    for plural, kind in _ANN_FLAGS:
+        cols = ",".join(c for g in _ANN_CSV_COLUMNS[kind] for c in g)
+        q.add_argument(f"--{plural}", action="append", default=None,
+                       metavar="CSV",
+                       help=f"CSV of {plural} (columns {cols}). A path, an s3:// URL, "
+                            f"or - for stdin. Repeatable")
+        q.add_argument(f"--{kind}", action="append", default=None,
+                       metavar=cols.upper(),
+                       help=f"one {kind} inline, as {cols}. Repeatable")
+    q.add_argument("--volume", default=None, metavar="PATH_OR_URL",
+                   help="the volume these annotate. Read for its voxel size, units and "
+                        "extent only — nothing else, and never its voxels. Without it, "
+                        "pass --voxel-size, or the layer is unitless and will not line up")
+    q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
+                   help="level-0 voxel size in nm, overriding the volume's own")
+    units = q.add_mutually_exclusive_group()
+    units.add_argument("--scale", type=int, default=0, metavar="N",
+                       help="the coordinates are in scale-N voxels; convert them to "
+                            "level 0 using the volume's real per-level voxel sizes "
+                            "(never an assumed 2**N). Needs --volume")
+    units.add_argument("--nm", action="store_true",
+                       help="the coordinates are physical nanometres; divide by the "
+                            "level-0 voxel size")
+    q.add_argument("--name", default="annotations", help="layer name")
+    q.add_argument("--label", default="a", metavar="PREFIX",
+                   help="prefix for generated annotation ids, numbered from 000. Only "
+                        "used for rows with no `id` column (default: a)")
+    q.add_argument("--color", default="#ffee00", help="annotation colour")
+    q.add_argument("--out", default=None, metavar="PATH_OR_URL",
+                   help="write the JSON here instead of to stdout (local or s3://...)")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_annotate_json)
 
     # --- relabel ------------------------------------------------------------
     q = sub.add_parser(

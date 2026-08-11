@@ -1,10 +1,16 @@
-"""Where the data is: a neuroglancer annotation layer marking a sparse volume's
-occupied regions.
+"""Neuroglancer annotation layers: derived from a volume's occupancy, or authored from
+coordinates you supply.
 
-For a volume that holds a handful of labeled boxes inside a large empty frame — a
-ground-truth volume, an ROI export — the hard part of viewing it is *finding* them.
-This derives one bounding box per written region and emits an annotation layer you
-paste into a neuroglancer state, giving a clickable list that jumps between them.
+Two entry points, one output. `bboxes-json` asks the volume *where its data is* and gets
+one box per written region — for a volume holding a handful of labeled boxes inside a
+large empty frame, finding them is the hard part. `annotate-json` takes points, boxes,
+lines and ellipsoids you already have (a synapse table, an ROI list) and puts them in the
+same kind of layer. Both end at :func:`local_layer`.
+
+Everything here writes **local** annotations, carried inline in the viewer state. For a
+set large enough that that stops working — synapses over a whole volume — the answer is
+the `neuroglancer_annotations_v1` precomputed format, which is a different piece of
+software with a different trade-off; see the em-annotate note in NOTES-TODO.
 
 **The annotations are local, not a precomputed annotation layer, and that is the whole
 point.** Neuroglancer builds its annotation list by iterating the layer's source, and
@@ -14,8 +20,8 @@ therefore renders in the viewport but contributes no rows to the Annotations tab
 list to click through, and ``[`` / ``]`` do not step. Local annotations, carried inline
 in the state, list and navigate. Nothing here writes to the store.
 
-Boxes come from the volume itself rather than from whatever was written into it, so
-they cannot drift from the data. Three steps, cheapest first:
+The occupancy boxes come from the volume itself rather than from whatever was written
+into it, so they cannot drift from the data. Three steps, cheapest first:
 
 1. **Which chunk objects exist.** TensorStore never persists an all-fill chunk, so the
    set of present keys *is* the occupied footprint. No voxel reads at all.
@@ -27,8 +33,9 @@ they cannot drift from the data. Three steps, cheapest first:
    answer to one coarse voxel — which is why extents come back as 252 or 256 rather
    than a uniform 256. Raise ``tighten_level`` for cheaper, ``0`` for exact.
 
-Coordinates are **zyx in memory** throughout, converted to xyz only in
-:func:`annotation_layer`, where neuroglancer requires it.
+Coordinates are **zyx in memory** throughout, converted to xyz in exactly one place —
+:func:`build_annotation` — because that is the conversion no test notices: a mirrored
+annotation is a perfectly valid annotation somewhere else in the volume.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from __future__ import annotations
 import itertools
 import json
 import math
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -306,30 +313,151 @@ def output_dimensions(voxel_size_zyx, units: str | None) -> tuple[dict, str | No
     return {d: [float(v) * metres, "m"] for d, v in zip("xyz", xyz)}, None
 
 
-def annotation_layer(regions: list[dict], dims: dict, *, name: str = "regions",
-                     color: str = "#ffee00", kind: str = "box",
-                     label: str = "r") -> dict:
-    """The layer object to paste into a state's ``layers`` array.
+#: The annotation kinds authored here: neuroglancer's own ``type`` string, and the
+#: geometry fields each one carries. Both come from ``annotationTypeHandlers`` /
+#: ``annotationToJson`` in neuroglancer's ``src/annotation/index.ts``, which is the
+#: authority — a bbox is stored as two *corners*, not an origin and a size.
+#:
+#: ``polyline`` is deliberately absent. It takes an arbitrary number of points per
+#: annotation, which one flat CSV row cannot carry, and inventing a grouping column for
+#: it would be a format of our own rather than a way of writing theirs.
+KINDS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "point": ("point", ("point",)),
+    "box": ("axis_aligned_bounding_box", ("pointA", "pointB")),
+    "line": ("line", ("pointA", "pointB")),
+    "ellipsoid": ("ellipsoid", ("center", "radii")),
+}
 
-    ``regions`` are zyx; every coordinate written here is reversed to xyz, which is
-    what neuroglancer reads.
+#: The zyx column names each kind needs, one tuple per geometry field above.
+CSV_COLUMNS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "point": (("z", "y", "x"),),
+    "box": (("z0", "y0", "x0"), ("z1", "y1", "x1")),
+    "line": (("z0", "y0", "x0"), ("z1", "y1", "x1")),
+    "ellipsoid": (("z", "y", "x"), ("rz", "ry", "rx")),
+}
+
+#: Columns any kind may carry. ``segments`` is what links an annotation to bodies, so
+#: selecting one in the viewer selects them; neuroglancer writes those ids as *strings*.
+OPTIONAL_COLUMNS = ("id", "description", "segments")
+
+#: How many of a kind's leading coordinate groups are *positions*. An ellipsoid's second
+#: group is radii — an extent, not a place — so a bounds check must not treat it as one.
+POSITION_GROUPS = {"point": 1, "box": 2, "line": 2, "ellipsoid": 1}
+
+
+def positions(record: dict):
+    """The position tuples of a record, skipping any that are extents (zyx)."""
+    return record["coords"][:POSITION_GROUPS[record["kind"]]]
+
+
+def read_annotation_csv(text: str, kind: str, *, source: str = "<csv>") -> list[dict]:
+    """Rows of a CSV as annotation records: ``{"kind", "coords", id?, ...}``.
+
+    ``coords`` is one zyx tuple per geometry field of ``kind`` — so a point has one and
+    a box has two — in whatever units the file is written in; converting them is
+    :func:`rescale`'s job, not this one's.
+
+    Columns are addressed **by name**, never by position: a synapse table has its own
+    column order and often extra columns, and silently reading the wrong three numbers
+    is the failure this avoids. Unknown columns are ignored.
     """
-    annotations = []
-    for i, r in enumerate(regions):
-        lo, hi = tuple(r["lo"])[::-1], tuple(r["hi"])[::-1]
-        ident = f"{label}{i:02d}"
-        extent = "x".join(str(hi[a] - lo[a]) for a in range(3))
-        note = f"{ident}  {extent} vox"
-        if r.get("n_labels") is not None:
-            note += f"  {r['n_labels']} labels"
-        ann = {"type": "point" if kind == "point" else "axis_aligned_bounding_box",
-               "id": ident, "description": note}
-        if kind == "point":
-            ann["point"] = [(lo[a] + hi[a]) / 2 for a in range(3)]
-        else:
-            ann["pointA"] = list(lo)
-            ann["pointB"] = list(hi)
-        annotations.append(ann)
+    import csv
+    import io
+
+    if kind not in CSV_COLUMNS:
+        raise ValueError(f"unknown annotation kind {kind!r}; known: {sorted(KINDS)}")
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        raise ValueError(f"{source}: no data rows (a header naming the columns is "
+                         f"required)")
+    needed = [c for group in CSV_COLUMNS[kind] for c in group]
+    present = {(k or "").strip() for k in rows[0]}
+    missing = [c for c in needed if c not in present]
+    if missing:
+        raise ValueError(
+            f"{source}: {kind} needs column(s) {', '.join(missing)} — expected "
+            f"{', '.join(needed)}{' plus any of ' + ', '.join(OPTIONAL_COLUMNS)}. "
+            f"Found: {', '.join(sorted(present)) or '(no header)'}")
+
+    records = []
+    for n, row in enumerate(rows, start=2):        # row 1 is the header
+        clean = {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+        try:
+            coords = tuple(tuple(float(clean[c]) for c in group)
+                           for group in CSV_COLUMNS[kind])
+        except ValueError as e:
+            raise ValueError(f"{source} line {n}: {e}") from None
+        rec: dict[str, Any] = {"kind": kind, "coords": coords}
+        if clean.get("id"):
+            rec["id"] = clean["id"]
+        if clean.get("description"):
+            rec["description"] = clean["description"]
+        if clean.get("segments"):
+            rec["segments"] = _parse_segments(clean["segments"], f"{source} line {n}")
+        records.append(rec)
+    return records
+
+
+def _parse_segments(value: str, where: str) -> list[str]:
+    """Segment ids, however they were separated. Kept as strings, as the state wants."""
+    ids = [p for p in value.replace("|", " ").replace(",", " ").split() if p]
+    for i in ids:
+        # A float here means a spreadsheet turned a 19-digit body id into 1.23e+18, and
+        # the annotation would then link to a body that does not exist.
+        if not i.isdigit():
+            raise ValueError(f"{where}: segment id {i!r} is not a whole number")
+    return ids
+
+
+def rescale(records: list[dict], factor_zyx: Sequence[float]) -> list[dict]:
+    """Multiply every coordinate of every record by ``factor_zyx`` (per axis).
+
+    One operation covers both conversions the CLI offers, because both are per-axis
+    scalings: voxels at scale N to level-0 voxels (the real per-level ratio), and
+    physical nm to level-0 voxels (the reciprocal of the voxel size). Radii scale
+    exactly as positions do.
+    """
+    out = []
+    for r in records:
+        out.append({**r, "coords": tuple(tuple(c * f for c, f in zip(group, factor_zyx))
+                                         for group in r["coords"])})
+    return out
+
+
+def build_annotation(record: dict, ident: str) -> dict:
+    """One annotation object, zyx in and **xyz out** — the only place that flips.
+
+    A ``box`` gets its corners sorted per axis: neuroglancer stores two corners with no
+    requirement about order, and a reversed pair renders as nothing at all. A ``line``
+    is left alone, because for a line the order *is* the direction.
+    """
+    kind = record["kind"]
+    type_name, fields = KINDS[kind]
+    coords = list(record["coords"])
+    if kind == "box":
+        lo, hi = coords
+        coords = [tuple(min(a, b) for a, b in zip(lo, hi)),
+                  tuple(max(a, b) for a, b in zip(lo, hi))]
+    ann: dict[str, Any] = {"type": type_name, "id": ident}
+    if record.get("description"):
+        ann["description"] = record["description"]
+    for field, group in zip(fields, coords):
+        ann[field] = [float(v) for v in tuple(group)[::-1]]          # zyx -> xyz
+    if record.get("segments"):
+        # Related segments: an array per relationship, and a local layer has exactly
+        # one. Ids are strings — a uint64 body id does not survive a JSON number.
+        ann["segments"] = [[str(s) for s in record["segments"]]]
+    return ann
+
+
+def local_layer(annotations: list[dict], dims: dict, *, name: str = "annotations",
+                color: str = "#ffee00") -> dict:
+    """The layer envelope for inline (``local://annotations``) annotations.
+
+    Local rather than a precomputed annotation source, for the reason in the module
+    docstring: only local annotations appear in the Annotations tab, which is what makes
+    them clickable and steppable.
+    """
     return {
         "type": "annotation",
         "name": name,
@@ -340,6 +468,29 @@ def annotation_layer(regions: list[dict], dims: dict, *, name: str = "regions",
         "annotationColor": color,
         "annotations": annotations,
     }
+
+
+def annotation_layer(regions: list[dict], dims: dict, *, name: str = "regions",
+                     color: str = "#ffee00", kind: str = "box",
+                     label: str = "r") -> dict:
+    """The occupancy layer: one annotation per region of :func:`labeled_regions`.
+
+    ``regions`` are zyx ``{"lo", "hi"}``; the flip to xyz happens in
+    :func:`build_annotation`, as it does for every annotation this module writes.
+    """
+    annotations = []
+    for i, r in enumerate(regions):
+        lo, hi = tuple(r["lo"]), tuple(r["hi"])
+        ident = f"{label}{i:02d}"
+        extent = "x".join(str(hi[a] - lo[a]) for a in range(3))
+        note = f"{ident}  {extent} vox"
+        if r.get("n_labels") is not None:
+            note += f"  {r['n_labels']} labels"
+        record = ({"kind": "point",
+                   "coords": (tuple((lo[a] + hi[a]) / 2 for a in range(3)),)}
+                  if kind == "point" else {"kind": "box", "coords": (lo, hi)})
+        annotations.append(build_annotation({**record, "description": note}, ident))
+    return local_layer(annotations, dims, name=name, color=color)
 
 
 def viewer_state(volume: str, fmt: str, layer: dict, regions: list[dict],
