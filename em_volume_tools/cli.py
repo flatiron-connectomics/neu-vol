@@ -867,7 +867,13 @@ def _maybe_cluster(args):
     return start_dask(args.workers, _configs(args), label="em-vol")
 
 
-def _parse_args(argv=None):
+def build_parser() -> argparse.ArgumentParser:
+    """The full ``em-vol`` parser, built but not run.
+
+    Separate from :func:`_parse_args` so the documentation can render it: the CLI
+    reference is generated from *this* object by ``sphinx-argparse``, which is what
+    stops the published usage from drifting away from ``--help``.
+    """
     p = argparse.ArgumentParser(
         prog="em-vol", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1193,6 +1199,11 @@ def _parse_args(argv=None):
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_relabel)
 
+    return p
+
+
+def _parse_args(argv=None):
+    p = build_parser()
     args = p.parse_args(argv)
 
     # Image files carry no physical scale, and the op would otherwise fail deep inside
