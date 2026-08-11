@@ -882,11 +882,12 @@ def cmd_ng_url_gen(args) -> int:
     space right, which is the part that fails silently when a state is written by hand.
     """
     from em_volume_tools.ops.ngurl import (DEFAULT_VIEWER, LAYOUTS, LONG_URL,
-                                           VolumeProblem, build_state, load_layer,
-                                           state_url, volume_layer)
+                                           VolumeProblem, annotation_extent,
+                                           build_state, load_layer, state_url,
+                                           volume_extent, volume_layer)
 
     err = sys.stderr
-    layers, frame = [], None
+    layers, frame, extents = [], None, []
     try:
         # --image before --seg so the segmentation draws over the image, which is the
         # order anyone wants and the opposite of alphabetical.
@@ -894,6 +895,7 @@ def cmd_ng_url_gen(args) -> int:
             layer, info = volume_layer(volume, kind="image", opacity=args.image_opacity)
             layers.append(layer)
             frame = frame or info
+            extents.append(volume_extent(volume, info["format"]))
         for i, volume in enumerate(args.seg or []):
             # --segments applies to the seg layers in order, so one list for one
             # segmentation is the common case and several stay unambiguous.
@@ -904,6 +906,7 @@ def cmd_ng_url_gen(args) -> int:
                 else None)
             layers.append(layer)
             frame = frame or info
+            extents.append(volume_extent(volume, info["format"]))
         for path in args.layer or []:
             layers.extend(load_layer(path))
     except (VolumeProblem, ValueError, json.JSONDecodeError) as e:
@@ -928,11 +931,18 @@ def cmd_ng_url_gen(args) -> int:
     if position is not None and args.position_order == "xyz":
         position = tuple(reversed(position))
 
+    # The whole frame of the largest volume, so an unspecified view opens centred and
+    # zoomed out rather than on the origin corner. Falling back to the annotations means
+    # a --layer-only link still frames its boxes instead of the origin.
+    known = [e for e in extents if e]
+    fit = max(known, key=lambda e: max(e[0])) if known else annotation_extent(layers)
+
     state, warning = build_state(
         layers, voxel_size_zyx=voxel, units=units, position_zyx=position,
         layout=args.layout, cross_section_scale=args.cross_section_scale,
         projection_scale=args.projection_scale,
-        selected=args.select or (layers[-1]["name"] if args.select_last else None))
+        selected=args.select or (layers[-1]["name"] if args.select_last else None),
+        frame=fit)
     url = state_url(state, args.viewer)
 
     print(f"{len(layers)} layer(s): "
@@ -941,6 +951,12 @@ def cmd_ng_url_gen(args) -> int:
     if position is not None:
         print(f"  position {tuple(position)} zyx "
               f"(given as {args.position_order})", file=err)
+    elif fit:
+        print(f"  view centred on the {tuple(int(v) for v in fit[0])} zyx frame, "
+              f"zoomed to fit it", file=err)
+    else:
+        print(f"  no volume or annotation established a frame — neuroglancer will open "
+              f"at the origin, zoomed in. Pass --position to place the view.", file=err)
     print(f"  layout {args.layout}, viewer {args.viewer}", file=err)
     if warning:
         print(f"  WARNING: {warning}", file=err)

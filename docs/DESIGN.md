@@ -574,6 +574,21 @@ and worth naming: neuroglancer *displays* xyz, so the numbers a user copies out 
 viewer to build a link are xyz. The default follows the package; the flag exists because
 the common source of those numbers does not. Both are echoed on every run.
 
+**The opening view is computed, because neuroglancer's default is unusable.** With no
+`position` it opens at the origin **corner**, and with no `crossSectionScale` at one voxel
+per viewport pixel — so a link to an 11260×9000×13750 volume opens on a few microns of its
+empty edge, which reads as a broken link rather than a zoomed-in one. The centre and both
+zooms are derived from the largest volume's own extent, read from the `info` already
+fetched (precomputed carries every scale's `size` and `voxel_offset`), falling back to the
+union of the annotations when every layer came from a file. Each of the three is filled in
+only if the caller did not specify it.
+
+The zoom needs a viewport size, which is not knowable here — it depends on the window and
+the layout — so it assumes a nominal 1000 px and errs large, which errs zoomed *out*.
+Being a factor of two off is harmless and adjustable; opening on the corner is not. When
+nothing establishes a frame at all — a single annotation layer with no annotations — the
+state carries none of the three and says so, rather than inventing a position.
+
 **Layer files are accepted as either a layer or a whole state.** `bboxes-json` can emit
 both shapes, and which one the caller happened to produce is not a distinction worth
 making them care about — a state's `layers` are taken, a bare layer is used as-is.

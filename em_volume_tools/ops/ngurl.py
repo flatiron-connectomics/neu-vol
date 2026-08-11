@@ -49,8 +49,89 @@ SCHEME = {
 LAYOUTS = ("4panel", "xy", "yz", "xz", "xy-3d", "yz-3d", "xz-3d", "3d")
 
 
+# A nominal viewport edge in pixels, used only to turn "fit the volume" into a zoom
+# number. The real panel size is not knowable here — it depends on the window and the
+# layout — so this errs large, which errs zoomed OUT. Being a factor of two off is
+# harmless; starting at the origin corner at one voxel per pixel is not.
+NOMINAL_VIEWPORT_PX = 1000
+
+# Leave a little space around the volume rather than cropping it to the panel edge.
+FIT_MARGIN = 1.15
+
+
 class VolumeProblem(RuntimeError):
     """A named volume could not be used as a layer source."""
+
+
+def volume_extent(volume: str, fmt: str) -> tuple[tuple, tuple] | None:
+    """``(extent_zyx, offset_zyx)`` in level-0 voxels, or None if not determinable.
+
+    Read as cheaply as the format allows: precomputed carries every scale's ``size`` and
+    ``voxel_offset`` in the one ``info`` this has already fetched, so it costs nothing,
+    while zarr needs the level-0 array's own metadata — one open, not the every-level
+    probe that :func:`describe` does.
+    """
+    from ..location import read_json
+
+    if str(fmt).startswith("neuroglancer_precomputed"):
+        info = read_json(volume.rstrip("/") + "/info") or {}
+        scales = info.get("scales")
+        if not scales:
+            return None
+        finest = min(scales, key=lambda s: tuple(s["resolution"]))
+        size = [int(v) for v in finest["size"]][::-1]                    # xyz -> zyx
+        off = [int(v) for v in finest.get("voxel_offset", [0, 0, 0])][::-1]
+        return tuple(size), tuple(off)
+
+    meta = read_source_metadata({"backend": fmt, "path": volume})
+    if not meta:
+        return None
+    try:
+        from ..backends.base import open_backend
+
+        shape = tuple(int(s) for s in open_backend(meta["data_spec"]).shape)
+    except Exception:
+        return None
+    spatial = shape[-3:] if len(shape) > 3 else shape       # drop a channel axis
+    return spatial, (0, 0, 0)
+
+
+def annotation_extent(layers: Sequence[dict]) -> tuple[tuple, tuple] | None:
+    """``(extent_zyx, offset_zyx)`` covering the annotations in ``layers``.
+
+    The fallback when every layer came from a file: a bounding-box layer knows where the
+    data is even though no volume was named, and framing those boxes is a better opening
+    view than the origin.
+    """
+    lo = [None, None, None]
+    hi = [None, None, None]
+    for layer in layers:
+        for ann in layer.get("annotations", []) or []:
+            pts = [ann[k] for k in ("pointA", "pointB", "point", "center") if k in ann]
+            for p in pts:
+                for a in range(3):
+                    v = float(p[2 - a])                     # stored xyz, wanted zyx
+                    lo[a] = v if lo[a] is None else min(lo[a], v)
+                    hi[a] = v if hi[a] is None else max(hi[a], v)
+    if any(v is None for v in lo):
+        return None
+    extent = tuple(max(1.0, hi[a] - lo[a]) for a in range(3))
+    return extent, tuple(lo)
+
+
+def default_view(extent_zyx: Sequence[float],
+                 offset_zyx: Sequence[float] = (0, 0, 0)) -> tuple[list, float, float]:
+    """``(centre_zyx, cross_section_scale, projection_scale)`` framing a whole volume.
+
+    Neuroglancer with no ``position`` opens at the origin **corner** and with no
+    ``crossSectionScale`` opens at one voxel per pixel, which on a 13750-voxel volume is
+    a view of its empty edge. Both scales are in canonical voxels — per viewport pixel
+    for the cross sections, across the viewport for the projection — so fitting is a
+    division by a nominal panel size.
+    """
+    centre = [float(o) + float(e) / 2 for o, e in zip(offset_zyx, extent_zyx)]
+    span = max(float(e) for e in extent_zyx) * FIT_MARGIN
+    return centre, span / NOMINAL_VIEWPORT_PX, span
 
 
 def volume_layer(volume: str, *, kind: str | None = None, name: str | None = None,
@@ -121,23 +202,35 @@ def build_state(layers: Sequence[dict], *, voxel_size_zyx=None, units: str | Non
                 layout: str = "4panel",
                 cross_section_scale: float | None = None,
                 projection_scale: float | None = None,
-                selected: str | None = None) -> dict:
+                selected: str | None = None,
+                frame: tuple | None = None) -> dict:
     """A viewer state. ``position_zyx`` is zyx and is reversed here, like every coordinate.
 
     ``dimensions`` has to agree with the layers or nothing lines up, so it is derived
     from a volume's recorded voxel size rather than assumed.
+
+    ``frame`` is an ``(extent_zyx, offset_zyx)`` pair used to fill in whichever of the
+    position and the two zooms the caller did not specify — see :func:`default_view`.
+    Without it the state carries none of the three and neuroglancer opens at the origin
+    corner, fully zoomed in.
     """
     from .annotate import output_dimensions
 
     dims, warning = output_dimensions(voxel_size_zyx, units)
     state: dict[str, Any] = {"dimensions": dims, "layers": list(layers),
                              "layout": layout}
-    if position_zyx is not None:
-        state["position"] = [float(v) for v in tuple(position_zyx)[::-1]]
-    if cross_section_scale is not None:
-        state["crossSectionScale"] = float(cross_section_scale)
-    if projection_scale is not None:
-        state["projectionScale"] = float(projection_scale)
+
+    fitted = default_view(*frame) if frame else (None, None, None)
+    position = position_zyx if position_zyx is not None else fitted[0]
+    cross = cross_section_scale if cross_section_scale is not None else fitted[1]
+    projection = projection_scale if projection_scale is not None else fitted[2]
+
+    if position is not None:
+        state["position"] = [float(v) for v in tuple(position)[::-1]]
+    if cross is not None:
+        state["crossSectionScale"] = float(cross)
+    if projection is not None:
+        state["projectionScale"] = float(projection)
     if selected:
         state["selectedLayer"] = {"visible": True, "layer": selected}
     return state, warning

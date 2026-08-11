@@ -219,6 +219,12 @@ em-vol ng-url-gen --image s3://.../em --seg s3://.../gt_v2 \
     --layer gt.json --segments 1,2,3 --layout xy-3d --select-last
 ```
 
+The opening view is centred on the largest volume and zoomed out to fit it, because
+neuroglancer with no `position` opens at the origin **corner** at one voxel per pixel —
+which on a large volume is a view of its empty edge. `--position`,
+`--cross-section-scale` and `--projection-scale` each override that part independently.
+With only `--layer` files, the annotations' own bounding box sets the view instead.
+
 It composes with `bboxes-json` through `--layer`, which takes either a bare layer or a
 whole state and uses its layers, so it does not matter which the other command emitted.
 `--position` is zyx like every other coordinate here; pass `--position-order xyz` to use
