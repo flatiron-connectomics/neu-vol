@@ -32,25 +32,55 @@ from .location import join, spec_kvstore, to_kvstore
 PRECOMPUTED_GZ = "neuroglancer_precomputed_gz"
 
 
+def _first_chunk_key(scale: Mapping[str, Any]) -> str | None:
+    """The key of a precomputed scale's origin chunk, from its metadata alone.
+
+    ``x0-x1_y0-y1_z0-z1`` in xyz, where the extent is clipped to the scale's size —
+    a scale smaller than one chunk stores `0-88_0-71_0-108`, not `0-128_...`.
+    """
+    try:
+        off = [int(v) for v in scale.get("voxel_offset", [0, 0, 0])]
+        size = [int(v) for v in scale["size"]]
+        chunk = [int(v) for v in scale["chunk_sizes"][0]]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return "_".join(f"{off[a]}-{off[a] + min(chunk[a], size[a])}" for a in range(3))
+
+
 def precomputed_chunks_are_gzipped(location: str | Mapping[str, Any],
-                                   scale_key: str) -> bool:
+                                   scale: Mapping[str, Any]) -> bool:
     """True if this precomputed scale's chunk objects are ``.gz``-suffixed.
 
     CloudVolume gzips chunks and appends ``.gz`` to the key, which is legal for
-    something that serves them over HTTP with ``Content-Encoding: gzip`` but is not
-    what the precomputed spec addresses. Detected by listing a couple of keys under
-    the scale prefix — bounded, so it costs one small request rather than a full
-    enumeration.
-    """
-    from .location import list_keys
+    something that serves them over HTTP with ``Content-Encoding: gzip`` but is not what
+    the precomputed spec addresses — tensorstore asks for the unsuffixed key and reads
+    the fill value, so every block comes back as zeros with nothing raised.
 
-    for key in list_keys(location, scale_key, limit=4):
-        name = key.rsplit("/", 1)[-1]
-        if not name:
-            continue
-        # A chunk key looks like `0-2048_0-2048_0-128`; anything else (a shard
-        # index, a stray file) is not evidence either way.
-        if "_" in name and "-" in name:
+    **Answered with two existence checks, not a listing.** This used to list the scale
+    prefix with ``limit=4``, which reads as bounded and is not: ``list_keys`` awaits the
+    whole listing before Python truncates it, so on a dense image volume's finest scale
+    it enumerated millions of keys. Measured on an 8-level EM volume on S3: **51 s, in
+    `detect_backend`, which nearly every op calls before doing anything.** Probing the
+    one key the metadata predicts is O(1) and needs no enumeration at all.
+
+    Falls back to a listing only when the origin chunk is absent — legitimate on a
+    sparse volume — and then over the caller's chosen scale, which is why
+    :func:`detect_backend` hands it the *coarsest*: it holds the fewest chunks.
+    """
+    from .location import exists, list_keys
+
+    key = _first_chunk_key(scale)
+    if key is not None:
+        prefix = scale.get("key", "")
+        if exists(location, prefix, key):
+            return False
+        if exists(location, prefix, key + ".gz"):
+            return True
+
+    for name in (k.rsplit("/", 1)[-1] for k in list_keys(location, scale.get("key", ""))):
+        # A chunk key looks like `0-2048_0-2048_0-128`; anything else (a shard index,
+        # a stray file) is not evidence either way.
+        if name and "_" in name and "-" in name:
             return name.endswith(".gz")
     return False
 
@@ -95,10 +125,13 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
     if raw is not None:
         try:
             scales = json.loads(raw)["scales"]
-            finest = min(scales, key=lambda s: tuple(s["resolution"]))["key"]
+            # The COARSEST scale, not the finest: gzipping is a property of how the
+            # whole volume was written, so any scale answers the question, and this one
+            # holds the fewest chunks if the probe has to fall back to a listing.
+            coarsest = max(scales, key=lambda s: tuple(s["resolution"]))
         except Exception:
             return "neuroglancer_precomputed"
-        if precomputed_chunks_are_gzipped(kv, finest):
+        if precomputed_chunks_are_gzipped(kv, coarsest):
             return PRECOMPUTED_GZ
         return "neuroglancer_precomputed"
     if _read_key(kv, "zarr.json") is not None:

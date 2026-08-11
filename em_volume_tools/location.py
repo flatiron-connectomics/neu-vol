@@ -147,11 +147,21 @@ def write_bytes(location: str | Mapping[str, Any], data: bytes, *parts: str) -> 
 
 def list_keys(location: str | Mapping[str, Any], *parts: str,
               limit: int | None = None) -> list[str]:
-    """Key names directly under a prefix. ``limit`` stops early.
+    """Key names directly under a prefix.
 
     Goes through the cached, credential-bootstrapped opener like every other access
-    here. ``limit`` matters on an object store, where an unbounded list enumerates
-    every object under the prefix — hundreds of thousands for one pyramid level.
+    here.
+
+    **``limit`` truncates the RESULT, not the request, and does not bound the cost.**
+    tensorstore's ``kvstore.list()`` returns a future of the complete listing, so the
+    whole enumeration happens before Python can stop reading it — a prefix with millions
+    of objects costs the same with ``limit=4`` as without. It is useful only for keeping
+    the returned list small.
+
+    So there is no cheap way to sample a large prefix. To answer a question about one
+    object, probe it by name with :func:`exists`; to bound a listing, list a narrower
+    prefix. Getting this wrong cost 51 s inside ``detect_backend`` on a dense volume,
+    where the docstring here promised "one small request".
     """
     kv = join(to_kvstore(location), *parts) if parts else dict(to_kvstore(location))
     if "path" in kv and not str(kv["path"]).endswith("/"):

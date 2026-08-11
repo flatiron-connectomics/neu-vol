@@ -24,7 +24,7 @@ import json
 import urllib.parse
 from typing import Any, Sequence
 
-from ..source_metadata import PRECOMPUTED_GZ, describe, detect_backend
+from ..source_metadata import PRECOMPUTED_GZ, detect_backend, read_source_metadata
 
 DEFAULT_VIEWER = "https://neuroglancer-demo.appspot.com/"
 
@@ -70,8 +70,12 @@ def volume_layer(volume: str, *, kind: str | None = None, name: str | None = Non
     if scheme is None:
         raise VolumeProblem(f"{volume} is {fmt}, which neuroglancer cannot read")
 
-    d = describe(volume)
-    meta = d["meta"] or {}
+    # `read_source_metadata`, NOT `describe`: this needs the voxel size, the units and
+    # the recorded kind, all of which are in `info`. `describe` additionally OPENS EVERY
+    # LEVEL and probes for a foreign marker — the expensive tier documented in
+    # source_metadata — and a link needs none of it. Two volumes here meant ~20 store
+    # opens for numbers already read.
+    meta = read_source_metadata({"backend": fmt, "path": volume}) or {}
     resolved = kind or meta.get("kind") or "image"
     layer: dict[str, Any] = {
         "type": "segmentation" if resolved == "segmentation" else "image",
@@ -85,7 +89,7 @@ def volume_layer(volume: str, *, kind: str | None = None, name: str | None = Non
     if opacity is not None:
         layer["opacity"] = float(opacity)
     return layer, {"voxel_size": meta.get("voxel_size"), "units": meta.get("units"),
-                   "shape": d["shape"], "format": fmt}
+                   "format": fmt}
 
 
 def load_layer(path: str) -> dict:
