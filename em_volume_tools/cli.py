@@ -10,8 +10,9 @@ continues where it stopped rather than starting over.
     em-vol progress <volume>                     # chunks written, per level
     em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
     em-vol write   <volume> --src ... --offset   # put one subvolume into it
-    em-vol annotations <volume>                  # a viewer layer marking where data is
+    em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
     em-vol relabel <volume> --out ...            # one id range per occupied region
+    em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 
 ``create`` + ``write`` are the small-pieces path, and they are not block-mapped:
 ``create`` lays out an empty volume (optionally copying a reference's frame exactly),
@@ -714,26 +715,42 @@ def cmd_progress(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# annotations
+# bboxes-json
 # --------------------------------------------------------------------------- #
-def cmd_annotations(args) -> int:
-    """A neuroglancer annotation layer marking where a sparse volume's data is.
+def _write_text(path: str, text: str) -> None:
+    """Write ``text`` to a local path or an object store, uniformly.
+
+    Through ``location`` rather than ``open()`` so ``--out s3://...`` works: the file
+    driver creates parent directories and the s3 driver bootstraps credentials, and
+    neither needs a branch here.
+    """
+    from em_volume_tools.location import write_bytes
+
+    write_bytes(path, text.encode())
+
+
+def cmd_bboxes_json(args) -> int:
+    """A neuroglancer annotation layer of bounding boxes over a sparse volume's data.
 
     The JSON goes to **stdout** and the human summary to **stderr**, so
-    ``em-vol annotations vol > layer.json`` works and so does reading the table while
-    it runs. ``--out`` writes the JSON to a file instead.
+    ``em-vol bboxes-json vol > layer.json`` works and so does reading the table while
+    it runs. ``--out`` writes the JSON somewhere instead, local or remote.
 
-    Reads only, and barely: the boxes come from listing which chunk objects exist,
-    which on a sparse volume is the occupancy question exactly, plus one coarse read
-    per region to tighten it. See :mod:`em_volume_tools.ops.annotate` for why the
-    annotations are local rather than a precomputed annotation layer.
+    Reads only: the boxes come from listing which chunk objects exist, which on a
+    sparse volume is the occupancy question exactly, plus one read per region to
+    tighten it. See :mod:`em_volume_tools.ops.annotate` for why the annotations are
+    local rather than a precomputed annotation layer.
     """
     from em_volume_tools.ops.annotate import (NoOccupancy, annotation_layer,
                                               labeled_regions, output_dimensions,
                                               render, viewer_state)
 
     volume = args.volume.rstrip("/")
-    tighten = None if args.no_tighten else args.tighten_level
+    # Tightening defaults to the level the footprint came from, so the cost of the
+    # reads scales with the level the caller already chose, and at the default
+    # --level 0 the boxes are exact rather than quantized to a coarser voxel.
+    tighten = None if args.no_tighten else (
+        args.level if args.tighten_level is None else args.tighten_level)
     try:
         regions, ctx = labeled_regions(volume, level=args.level, tighten_level=tighten)
     except (FileNotFoundError, ValueError, NoOccupancy) as e:
@@ -758,7 +775,7 @@ def cmd_annotations(args) -> int:
                    f"asked for but does not exist, so this is exact and slower")
         print(f"  tightened at level {tighten}{nm}{clamped}", file=err)
     if not regions:
-        print("  nothing is stored — no annotations to make", file=err)
+        print("  nothing is stored — no boxes to make", file=err)
         return 1
     print(f"\n{'#':>3}  {'z':>15} {'y':>15} {'x':>15}  {'extent zyx':>18} "
           f"{'labels':>7}", file=err)
@@ -777,12 +794,12 @@ def cmd_annotations(args) -> int:
            if args.state else layer)
     text = render(obj)
     if args.out:
-        with open(args.out, "w") as f:
-            f.write(text + "\n")
-        print(f"\nwrote {args.out} — paste it into the `layers` array of a "
-              f"neuroglancer state" if not args.state else
-              f"\nwrote {args.out} — load it with neuroglancer's {{}} JSON editor",
-              file=err)
+        _write_text(args.out, text + "\n")
+        print(f"\nwrote {args.out} — " + ("load it with neuroglancer's {} JSON editor"
+                                          if args.state else
+                                          "paste it into the `layers` array of a "
+                                          "neuroglancer state, or pass it to "
+                                          "`em-vol ng-url-gen --layer`"), file=err)
     else:
         print(text)
     return 0
@@ -851,6 +868,96 @@ def cmd_relabel(args) -> int:
               f"knowable from the voxels — so a real run repeats those reads.")
     else:
         print(f"\nwrote the old->new mapping to {result['map_path']}")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# ng-url-gen
+# --------------------------------------------------------------------------- #
+def cmd_ng_url_gen(args) -> int:
+    """A neuroglancer URL carrying a whole viewer state.
+
+    The URL goes to **stdout** and the summary to **stderr**, so it can be piped or
+    assigned. Reads the volumes' metadata to get the source scheme and the coordinate
+    space right, which is the part that fails silently when a state is written by hand.
+    """
+    from em_volume_tools.ops.ngurl import (DEFAULT_VIEWER, LAYOUTS, LONG_URL,
+                                           VolumeProblem, build_state, load_layer,
+                                           state_url, volume_layer)
+
+    err = sys.stderr
+    layers, frame = [], None
+    try:
+        # --image before --seg so the segmentation draws over the image, which is the
+        # order anyone wants and the opposite of alphabetical.
+        for volume in args.image or []:
+            layer, info = volume_layer(volume, kind="image", opacity=args.image_opacity)
+            layers.append(layer)
+            frame = frame or info
+        for i, volume in enumerate(args.seg or []):
+            # --segments applies to the seg layers in order, so one list for one
+            # segmentation is the common case and several stay unambiguous.
+            picked = args.segments[i] if i < len(args.segments or []) else None
+            layer, info = volume_layer(
+                volume, kind="segmentation", name=None,
+                segments=[int(s) for s in picked.replace(",", " ").split()] if picked
+                else None)
+            layers.append(layer)
+            frame = frame or info
+        for path in args.layer or []:
+            layers.extend(load_layer(path))
+    except (VolumeProblem, ValueError, json.JSONDecodeError) as e:
+        raise SystemExit(str(e)) from None
+
+    if not layers:
+        raise SystemExit("nothing to show: pass at least one of --image, --seg or --layer")
+
+    voxel = _ftriple(args.voxel_size, "voxel-size")
+    units = "nm" if voxel else (frame or {}).get("units")
+    if voxel is None:
+        voxel = (frame or {}).get("voxel_size")
+    if voxel is None:
+        # A state whose dimensions disagree with its layers loads and puts everything
+        # in the wrong place, so this is worth refusing rather than guessing.
+        raise SystemExit(
+            "no voxel size available: --layer files carry their own frame but do not "
+            "establish the viewer's, and no --image/--seg volume recorded one. Pass "
+            "--voxel-size Z,Y,X (nm).")
+
+    position = _ftriple(args.position, "position")
+    if position is not None and args.position_order == "xyz":
+        position = tuple(reversed(position))
+
+    state, warning = build_state(
+        layers, voxel_size_zyx=voxel, units=units, position_zyx=position,
+        layout=args.layout, cross_section_scale=args.cross_section_scale,
+        projection_scale=args.projection_scale,
+        selected=args.select or (layers[-1]["name"] if args.select_last else None))
+    url = state_url(state, args.viewer)
+
+    print(f"{len(layers)} layer(s): "
+          + ", ".join(f"{lyr['name']} ({lyr['type']})" for lyr in layers), file=err)
+    print(f"  voxel size {tuple(voxel)} zyx, units {units or '?'}", file=err)
+    if position is not None:
+        print(f"  position {tuple(position)} zyx "
+              f"(given as {args.position_order})", file=err)
+    print(f"  layout {args.layout}, viewer {args.viewer}", file=err)
+    if warning:
+        print(f"  WARNING: {warning}", file=err)
+    if len(url) > LONG_URL:
+        print(f"  note: the URL is {len(url):,} characters. Everything after '#!' is a "
+              f"fragment and never reaches a server, but some mail and chat clients "
+              f"wrap or truncate at less than this — send it as a file if it matters.",
+              file=err)
+
+    if args.state_out:
+        _write_text(args.state_out, json.dumps(state, indent=1) + "\n")
+        print(f"  wrote the state to {args.state_out}", file=err)
+    if args.out:
+        _write_text(args.out, url + "\n")
+        print(f"  wrote the URL to {args.out}", file=err)
+    else:
+        print(url)
     return 0
 
 
@@ -1104,9 +1211,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_progress)
 
-    # --- annotations --------------------------------------------------------
+    # --- bboxes-json --------------------------------------------------------
     q = sub.add_parser(
-        "annotations", help="a neuroglancer layer marking where the data is",
+        "bboxes-json", help="a neuroglancer layer of boxes marking where the data is",
         description="Emit a neuroglancer annotation layer with one bounding box per "
                     "written region of a SPARSE volume — a ground-truth volume, an "
                     "ROI export — so the viewer gets a clickable list that jumps "
@@ -1121,20 +1228,25 @@ def build_parser() -> argparse.ArgumentParser:
                     "Reads only; writes nothing to the volume.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume", help="the volume (path or s3://...)")
-    q.add_argument("--out", default=None, metavar="PATH",
-                   help="write the JSON here instead of to stdout")
+    q.add_argument("--out", default=None, metavar="PATH_OR_URL",
+                   help="write the JSON here instead of to stdout. May be a local path "
+                        "or an object store location (s3://...)")
     q.add_argument("--state", action="store_true",
                    help="emit a complete loadable viewer state (volume layer + "
-                        "annotations) rather than just the layer to paste")
+                        "annotations) rather than just the layer to paste. For a state "
+                        "with an image layer and a starting view, use `ng-url-gen`")
     q.add_argument("--level", type=int, default=0,
                    help="the level whose chunk objects define the footprint. Coarser "
                         "is a cheaper listing and a blockier box; coordinates are "
                         "reported in level-0 voxels either way (default: 0)")
-    q.add_argument("--tighten-level", type=int, default=2, metavar="N",
+    q.add_argument("--tighten-level", type=int, default=None, metavar="N",
                    help="shrink each box to its nonzero voxels by reading it at this "
-                        "level. Cheap — a 384-voxel box is 96 voxels at 32 nm — and "
-                        "exact to one voxel there, so a coarser level gives a looser "
-                        "box and 0 gives the exact one (default: 2)")
+                        "level, instead of leaving it on the chunk grid. DEFAULTS TO "
+                        "--level, so the reads cost what the level you picked costs and "
+                        "the boxes are exact in the level-0 voxels they are reported in. "
+                        "Raise it on a volume whose occupied footprint is large: each "
+                        "level is a factor smaller to read, at the price of quantizing "
+                        "each bound to one voxel there")
     q.add_argument("--no-tighten", action="store_true",
                    help="skip the reads entirely: boxes stay chunk-aligned and no "
                         "label counts are reported")
@@ -1152,7 +1264,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "records it in units this does not recognise. Without a "
                         "usable one the layer is unitless and will not line up")
     q.add_argument("--store-logs", action="store_true")
-    q.set_defaults(func=cmd_annotations)
+    q.set_defaults(func=cmd_bboxes_json)
 
     # --- relabel ------------------------------------------------------------
     q = sub.add_parser(
@@ -1165,7 +1277,7 @@ def build_parser() -> argparse.ArgumentParser:
                     "volume. This walks the regions in order and gives each its own "
                     "range, so an id identifies one cell in one region.\n\n"
                     "Regions come from stored-chunk occupancy (as `em-vol "
-                    "annotations`), so they are disjoint and chunk-aligned: no write is "
+                    "bboxes-json`), so they are disjoint and chunk-aligned: no write is "
                     "a partial-chunk update. Serial by construction — each range starts "
                     "where the last ended — so it runs in this process, no dask.\n\n"
                     "SINGLE-SCALE, like `em-vol write`: run `em-vol downsample "
@@ -1198,6 +1310,70 @@ def build_parser() -> argparse.ArgumentParser:
                         "nothing. Still reads them, since the ids come from the voxels")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_relabel)
+
+    # --- ng-url-gen ---------------------------------------------------------
+    from em_volume_tools.ops.ngurl import DEFAULT_VIEWER, LAYOUTS
+
+    q = sub.add_parser(
+        "ng-url-gen", help="a neuroglancer URL carrying a whole viewer state",
+        description="Build a neuroglancer link from volumes and layer files.\n\n"
+                    "Neuroglancer keeps its whole state in the URL fragment, so a link "
+                    "IS the state — which volumes are loaded, where the view sits, which "
+                    "segments are selected. This reads the volumes to get the source "
+                    "scheme and the coordinate space right, which is the part that fails "
+                    "silently by hand: a `dimensions` block that disagrees with the data "
+                    "loads fine and puts every layer in the wrong place.\n\n"
+                    "Everything after '#!' is a fragment and never reaches a server, so "
+                    "a link carries no data anywhere — but the whole state travels in it, "
+                    "and a large inline annotation layer makes for a long URL.\n\n"
+                    "Composes with `bboxes-json`: that writes a layer, --layer inlines "
+                    "it here.\n\n"
+                    "  em-vol bboxes-json s3://.../gt_v2 --label gt --out gt.json\n"
+                    "  em-vol ng-url-gen --image s3://.../em --seg s3://.../gt_v2 \\\n"
+                    "      --layer gt.json --segments 1,2,3 --layout xy-3d\n\n"
+                    "URL to stdout, summary to stderr. Reads only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("--image", action="append", metavar="VOLUME",
+                   help="an image volume (repeatable). Drawn beneath the segmentations")
+    q.add_argument("--seg", action="append", metavar="VOLUME",
+                   help="a segmentation volume (repeatable)")
+    q.add_argument("--segments", action="append", metavar="IDS",
+                   help="comma-separated segment ids to select, applied to the --seg "
+                        "volumes in order. Repeat for a second segmentation")
+    q.add_argument("--layer", action="append", metavar="PATH_OR_URL",
+                   help="a JSON file holding a layer, or a state whose layers are taken "
+                        "— e.g. the output of `em-vol bboxes-json` (repeatable)")
+    q.add_argument("--position", default=None, metavar="Z,Y,X",
+                   help="where to put the crosshair, in level-0 voxels")
+    q.add_argument("--position-order", choices=("zyx", "xyz"), default="zyx",
+                   help="axis order of --position. Everything in this package is zyx, "
+                        "but neuroglancer DISPLAYS xyz — so pass --position-order xyz to "
+                        "use numbers copied straight out of the viewer (default: zyx)")
+    q.add_argument("--layout", default="4panel", choices=LAYOUTS,
+                   help="neuroglancer panel layout (default: 4panel)")
+    q.add_argument("--cross-section-scale", type=float, default=None, metavar="S",
+                   help="zoom of the 2D panels: nm per screen pixel, smaller is closer")
+    q.add_argument("--projection-scale", type=float, default=None, metavar="S",
+                   help="zoom of the 3D panel")
+    q.add_argument("--image-opacity", type=float, default=None, metavar="F",
+                   help="opacity for the --image layers")
+    q.add_argument("--select", default=None, metavar="NAME",
+                   help="open the side panel on this layer")
+    q.add_argument("--select-last", action="store_true",
+                   help="open the side panel on the last layer added — with a bboxes "
+                        "layer last, that is its clickable list of regions")
+    q.add_argument("--viewer", default=DEFAULT_VIEWER,
+                   help=f"viewer base URL (default: {DEFAULT_VIEWER})")
+    q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
+                   help="level-0 voxel size in nm, overriding what the volumes record. "
+                        "Required when every layer comes from --layer, since a layer "
+                        "file carries its own frame but does not establish the viewer's")
+    q.add_argument("--out", default=None, metavar="PATH_OR_URL",
+                   help="write the URL here instead of stdout (local or s3://...)")
+    q.add_argument("--state-out", default=None, metavar="PATH_OR_URL",
+                   help="also write the state as JSON, for pasting into the {} editor")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_ng_url_gen)
 
     return p
 

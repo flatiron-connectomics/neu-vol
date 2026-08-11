@@ -277,8 +277,8 @@ def test_render_stays_valid_json_with_one_line_per_annotation():
 # --------------------------------------------------------------------------- #
 def test_stdout_is_only_json_so_it_can_be_redirected(tmp_path, capsys):
     dst = _sparse(tmp_path, "vol", profile="local-neuroglancer")
-    assert cli.cmd_annotations(cli._parse_args(
-        ["annotations", dst, "--tighten-level", "1"])) == 0
+    assert cli.cmd_bboxes_json(cli._parse_args(
+        ["bboxes-json", dst, "--tighten-level", "1"])) == 0
     captured = capsys.readouterr()
     layer = json.loads(captured.out)          # the whole of stdout, or this raises
     assert layer["type"] == "annotation"
@@ -289,8 +289,8 @@ def test_stdout_is_only_json_so_it_can_be_redirected(tmp_path, capsys):
 def test_out_writes_the_file_and_leaves_stdout_empty(tmp_path, capsys):
     dst = _sparse(tmp_path, "vol", profile="local-neuroglancer")
     out = str(tmp_path / "layer.json")
-    cli.cmd_annotations(cli._parse_args(
-        ["annotations", dst, "--tighten-level", "1", "--out", out]))
+    cli.cmd_bboxes_json(cli._parse_args(
+        ["bboxes-json", dst, "--tighten-level", "1", "--out", out]))
     assert capsys.readouterr().out == ""
     with open(out) as f:
         assert len(json.load(f)["annotations"]) == 2
@@ -298,8 +298,8 @@ def test_out_writes_the_file_and_leaves_stdout_empty(tmp_path, capsys):
 
 def test_state_is_loadable_and_carries_the_volume_layer(tmp_path, capsys):
     dst = _sparse(tmp_path, "vol", profile="local-neuroglancer")
-    cli.cmd_annotations(cli._parse_args(
-        ["annotations", dst, "--tighten-level", "1", "--state"]))
+    cli.cmd_bboxes_json(cli._parse_args(
+        ["bboxes-json", dst, "--tighten-level", "1", "--state"]))
     state = json.loads(capsys.readouterr().out)
     assert [lyr["type"] for lyr in state["layers"]] == ["segmentation", "annotation"]
     assert state["layers"][0]["source"] == f"precomputed://{dst}"
@@ -310,16 +310,16 @@ def test_state_is_loadable_and_carries_the_volume_layer(tmp_path, capsys):
 
 def test_state_names_the_zarr_driver_for_a_zarr_volume(tmp_path, capsys):
     dst = _sparse(tmp_path, "vol", profile="local")
-    cli.cmd_annotations(cli._parse_args(
-        ["annotations", dst, "--tighten-level", "1", "--state"]))
+    cli.cmd_bboxes_json(cli._parse_args(
+        ["bboxes-json", dst, "--tighten-level", "1", "--state"]))
     state = json.loads(capsys.readouterr().out)
     assert state["layers"][0]["source"] == f"zarr://{dst}"
 
 
 def test_label_and_name_flow_through(tmp_path, capsys):
     dst = _sparse(tmp_path, "vol", profile="local-neuroglancer")
-    cli.cmd_annotations(cli._parse_args(
-        ["annotations", dst, "--tighten-level", "1", "--label", "gt",
+    cli.cmd_bboxes_json(cli._parse_args(
+        ["bboxes-json", dst, "--tighten-level", "1", "--label", "gt",
          "--name", "gt-chunks", "--color", "#ff0000"]))
     layer = json.loads(capsys.readouterr().out)
     assert layer["name"] == "gt-chunks"
@@ -334,16 +334,60 @@ def test_an_empty_volume_reports_nothing_to_annotate(tmp_path, capsys):
     dst = str(tmp_path / "empty")
     create_volume(dst, format="precomputed", shape=(32, 32, 32), dtype="uint64",
                   voxel_size=(8, 8, 8), chunk=(8, 8, 8), kind="segmentation")
-    assert cli.cmd_annotations(cli._parse_args(["annotations", dst])) == 1
+    assert cli.cmd_bboxes_json(cli._parse_args(["bboxes-json", dst])) == 1
     assert "nothing is stored" in capsys.readouterr().err
 
 
 def test_a_missing_volume_exits_cleanly(tmp_path):
     with pytest.raises(SystemExit, match="no volume found"):
-        cli.cmd_annotations(cli._parse_args(
-            ["annotations", str(tmp_path / "nope")]))
+        cli.cmd_bboxes_json(cli._parse_args(
+            ["bboxes-json", str(tmp_path / "nope")]))
 
 
-def test_annotations_is_wired_to_the_subcommand():
-    assert cli._parse_args(["annotations", "v"]).func is cli.cmd_annotations
+def test_tighten_defaults_to_the_footprint_level(tmp_path, capsys):
+    """Exact boxes by default, and the read cost scales with the level already chosen.
+
+    Defaulting to a fixed coarse level made the common invocation quantize every bound
+    to that level's voxel — the reason extents came out 252 instead of 256 on real data
+    and had to be explained. Defaulting to --level means exact at the default --level 0,
+    and no worse than the listing already costs when a coarser level is asked for.
+    """
+    seg = np.zeros((32, 32, 32), np.uint64)
+    seg[8:24, 8:24, 8:24] = 9          # inside chunk boundaries on every side
+    src = str(tmp_path / "s.zarr")
+    be = TensorStoreBackend.create(
+        zarr3_create_spec("local", src, seg.shape, "uint64",
+                          dimension_names=("z", "y", "x"), chunk=(8, 8, 8)),
+        delete_existing=True)
+    be.write_region(tuple(slice(0, s) for s in seg.shape), seg)
+    dst = str(tmp_path / "v")
+    convert(src, dst, voxel_size=(8, 8, 8), kind="segmentation",
+            profile="local-neuroglancer", chunk=(16, 16, 16), factors=[(2, 2, 2)],
+            min_dim=8, delete_existing=True)
+
+    args = cli._parse_args(["bboxes-json", dst])
+    assert args.tighten_level is None, "the default must resolve against --level"
+    assert cli.cmd_bboxes_json(args) == 0
+    ann = json.loads(capsys.readouterr().out)["annotations"][0]
+    assert ann["pointA"] == [8, 8, 8] and ann["pointB"] == [24, 24, 24]
+
+
+def test_out_goes_through_the_kvstore_not_open(tmp_path, capsys):
+    """So `--out s3://...` works at all.
+
+    Pinned with a local path whose parent does not exist: the file driver creates it,
+    while `open()` would raise. That is the same code path a remote --out takes, and it
+    is the only part of it a test can exercise without a bucket.
+    """
+    dst = _sparse(tmp_path, "vol", profile="local-neuroglancer")
+    out = str(tmp_path / "does" / "not" / "exist" / "layer.json")
+    assert cli.cmd_bboxes_json(cli._parse_args(
+        ["bboxes-json", dst, "--tighten-level", "1", "--out", out])) == 0
+    with open(out) as f:
+        assert len(json.load(f)["annotations"]) == 2
+    assert capsys.readouterr().out == "", "--out must keep stdout clean"
+
+
+def test_bboxes_json_is_wired_to_the_subcommand():
+    assert cli._parse_args(["bboxes-json", "v"]).func is cli.cmd_bboxes_json
     assert not os.path.exists("v"), "parsing must not touch the volume"

@@ -133,11 +133,12 @@ em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted on
 em-vol progress <volume>                     # chunks written, per level
 em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
-em-vol annotations <volume>                  # a viewer layer marking where data is
+em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
 em-vol relabel <volume> --out ...            # one id range per occupied region
+em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 ```
 
-`info`, `progress` and `annotations` read only. `downsample` rebuilds a pyramid **in place** from a
+`info`, `progress`, `bboxes-json` and `ng-url-gen` read only. `downsample` rebuilds a pyramid **in place** from a
 level you trust — cascaded downsampling means a bad level poisons everything above it
 — and `--dry-run` prints the schedule beside what is on disk, refusing if they
 disagree rather than leaving the pyramid inconsistent. Use `convert` to build a *new*
@@ -176,28 +177,57 @@ own but loses one of two updates if overlapping writes ever run at once.
 ### Finding the data in a sparse volume
 
 A volume holding a few labeled boxes inside a large empty frame is hard to *view* —
-the boxes are needles in the frame. `annotations` emits a neuroglancer annotation
+the boxes are needles in the frame. `bboxes-json` emits a neuroglancer annotation
 layer with one bounding box per written region, giving a clickable list that jumps
 between them:
 
 ```bash
-em-vol annotations s3://.../gt_v1 --label gt        # layer JSON to stdout, table to stderr
-em-vol annotations s3://.../gt_v1 --out layer.json  # paste into a state's `layers`
-em-vol annotations s3://.../gt_v1 --state --out state.json   # a whole loadable state
+em-vol bboxes-json s3://.../gt_v1 --label gt        # layer JSON to stdout, table to stderr
+em-vol bboxes-json s3://.../gt_v1 --out layer.json  # or s3://... — both work
+em-vol bboxes-json s3://.../gt_v1 --state --out state.json   # a whole loadable state
 ```
 
 The boxes come from the volume itself, so they cannot drift from the data: an all-fill
 chunk is never stored, so *which chunk objects exist* is the occupancy question exactly
 — no voxel reads. Those cells are then covered with maximal boxes (not connected
 components: two regions written face to face merge into one, plus the empty corner
-between them), and each box is tightened to its nonzero voxels with one read at
-`--tighten-level`, cheap because a 384-voxel box is 96 voxels at 32 nm.
+between them), and each box is then tightened to its nonzero voxels.
+
+`--tighten-level` defaults to `--level`, so at the default level 0 the boxes are exact
+in the voxels they are reported in, and the reads cost what the level you picked costs.
+Raise it when the occupied footprint is large — each level is a factor smaller to read,
+at the price of quantizing every bound to one voxel there. `--no-tighten` leaves the
+boxes on the chunk grid and reads nothing.
 
 The annotations are **local** — inline in the state — rather than a precomputed
 annotation layer, because neuroglancer does not *list* precomputed annotations: it
 builds the annotation panel by iterating the layer's source, and the class behind every
 precomputed annotation source defines that iterator as empty. Those annotations render
 in the viewport but cannot be clicked through, which defeats the purpose here.
+
+### Sharing a view
+
+`ng-url-gen` builds a neuroglancer link carrying a whole viewer state — which volumes
+are loaded, where the view sits, which segments are selected. It reads the volumes to
+get the source scheme and the coordinate space right, which is the part that fails
+silently by hand: a `dimensions` block that disagrees with the data loads fine and puts
+every layer in the wrong place.
+
+```bash
+em-vol bboxes-json s3://.../gt_v2 --label gt --out gt.json
+em-vol ng-url-gen --image s3://.../em --seg s3://.../gt_v2 \
+    --layer gt.json --segments 1,2,3 --layout xy-3d --select-last
+```
+
+It composes with `bboxes-json` through `--layer`, which takes either a bare layer or a
+whole state and uses its layers, so it does not matter which the other command emitted.
+`--position` is zyx like every other coordinate here; pass `--position-order xyz` to use
+numbers copied straight out of the viewer, since that is what neuroglancer displays.
+
+Everything after `#!` is a URL fragment and never reaches a server, so the link carries
+no data anywhere — but the whole state travels in it, and a large inline annotation layer
+makes for a long URL. `--state-out` writes the JSON alongside for pasting into the `{}`
+editor instead.
 
 ### Ground truth annotated chunk by chunk
 
@@ -212,7 +242,7 @@ em-vol relabel s3://.../gt_v1 --out s3://.../gt_v2             # then --start-le
 em-vol downsample s3://.../gt_v2 --start-level 0
 ```
 
-Regions are the same stored-chunk footprints `annotations` uses, so they are pairwise
+Regions are the same stored-chunk footprints `bboxes-json` uses, so they are pairwise
 disjoint and chunk-aligned — no write is a partial-chunk update. It is serial by
 construction, since each range begins where the last ended, so it runs in the calling
 process with no dask. `--block-size N` numbers region *k* from `N*k+1` instead, making

@@ -432,12 +432,14 @@ reported rather than silently accepted. These ops run in the calling process, no
 which is also what keeps that hazard confined to what the user does across invocations.
 
 
-## 11. Finding the data again: `annotations`
+## 11. Finding the data again: `bboxes-json`
 
 Create-then-write produces a volume that is mostly empty on purpose, and that makes it
 hard to *look at*: twelve labeled boxes in an 11260×9000×13750 frame are needles.
-`em-vol annotations` closes that loop by emitting a neuroglancer annotation layer with
-one box per written region, so the viewer gets a list to click through.
+`em-vol bboxes-json` closes that loop by emitting a neuroglancer annotation layer with
+one box per written region, so the viewer gets a list to click through. It is named for
+its output rather than for "annotations", which said nothing about what it produces —
+and `ng-url-gen` (§13) turns that layer into a link.
 
 **Occupancy comes from chunk presence, not from voxels.** TensorStore never persists a
 chunk that is entirely the fill value, so on a sparse volume the set of stored objects
@@ -457,11 +459,16 @@ the property that matters, since a box is a claim that there is data there. Regi
 are genuinely contiguous *do* merge, correctly: nothing in the stored chunks
 distinguishes that from one write of twice the size.
 
-**Tightening is an optimisation, so a missing level is not an error.** Chunk-aligned
-boxes are blocky (a 256³ region rounds out to 384³ at 128³ chunks), so each box is
-shrunk to its nonzero voxels by one read at `--tighten-level` — nearly free, because a
-384-voxel box is 96 voxels at 32 nm, at the cost of quantizing the bound to one coarse
-voxel. When that level does not exist the level clamps *finer* rather than raising: a
+**Tightening defaults to the footprint's own level, and is an optimisation either way.**
+Chunk-aligned boxes are blocky (a 256³ region rounds out to 384³ at 128³ chunks), so each
+box is shrunk to its nonzero voxels by one read at `--tighten-level`. That defaulted to a
+fixed level 2 at first, which made the common invocation quantize every bound to a coarse
+voxel — the reason real extents came out 252 instead of 256, a surprise that had to be
+explained rather than read off. Defaulting to `--level` instead means the boxes are exact
+in the level-0 voxels they are reported in whenever the footprint came from level 0, and
+the reads never cost more than the level the caller already chose. Raising it trades
+exactness for a factor per level, which is the right knob when the occupied footprint is
+large. When the level does not exist the level clamps *finer* rather than raising: a
 single-level volume is the normal state of one `create` made and `write` filled, and
 refusing to annotate exactly those would be absurd. Finer means more exact and only
 slower, bounded by the occupied footprint — but it is reported, or an unexplained slow
@@ -534,3 +541,45 @@ separate decision and a separate run, so this reports the stale levels and names
 `N*k+1`, trading id density for being able to read the source region off the id, and
 refuses rather than letting a region overflow into the next range — which would recreate
 the exact collision the operation exists to remove.
+
+
+## 13. `ng-url-gen`: the link is the state
+
+Neuroglancer keeps its entire state in the URL fragment, so a link *is* a configured
+viewer. That makes a link the natural unit for sharing a result — and hand-writing one
+the natural way to get it subtly wrong, because a state with the wrong `dimensions` or
+the wrong source scheme **loads without complaint** and shows the data in the wrong
+place, or shows nothing and appears to blame the store.
+
+So the values that can be read are read. `detect_backend` decides `precomputed://` vs
+`zarr://`; the coordinate space comes from a volume's recorded voxel size rather than
+being assumed. When no volume establishes one — every layer supplied as a `--layer` file,
+which carries its own frame but not the viewer's — it refuses and asks for
+`--voxel-size`, because that is the case where guessing produces a plausible, wrong
+picture.
+
+Decisions worth recording:
+
+**The classic `scheme://` source form, not the newer `kvstore|adapter:` pipeline syntax.**
+Both work in current builds; only the classic one works in older ones, and a link is the
+artefact most likely to be opened by someone running a different viewer than the author.
+
+**Segment ids are strings.** JSON numbers are doubles, so a uint64 body id above 2^53
+would arrive rounded and select a different segment — or nothing. The ids in this dataset
+already reach 3.37 million and there is no reason to assume a ceiling.
+
+**`--position` is zyx, with `--position-order xyz` to override.** Consistent with every
+other coordinate flag in the package (invariant: zyx in memory), but the tension is real
+and worth naming: neuroglancer *displays* xyz, so the numbers a user copies out of the
+viewer to build a link are xyz. The default follows the package; the flag exists because
+the common source of those numbers does not. Both are echoed on every run.
+
+**Layer files are accepted as either a layer or a whole state.** `bboxes-json` can emit
+both shapes, and which one the caller happened to produce is not a distinction worth
+making them care about — a state's `layers` are taken, a bare layer is used as-is.
+
+**Composition over integration.** `ng-url-gen` does not know how to find bounding boxes
+and `bboxes-json` does not know how to make a URL. They meet at a file of JSON, so either
+can be used alone, and neither grows the other's flags. The alternative — a `--bboxes
+<volume>` flag that generated boxes inline — would have duplicated §11 inside §13 and
+given two places for the region-finding behaviour to drift.

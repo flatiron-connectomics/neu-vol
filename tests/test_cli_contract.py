@@ -34,7 +34,7 @@ def test_every_subcommand_is_reachable_from_the_parser():
     subs = next(a for a in parser._actions
                 if isinstance(a, argparse._SubParsersAction)).choices
     assert set(subs) == {"info", "convert", "downsample", "create", "write",
-                         "progress", "annotations", "relabel"}
+                         "progress", "bboxes-json", "relabel", "ng-url-gen"}
     for name, sub in subs.items():
         assert sub.format_usage().strip(), f"{name} renders no usage line"
 
