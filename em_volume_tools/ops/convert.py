@@ -1,11 +1,18 @@
 """Convert an existing volume (any source backend) into a multiscale zarr v3 or
-neuroglancer-precomputed volume.
+neuroglancer-precomputed volume, whole or cropped to a box.
 
 Generalizes ``ingest``: the source is any registered backend. Coordinate metadata
 (``voxel_size``/``offset``/``units``/``axes``) is read from the source when it
 carries it (OME-NGFF zarr groups, precomputed ``info``); anything the caller
 passes explicitly overrides the read value. Sources without metadata (bare
 arrays, HDF5) require the caller to supply at least ``voxel_size``.
+
+``crop_start``/``crop_stop`` restrict the copy to a box **without changing the model
+space**: the physical offset shifts by the crop origin, so the output lands on top of
+the source in a viewer rather than at the origin (CLAUDE.md invariant 1). This is
+where cropping belongs, rather than beside the metadata resolution above — the crop
+view wraps the resolved ``data_spec``, so a cropped copy reads through exactly the
+reader detection chose (invariant 9). ``ops/roi.py`` is a thin wrapper over it.
 """
 
 from __future__ import annotations
@@ -20,6 +27,57 @@ from ._multiscale import materialize_multiscale
 logger = logging.getLogger(__name__)
 
 
+def _resolve_crop(
+    data_spec: dict,
+    src_shape: Sequence[int],
+    *,
+    start: Sequence[int] | None,
+    stop: Sequence[int] | None,
+    n_spatial: int,
+    has_channels: bool,
+    pad_value: float,
+    clip: bool,
+) -> tuple[dict, tuple[int, ...], tuple[int, ...]]:
+    """A crop view over ``data_spec``: ``(spec, output shape, spatial start)``.
+
+    ``start``/``stop`` are voxel indices into ``data_spec``'s own (level-0) grid, in
+    spatial ``(z, y, x)``; a leading channel axis is always taken in full. Either may
+    be ``None``, meaning the volume's own bound, so a half-open box needs only the end
+    that matters.
+
+    ``clip`` trims the box to the source extent — the default, because the alternative
+    is inventing voxels: :class:`~em_volume_tools.backends.view.CropBackend` happily
+    reads outside the volume and fills with ``pad_value``, which for a copy would
+    publish fabricated data at the margin with nothing to show it was fabricated.
+    ``clip=False`` is the crop-*and*-pad contract of :func:`~em_volume_tools.extract_roi`.
+    """
+    spatial = tuple(int(s) for s in (src_shape[1:] if has_channels else src_shape))
+    start = (0,) * n_spatial if start is None else tuple(int(v) for v in start)
+    stop = spatial if stop is None else tuple(int(v) for v in stop)
+    if len(start) != n_spatial or len(stop) != n_spatial:
+        raise ValueError(
+            f"crop start/stop must have {n_spatial} spatial entries, got "
+            f"{start} / {stop}"
+        )
+    if clip:
+        c_start = tuple(max(0, a) for a in start)
+        c_stop = tuple(min(b, d) for b, d in zip(stop, spatial))
+        if (c_start, c_stop) != (start, stop):
+            logger.info("crop clipped to the source extent: [%s:%s] -> [%s:%s]",
+                        start, stop, c_start, c_stop)
+            start, stop = c_start, c_stop
+    out_spatial = tuple(b - a for a, b in zip(start, stop))
+    if any(s <= 0 for s in out_spatial):
+        raise ValueError(
+            f"empty crop: start={start} stop={stop} (source spatial shape {spatial})"
+        )
+    origin = ((0,) + start) if has_channels else start
+    out_shape = ((int(src_shape[0]),) + out_spatial) if has_channels else out_spatial
+    spec = {"backend": "crop", "source": dict(data_spec), "origin": list(origin),
+            "shape": list(out_shape), "pad_value": pad_value}
+    return spec, out_shape, start
+
+
 def convert(
     src: str | dict,
     dst: str,
@@ -30,6 +88,10 @@ def convert(
     axes: Sequence[str] | None = None,
     offset: Sequence[float] | None = None,
     has_channels: bool | None = None,
+    crop_start: Sequence[int] | None = None,
+    crop_stop: Sequence[int] | None = None,
+    pad_value: float = 0,
+    clip_crop: bool = True,
     profile: str = "local",
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
@@ -50,7 +112,7 @@ def convert(
     progress_path: str | None = None,
     validate: bool = True,
 ) -> dict:
-    """Convert ``src`` into a multiscale volume at ``dst``.
+    """Convert ``src`` into a multiscale volume at ``dst``, whole or cropped.
 
     ``src`` is a path or a full backend spec dict. For a path, ``src_format`` is
     auto-detected (``info``->precomputed, ``zarr.json``->zarr3,
@@ -58,6 +120,14 @@ def convert(
     taken from the source where available; ``voxel_size`` is required if the source
     carries none. With ``resume=True`` an interrupted run continues, skipping
     already-done blocks instead of recreating them.
+
+    ``crop_start``/``crop_stop`` copy only ``src[crop_start:crop_stop]`` (spatial
+    ``(z, y, x)`` voxels of the source's level 0, either bound optional). The output's
+    physical offset shifts by the crop origin, so it stays in the source's coordinate
+    frame. The pyramid is then built **from the cropped level 0**, so its coarse levels
+    are the crop's own reductions rather than slices of the source's coarse levels —
+    for a crop whose origin is not a multiple of the cumulative factor, a coarse voxel
+    of the output straddles the source's differently.
     """
     if isinstance(src, dict):
         src_spec = dict(src)
@@ -108,18 +178,33 @@ def convert(
             f"{'+ channel' if has_channels else ''}"
         )
     num_channels = int(src_shape[0]) if has_channels else 1
+
+    # The crop wraps the *resolved* data_spec, so the cropped read goes through the
+    # reader detection chose rather than a hand-built one (invariant 9), and the offset
+    # shift keeps the output in the source's frame (invariant 1).
+    read_spec, read_shape = data_spec, src_shape
+    out_offset = tuple(offset) if offset else (0.0,) * n_spatial
+    if crop_start is not None or crop_stop is not None:
+        read_spec, read_shape, start = _resolve_crop(
+            data_spec, src_shape, start=crop_start, stop=crop_stop,
+            n_spatial=n_spatial, has_channels=has_channels, pad_value=pad_value,
+            clip=clip_crop)
+        out_offset = tuple(o + a * v for o, a, v in zip(out_offset, start, voxel_size))
+        logger.info("crop [%s:%s] of %s -> shape=%s offset=%s nm",
+                    start, tuple(a + b for a, b in zip(start, read_shape[-n_spatial:])),
+                    src_shape, read_shape, out_offset)
     logger.info("convert %s -> %s | shape=%s dtype=%s channels=%s voxel_size=%s",
-                data_spec, dst, src_shape, src_backend.dtype,
+                data_spec, dst, read_shape, src_backend.dtype,
                 num_channels if has_channels else 1, tuple(voxel_size))
 
     return materialize_multiscale(
-        src_spec=data_spec,
-        src_shape=src_shape,
+        src_spec=read_spec,
+        src_shape=read_shape,
         src_dtype=str(src_backend.dtype),
         dst=dst,
         profile=profile,
         voxel_size=tuple(voxel_size),
-        offset=tuple(offset) if offset else (0.0,) * n_spatial,
+        offset=out_offset,
         units=units,
         spatial_axes=tuple(axes),
         has_channels=has_channels,

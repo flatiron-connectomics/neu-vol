@@ -54,7 +54,28 @@ convert("in.zarr", "out.precomputed",           # voxel_size read from in.zarr's
         profile="s3-neuroglancer", kind="segmentation")   # mode pyramid, compressed_segmentation
 ```
 
-`extract_roi()` crops/pads a region (and can pyramid it) into either format.
+`crop_start`/`crop_stop` copy **one box** instead of the whole volume, clipped to the
+source extent. The output's physical offset shifts by the crop origin, so it stays in
+the source's coordinate frame and overlays the original in a viewer; its pyramid is then
+built from the cropped level 0, never from slices of the source's coarse levels.
+
+```python
+convert("in.precomputed", "crop.precomputed", kind="segmentation",
+        crop_start=(5632, 4480, 6784), crop_stop=(5760, 4736, 7040))   # zyx voxels
+```
+
+`extract_roi()` is the same crop with the opposite out-of-bounds policy: `start` may be
+negative and `stop` may pass the extent, and the margin is filled with `pad_value`
+instead of trimmed. It delegates to `convert()`.
+
+On the command line, `em-vol convert --crop-bbox z0,y0,x0,z1,y1,x1` (optionally
+`--crop-scale N`, resolved through the source's own per-level voxel sizes) does this, and
+**`em-vol copy` is the same command with the source's own parameters as the defaults** —
+format, chunking, voxel size and image/segmentation type all read from the source, with
+anything it does not record an error rather than a guess. That last part is why it exists:
+`convert --kind` defaults to `image`, so copying a segmentation and forgetting the flag
+averages label ids into ids that were never in the data, silently, while the source's
+`info` said `segmentation` all along.
 
 `create_volume()` + `write_subvolume()` are the other shape of the problem: several
 small pieces that belong at known positions inside one frame, rather than one source

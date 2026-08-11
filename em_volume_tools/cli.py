@@ -6,6 +6,7 @@ continues where it stopped rather than starting over.
 
     em-vol info    <volume>                      # what is it, what levels exist
     em-vol convert --src ... --dst ...           # build a multiscale volume
+    em-vol copy    --src ... --dst ...           # copy one as it is, whole or a box
     em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
     em-vol progress <volume>                     # chunks written, per level
     em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
@@ -13,6 +14,10 @@ continues where it stopped rather than starting over.
     em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
     em-vol relabel <volume> --out ...            # one id range per occupied region
     em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
+
+``convert`` and ``copy`` are the same operation under two defaulting policies: convert
+states the output it wants, copy takes the source's own format, chunking, voxel size and
+image/segmentation type. Either copies the whole volume or one ``--crop-bbox``.
 
 ``create`` + ``write`` are the small-pieces path, and they are not block-mapped:
 ``create`` lays out an empty volume (optionally copying a reference's frame exactly),
@@ -62,6 +67,62 @@ def _add_cluster_args(p, *, default_workers=4, serial=True):
                         "(suppressed by default; real errors are never suppressed)")
 
 
+def _add_convert_args(p, *, source_defaults: bool):
+    """The arguments shared by ``convert`` and ``copy``.
+
+    ``source_defaults`` is the only difference between the two subcommands: with it,
+    ``--format`` / ``--kind`` / ``--voxel-size`` / ``--chunk`` default to whatever the
+    source records instead of to fixed values, and a source that records none of them
+    is an error rather than a silent guess. Everything else — the pyramid schedule, the
+    crop, resume, the cluster — is identical, so it lives here and cannot drift.
+    """
+    from_source = " (default: from the source)" if source_defaults else ""
+    p.add_argument("--src", required=True, help="path, s3://..., precomputed or .zarr")
+    p.add_argument("--dst", required=True,
+                   help="destination base (path or s3://bucket/prefix). With "
+                        "--format both, '.precomputed' and '.zarr' are appended")
+    p.add_argument("--format", choices=("precomputed", "zarr", "both"),
+                   default=None if source_defaults else "precomputed",
+                   help="output format" + (from_source or " (default: precomputed)"))
+    p.add_argument("--kind", choices=("image", "probability", "segmentation"),
+                   default=None if source_defaults else "image",
+                   help="reducer for the pyramid: mean for image/probability, "
+                        "label-preserving mode for segmentation. Getting this wrong "
+                        "is silent — averaging label ids invents ids" + from_source)
+    p.add_argument("--voxel-size", default=None,
+                   help="z,y,x nm (default: from source)")
+    p.add_argument("--chunk", default=None if source_defaults else "128,128,128",
+                   help="z,y,x chunk" + (from_source or " (default: 128,128,128)"))
+    p.add_argument("--shard", default=None,
+                   help="z,y,x shard (zarr only)" + from_source)
+    p.add_argument("--crop-bbox", default=None, metavar="Z0,Y0,X0,Z1,Y1,X1",
+                   help="copy only this box instead of the whole volume, in voxels at "
+                        "--crop-scale. Half-open, clipped to the volume. The output "
+                        "keeps the source's frame — its physical offset shifts by the "
+                        "crop origin — so the two overlay in a viewer")
+    p.add_argument("--crop-scale", type=int, default=0, metavar="N",
+                   help="the scale --crop-bbox is given in (default: 0, level-0 "
+                        "voxels). Converted using the source's own per-level voxel "
+                        "sizes, never an assumed 2**N, since real pyramids are "
+                        "anisotropic. The same six values name a different box at "
+                        "every scale, so check the resolved level-0 box that is logged")
+    p.add_argument("--profile", default=None,
+                   help="storage profile name (default: chosen from --format and "
+                        "whether --dst is remote)")
+    p.add_argument("--factors", default=None,
+                   help="explicit per-level factors, e.g. '1,2,2;1,2,2' (default auto)")
+    p.add_argument("--max-levels", type=int, default=8)
+    p.add_argument("--min-dim", type=int, default=128,
+                   help="stop when the largest spatial dim is <= this")
+    p.add_argument("--single-level", action="store_true",
+                   help="write level 0 only, no pyramid")
+    p.add_argument("--fresh", action="store_true",
+                   help="delete and restart instead of resuming")
+    p.add_argument("--no-validate", action="store_true",
+                   help="skip OME metadata validation")
+    _add_cluster_args(p)
+
+
 def _triple(value, name):
     """'z,y,x' (or 'zxyxx') -> a 3-tuple of ints, or None."""
     if value is None:
@@ -80,6 +141,19 @@ def _ftriple(value, name):
     if len(parts) != 3:
         raise SystemExit(f"--{name} needs 3 comma-separated values, got {value!r}")
     return parts
+
+
+def _sextuple(value, name):
+    """'z0,y0,x0,z1,y1,x1' -> two 3-tuples of ints (start, stop)."""
+    parts = tuple(int(v) for v in value.split(","))
+    if len(parts) != 6:
+        raise SystemExit(f"--{name} needs 6 comma-separated values "
+                         f"(z0,y0,x0,z1,y1,x1), got {value!r}")
+    start, stop = parts[:3], parts[3:]
+    if any(b <= a for a, b in zip(start, stop)):
+        raise SystemExit(f"--{name} is empty or inverted: every start must be below its "
+                         f"stop, got start={start} stop={stop}")
+    return start, stop
 
 
 def _human_bytes(n: float) -> str:
@@ -169,42 +243,185 @@ def cmd_info(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# convert
+# convert  (+ copy, which is convert with the source's own parameters as defaults)
 # --------------------------------------------------------------------------- #
-def cmd_convert(args) -> int:
-    import contextlib
-    import os
-
-    from em_volume_tools import StorageProfile, convert
-
-    dst = args.dst.rstrip("/")
+def _warn_if_no_aws(dst: str) -> None:
     if dst.startswith("s3://") and not (
             os.environ.get("AWS_ACCESS_KEY_ID")
             or os.path.exists(os.path.expanduser("~/.aws/credentials"))):
         log.warning("no AWS credentials in the environment or ~/.aws/credentials; "
                     "S3 writes will fail with AccessDenied")
 
-    chunk = _triple(args.chunk, "chunk")
-    voxel = _triple(args.voxel_size, "voxel-size")
 
-    # `both` writes two volumes from one read-side setup: precomputed for viewing,
-    # zarr for downstream compute. Suffixes keep them distinguishable at one --dst.
+def _level0_factor(src: str, scale: int, per_level=None) -> tuple[int, ...]:
+    """How many level-0 voxels one scale-``scale`` voxel spans, per axis.
+
+    Read from each level's OWN recorded voxel size, never ``2**scale``: real pyramids
+    are anisotropic and ``(1, 2, 2)`` — halve x/y, leave z — is common (CLAUDE.md
+    invariant 1). Shape ratios are not used either; ceil-division makes them inexact.
+    """
+    from em_volume_tools.source_metadata import (detect_backend,
+                                                 read_level_voxel_sizes)
+
+    if per_level is None:
+        fmt = detect_backend(src)
+        if fmt is None:
+            raise SystemExit(f"--crop-scale {scale} needs the source's per-level voxel "
+                             f"sizes and nothing at {src} looks like a volume")
+        per_level = read_level_voxel_sizes({"backend": fmt, "path": src})
+    if not per_level:
+        raise SystemExit(f"--crop-scale {scale} needs the source's per-level voxel "
+                         f"sizes, and {src} records none. Give --crop-bbox in level-0 "
+                         f"voxels instead (--crop-scale 0).")
+    if scale >= len(per_level):
+        raise SystemExit(f"--crop-scale {scale}: the source records only "
+                         f"{len(per_level)} level(s) (0-{len(per_level) - 1})")
+    factor = tuple(s / b for s, b in zip(per_level[scale], per_level[0]))
+    if any(abs(f - round(f)) > 1e-6 for f in factor):
+        raise SystemExit(f"--crop-scale {scale}: its voxel size {per_level[scale]} is "
+                         f"not an integer multiple of level 0's {per_level[0]}, so a "
+                         f"box there does not land on level-0 voxels. Use "
+                         f"--crop-scale 0.")
+    return tuple(int(round(f)) for f in factor)
+
+
+def _src_voxel_size(src):
+    """The source's own level-0 voxel size, or ``None``. Metadata reads only."""
+    from em_volume_tools.source_metadata import (detect_backend,
+                                                 read_source_metadata)
+
+    fmt = detect_backend(src)
+    meta = read_source_metadata({"backend": fmt, "path": src}) if fmt else None
+    return tuple(meta["voxel_size"]) if meta else None
+
+
+def _crop_bbox(args, per_level=None):
+    """``(start, stop)`` in level-0 voxels from ``--crop-bbox``, or ``(None, None)``."""
+    if not getattr(args, "crop_bbox", None):
+        return None, None
+    start, stop = _sextuple(args.crop_bbox, "crop-bbox")
+    scale = getattr(args, "crop_scale", 0) or 0
+    if scale:
+        factor = _level0_factor(args.src, scale, per_level)
+        start = tuple(a * f for a, f in zip(start, factor))
+        stop = tuple(b * f for b, f in zip(stop, factor))
+        log.info("--crop-bbox is in scale-%d voxels (%s level-0 voxels each): "
+                 "level-0 box %s:%s", scale, factor, start, stop)
+    return start, stop
+
+
+def _pyramid_levels(shape, voxel, args):
+    """``[(shape, voxel_size)]`` per level, for the schedule these arguments imply."""
+    from em_volume_tools.pyramid import downsample_schedule
+
+    if args.single_level:
+        return [(tuple(shape), tuple(voxel))]
+    schedule = downsample_schedule(shape, voxel, factors=_factor_list(args.factors),
+                                   max_levels=args.max_levels, min_dim=args.min_dim)
+    levels = [(tuple(shape), tuple(voxel))]
+    for factor in schedule:
+        levels.append((tuple(-(-s // f) for s, f in zip(levels[-1][0], factor)),
+                       tuple(v * f for v, f in zip(levels[-1][1], factor))))
+    return levels
+
+
+def _warn_if_crop_unaligned(start, shape, voxel, args) -> None:
+    """A crop origin off the pyramid's own grid shifts every coarse level.
+
+    The output's pyramid is built from the *cropped* level 0, so its reduction windows
+    start at the crop origin. When that origin is not a multiple of a level's
+    cumulative factor, that level's voxels straddle the source's coarse voxels
+    differently and its ``voxel_offset`` rounds to the nearest coarse voxel — the
+    output still overlays the source at level 0 while drifting by up to half a voxel at
+    the top. Aligning the origin avoids it; nothing else can, since the crop defines
+    the grid.
+    """
+    from em_volume_tools.pyramid import cumulative_factors, downsample_schedule
+
+    if args.single_level or not voxel:
+        return  # no pyramid, or no voxel size to derive the schedule's factors from
+    schedule = downsample_schedule(shape, voxel, factors=_factor_list(args.factors),
+                                   max_levels=args.max_levels, min_dim=args.min_dim)
+    coarsest = cumulative_factors(schedule, len(shape))[-1]
+    if any(a % f for a, f in zip(start, coarsest)):
+        aligned = tuple(a - a % f for a, f in zip(start, coarsest))
+        log.warning("crop origin %s is not a multiple of the coarsest cumulative "
+                    "factor %s: the pyramid is built from the cropped level 0, so its "
+                    "coarse levels sit on a different grid than the source's and their "
+                    "voxel_offset rounds. Level 0 is exact either way. Use origin %s "
+                    "to keep both grids in step.", tuple(start), coarsest, aligned)
+
+
+def _level0_chunking(d, src):
+    """``(read chunk, write chunk)`` of a source's level 0, either possibly ``None``.
+
+    ``describe`` reports chunking per level, but only for levels it can *find*: a bare
+    zarr array has no level subdirectories, so it reports none and its chunking lives
+    on the array itself. They differ when the level is sharded — the write chunk is the
+    shard — and a copy wants to carry both across.
+    """
+    from em_volume_tools.backends.base import open_backend
+
+    lvl0 = d["levels"].get(0) or {}
+    if lvl0.get("read_chunks") or lvl0.get("chunks"):
+        return lvl0.get("read_chunks"), lvl0.get("chunks")
+    meta = d["meta"] or {}
+    try:
+        be = open_backend(meta.get("data_spec") or {"backend": d["format"], "path": src})
+    except Exception as e:
+        # A backend that cannot be opened here can still be read by the workers — the
+        # cloudvolume one needs a package only the em-vol-cv environment carries. Fall
+        # back to the profile's default chunking rather than fail before starting.
+        log.info("could not read the source's chunking (%s); using the profile default", e)
+        return None, None
+
+    def _maybe(attr):
+        try:
+            return tuple(int(c) for c in getattr(be, attr))
+        except Exception:
+            return None
+
+    return _maybe("read_chunks"), _maybe("chunks")
+
+
+def _convert_targets(fmt, dst, profile_arg, chunk, shard):
+    """``(profile, destination)`` per requested output format.
+
+    ``both`` writes two volumes from one read-side setup: precomputed for viewing, zarr
+    for downstream compute. Suffixes keep them distinguishable at one ``--dst``.
+    """
+    from em_volume_tools import StorageProfile
+
     targets: list[tuple[object, str]] = []
-    if args.format in ("precomputed", "both"):
-        profile = args.profile or ("s3-neuroglancer" if dst.startswith("s3://")
-                                   else "local-neuroglancer")
-        targets.append((profile, dst + (".precomputed" if args.format == "both" else "")))
-    if args.format in ("zarr", "both"):
-        profile = args.profile or StorageProfile("zarr3", chunk=chunk, shard=args.shard
-                                                 and _triple(args.shard, "shard"))
-        targets.append((profile, dst + (".zarr" if args.format == "both" else "")))
+    if fmt in ("precomputed", "both"):
+        profile = profile_arg or ("s3-neuroglancer" if dst.startswith("s3://")
+                                  else "local-neuroglancer")
+        targets.append((profile, dst + (".precomputed" if fmt == "both" else "")))
+    if fmt in ("zarr", "both"):
+        # `chunk` is None only when nothing asked for one and the source records none;
+        # a StorageProfile built with chunk=None fails deep inside the create spec, so
+        # fall back to the named profile's own default.
+        profile = profile_arg or (StorageProfile("zarr3", chunk=chunk, shard=shard)
+                                  if chunk else "local")
+        targets.append((profile, dst + (".zarr" if fmt == "both" else "")))
+    return targets
 
+
+def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop) -> int:
+    """The shared body of ``convert`` and ``copy``: block-map the copy per target."""
+    from em_volume_tools import convert
+
+    dst = args.dst.rstrip("/")
+    _warn_if_no_aws(dst)
+    crop_start, crop_stop = crop
     with _maybe_cluster(args) as client:
-        for profile, target in targets:
-            log.info("convert %s -> %s (%s)", args.src, target, args.kind)
+        for profile, target in _convert_targets(fmt, dst, args.profile, chunk, shard):
+            log.info("%s %s -> %s (%s)", args.command, args.src, target, kind)
             summary = convert(
-                args.src, target, voxel_size=voxel, src_format=args.src_format,
-                profile=profile, kind=args.kind, chunk=chunk,
+                args.src, target, voxel_size=voxel,
+                src_format=getattr(args, "src_format", None),
+                profile=profile, kind=kind, chunk=chunk,
+                crop_start=crop_start, crop_stop=crop_stop,
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
                 client=client, resume=not args.fresh, delete_existing=args.fresh,
@@ -213,6 +430,97 @@ def cmd_convert(args) -> int:
             log.info("done %s: %d levels, status=%s", target,
                      summary["num_levels"], summary.get("status_counts"))
     return 0
+
+
+def cmd_convert(args) -> int:
+    chunk = _triple(args.chunk, "chunk")
+    voxel = _ftriple(args.voxel_size, "voxel-size")
+    crop = _crop_bbox(args)
+    if crop[0] is not None:
+        _warn_if_crop_unaligned(crop[0], tuple(b - a for a, b in zip(*crop)),
+                                voxel or _src_voxel_size(args.src), args)
+    return _run_convert(args, fmt=args.format, voxel=voxel, chunk=chunk,
+                        shard=_triple(args.shard, "shard"), kind=args.kind, crop=crop)
+
+
+def cmd_copy(args) -> int:
+    """Copy a volume, or a box out of it, keeping the source's own parameters."""
+    try:
+        d = describe(args.src)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"no volume found at {args.src}. `copy` takes its format, chunking, voxel "
+            f"size and image/segmentation type from the source, so it needs a volume "
+            f"that records them: precomputed (`info`) or an OME-NGFF zarr group. For an "
+            f"image stack, HDF5 or a bare array, use `em-vol convert` and state them.") \
+            from None
+    meta = d["meta"] or {}
+
+    # A `.gz`-chunked source (CloudVolume) copies out as PLAIN precomputed, which is
+    # much of the point: the copy is addressable by tensorstore, the original is not.
+    fmt = args.format or ("zarr" if d["format"] == "zarr3" else "precomputed")
+    kind = args.kind or meta.get("kind")
+    if kind is None:
+        raise SystemExit(
+            f"{args.src} records no image/segmentation type; pass --kind. Guessing "
+            f"wrong is silent and destructive — averaging label ids invents ids that "
+            f"were never in the data.")
+    voxel = _ftriple(args.voxel_size, "voxel-size") or (meta.get("voxel_size") and
+                                                        tuple(meta["voxel_size"]))
+    if not voxel:
+        raise SystemExit(f"{args.src} records no voxel size; pass --voxel-size")
+    # Sharded levels report the inner read chunk and the shard separately; carry both.
+    read_chunk, write_chunk = _level0_chunking(d, args.src)
+    chunk = _triple(args.chunk, "chunk") or read_chunk or write_chunk
+    shard = _triple(args.shard, "shard")
+    if shard is None and read_chunk and write_chunk and read_chunk != write_chunk:
+        shard = write_chunk
+
+    # The box reported here is the one that will be copied: `convert` clips a crop to
+    # the source extent rather than padding, so clip before reporting or the printed
+    # shape and byte count are not what runs.
+    spatial = tuple(d["shape"][1:] if d["has_channels"] else d["shape"])
+    crop_start, crop_stop = _crop_bbox(args, d["level_voxel_sizes"])
+    start = tuple(max(0, a) for a in crop_start) if crop_start else (0,) * len(spatial)
+    stop = (tuple(min(b, s) for b, s in zip(crop_stop, spatial)) if crop_stop
+            else spatial)
+    out_shape = tuple(b - a for a, b in zip(start, stop))
+    if any(s <= 0 for s in out_shape):
+        raise SystemExit(f"--crop-bbox {start}:{stop} does not intersect the volume "
+                         f"(spatial shape {tuple(spatial)})")
+
+    import numpy as np
+
+    levels = _pyramid_levels(out_shape, voxel, args)
+    nbytes = float(np.dtype(d["dtype"]).itemsize) * math.prod(out_shape)
+    dst = args.dst.rstrip("/")
+    print(f"{args.src}  ->  {dst}")
+    print(f"  format      {fmt}{'' if args.format else ' (from the source)'}")
+    print(f"  dtype       {d['dtype']}")
+    print(f"  kind        {kind}{'' if args.kind else ' (from the source)'}")
+    print(f"  voxel size  {'x'.join(f'{v:g}' for v in voxel)} nm"
+          f"{'' if args.voxel_size else ' (from the source)'}")
+    print(f"  chunk       {'x'.join(str(c) for c in chunk) if chunk else '(profile default)'}"
+          f"{'' if args.chunk else ' (from the source)'}"
+          + (f"   shard {'x'.join(str(c) for c in shard)}" if shard else ""))
+    if crop_start or crop_stop:
+        print("  crop        " + "  ".join(f"{ax} {a}:{b}"
+                                           for ax, a, b in zip("zyx", start, stop)))
+    print(f"  copying     {tuple(out_shape)} = {_human_bytes(nbytes)} at level 0"
+          f"{'' if (crop_start or crop_stop) else ' (the whole volume)'}")
+    print(f"  levels      {len(levels)}"
+          + ("" if len(levels) == 1 else
+             ", each downsampled from the one below — the source's own coarse levels "
+             "are not copied"))
+    for i, (shape, vox) in enumerate(levels):
+        print(f"  {i:>5}  {str(shape):>24}  {'x'.join(f'{v:g}' for v in vox):>20}")
+    if crop_start:
+        _warn_if_crop_unaligned(start, out_shape, voxel, args)
+    if args.dry_run:
+        print("--dry-run: nothing written")
+        return 0
+    return _run_convert(args, fmt=fmt, voxel=voxel, chunk=chunk, shard=shard,
+                        kind=kind, crop=(crop_start, crop_stop))
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,47 +1322,52 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_info)
 
-    # --- convert ------------------------------------------------------------
+    # --- convert / copy -----------------------------------------------------
+    # One argument set, two defaulting policies: `convert` states the output it wants,
+    # `copy` takes the source's. See _add_convert_args.
     q = sub.add_parser("convert", help="build a multiscale volume from a source",
                        description=cmd_convert.__doc__ or
                        "Convert a source volume into a multiscale zarr and/or "
-                       "neuroglancer-precomputed volume. Resumable.",
+                       "neuroglancer-precomputed volume, whole or cropped to a box. "
+                       "Resumable.\n\nTo copy a volume as it is — same format, "
+                       "chunking, voxel size and image/segmentation type — use "
+                       "`em-vol copy`, which reads those from the source instead of "
+                       "defaulting them.",
                        formatter_class=argparse.RawDescriptionHelpFormatter)
-    q.add_argument("--src", required=True, help="path, s3://..., precomputed or .zarr")
-    q.add_argument("--dst", required=True,
-                   help="destination base (path or s3://bucket/prefix). With "
-                        "--format both, '.precomputed' and '.zarr' are appended")
     q.add_argument("--src-format", default=None,
                    help="backend for --src (default: auto-detect). Use 'image_stack' "
                         "for a directory or glob of ordered 2D slices (PNG/TIFF) — "
                         "that one is never auto-detected, and needs --voxel-size "
                         "since image files carry no physical scale")
-    q.add_argument("--format", choices=("precomputed", "zarr", "both"),
-                   default="precomputed")
-    q.add_argument("--kind", choices=("image", "probability", "segmentation"),
-                   default="image",
-                   help="reducer for the pyramid: mean for image/probability, "
-                        "label-preserving mode for segmentation. Getting this wrong "
-                        "is silent — averaging label ids invents ids")
-    q.add_argument("--voxel-size", default=None, help="z,y,x nm (default: from source)")
-    q.add_argument("--chunk", default="128,128,128", help="z,y,x chunk")
-    q.add_argument("--shard", default=None, help="z,y,x shard (zarr only)")
-    q.add_argument("--profile", default=None,
-                   help="storage profile name (default: chosen from --format and "
-                        "whether --dst is remote)")
-    q.add_argument("--factors", default=None,
-                   help="explicit per-level factors, e.g. '1,2,2;1,2,2' (default auto)")
-    q.add_argument("--max-levels", type=int, default=8)
-    q.add_argument("--min-dim", type=int, default=128,
-                   help="stop when the largest spatial dim is <= this")
-    q.add_argument("--single-level", action="store_true",
-                   help="write level 0 only, no pyramid")
-    q.add_argument("--fresh", action="store_true",
-                   help="delete and restart instead of resuming")
-    q.add_argument("--no-validate", action="store_true",
-                   help="skip OME metadata validation")
-    _add_cluster_args(q)
+    _add_convert_args(q, source_defaults=False)
     q.set_defaults(func=cmd_convert)
+
+    q = sub.add_parser(
+        "copy", help="copy a volume, or a box out of it, as it is",
+        description="Copy a volume — or a box out of it — keeping the source's own "
+                    "format, chunking, voxel size and image/segmentation type.\n\n"
+                    "It is `convert` with a different defaulting policy, and that is "
+                    "the whole point: `convert` defaults to precomputed, 128^3 chunks "
+                    "and --kind image, so copying a segmentation with it and forgetting "
+                    "--kind segmentation averages label ids into ids that were never in "
+                    "the data — silently, while the source's own metadata said "
+                    "`segmentation` all along. Here every one of those comes from the "
+                    "source, and anything it does not record is an error rather than a "
+                    "guess. Pass any of them to override.\n\n"
+                    "--crop-bbox copies one box instead of the whole volume, and the "
+                    "output keeps the source's coordinate frame (its physical offset "
+                    "shifts by the crop origin), so the two overlay in a viewer.\n\n"
+                    "The pyramid is REBUILT from the copied level 0, not copied: the "
+                    "source's coarse levels are never read. For a crop that is what you "
+                    "want — a slice of the source's coarse level is not the reduction of "
+                    "the crop — but a whole-volume copy pays to recompute what already "
+                    "exists.\n\nResumable, like `convert`; re-run to continue.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_convert_args(q, source_defaults=True)
+    q.add_argument("--dry-run", action="store_true",
+                   help="report what would be copied — resolved parameters, the box, "
+                        "the level shapes — and write nothing")
+    q.set_defaults(func=cmd_copy)
 
     # --- downsample ---------------------------------------------------------
     q = sub.add_parser(
@@ -1410,6 +1723,10 @@ def _parse_args(argv=None):
         p.error("--src-format image_stack requires --voxel-size: image files record "
                 "no physical scale, so it cannot be read from the source "
                 "(e.g. --voxel-size 8,8,8 for 8 nm isotropic)")
+    # A scale with no box is the sign of a half-finished command line; saying so beats
+    # running the whole volume when a crop was meant.
+    if getattr(args, "crop_scale", 0) and not getattr(args, "crop_bbox", None):
+        p.error("--crop-scale has no effect without --crop-bbox")
     return args
 
 

@@ -319,8 +319,8 @@ em_volume_tools/                # volume/EM-specific
 ├── ops/
 │   ├── _multiscale.py  # shared copy+pyramid loop; zarr3 & precomputed targets
 │   ├── ingest.py    # image stack -> multiscale volume
-│   ├── convert.py   # any source backend -> multiscale volume
-│   ├── roi.py       # extract_roi: crop / pad (-> multiscale)
+│   ├── convert.py   # any source backend -> multiscale volume, whole or cropped
+│   ├── roi.py       # extract_roi: convert + the crop-AND-PAD policy
 │   ├── create.py    # create_volume: an EMPTY volume (zarr3 or precomputed), specced
 │   │                #   by hand or `like=` a reference (§10) — no source, no data
 │   └── write.py     # write_subvolume: one piece into one level, at a voxel offset
@@ -333,15 +333,29 @@ em_volume_tools/                # volume/EM-specific
 └── configs/         # dask config templates (local / slurm-gen / slurm-any)
 
 em_volume_tools/cli.py          # the `em-vol` command:
-                                #   info / convert / downsample / progress / create / write
+                                #   info / convert / copy / downsample / progress /
+                                #   create / write / bboxes-json / relabel / ng-url-gen
 ```
+
+`convert` and `copy` are one implementation under two defaulting policies (`cli.
+_add_convert_args`): convert states the output it wants, copy takes the source's own
+format, chunking, voxel size and image/segmentation type and errors where the source
+records none. The policy is the whole subcommand — convert's `--kind image` default
+turns a segmentation copy into averaged label ids with nothing raised, which is not a
+documentation problem.
+
+Cropping lives in `convert`, not beside it, because it has to wrap the **resolved**
+`data_spec` — the one detection chose, `.gz` reader included (§ invariant 9) — and
+because the offset shift that keeps the output in the source's frame needs the source's
+own offset, which only the metadata resolution has. `roi.py` is what is left of
+`extract_roi` once that moves: the crop-and-pad policy, and nothing else.
 
 ---
 
 ## 10. Create-then-write: several small pieces into one frame
 
 `ingest`/`convert`/`extract_roi` all have the same shape — *one* source, materialized
-wholesale, block-mapped over dask. The other real workflow does not fit that: a
+wholesale (or to one box) and block-mapped over dask. The other real workflow does not fit that: a
 handful of small subvolumes (image stacks, HDF5 files) that belong at known positions
 inside one larger volume, arriving at different times. Forcing it through `convert`
 would mean one volume per piece, or a source backend that stitches them, and neither

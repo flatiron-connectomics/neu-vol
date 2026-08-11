@@ -1,10 +1,19 @@
 """Extract / crop / pad a region of interest into a new multiscale volume.
 
-Wraps the source in a read-only crop view (backends/view.py) and runs the shared
-materialize engine, so the ROI output is chunked, optionally multiscale, and in
-either zarr v3 or precomputed — just like ``convert``. The crop origin shifts the
-physical offset accordingly. ``start``/``stop`` are spatial ``(z, y, x)``; a
-leading channel axis is preserved in full.
+A thin wrapper over :func:`~em_volume_tools.convert`, which owns the crop (it wraps
+the source in the read-only crop view from ``backends/view.py`` and runs the shared
+materialize engine). What this adds is the crop-*and*-pad contract: ``start`` may be
+negative and ``stop`` may exceed the source extent, and the out-of-bounds margin is
+filled with ``pad_value`` rather than trimmed away.
+
+It used to resolve the source itself, and that was the weaker of two paths — it never
+called ``read_source_metadata``, so it demanded an explicit ``voxel_size``, defaulted
+the offset to zero instead of the source's, and addressed the source by a hand-built
+``{"backend": ..., "path": ...}`` spec, which cannot open an OME-NGFF *group* and
+contradicts detection for CloudVolume-style ``.gz`` precomputed (invariant 9).
+Delegating fixes all of that; the one visible change is that a source carrying an
+offset now contributes it, so the ROI lands in the source's frame rather than
+``start * voxel_size`` from the origin.
 """
 
 from __future__ import annotations
@@ -12,8 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Sequence
 
-from ..backends.base import open_backend
-from ._multiscale import materialize_multiscale
+from .convert import convert
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +31,12 @@ def extract_roi(
     dst: str,
     start: Sequence[int],
     stop: Sequence[int],
-    voxel_size: Sequence[float],
+    voxel_size: Sequence[float] | None = None,
     *,
     src_format: str | None = None,
     pad_value: float = 0,
-    units: str = "nm",
-    axes: Sequence[str] = ("z", "y", "x"),
+    units: str | None = None,
+    axes: Sequence[str] | None = None,
     offset: Sequence[float] | None = None,
     has_channels: bool | None = None,
     profile: str = "local",
@@ -54,54 +62,23 @@ def extract_roi(
     """Extract ``src[start:stop]`` (spatial) into a new volume at ``dst``.
 
     ``start`` may be negative and ``stop`` may exceed the source extent; the
-    out-of-bounds margin is filled with ``pad_value`` (crop *and* pad in one).
+    out-of-bounds margin is filled with ``pad_value`` (crop *and* pad in one). To
+    trim to the volume instead — the right default when copying real data — call
+    ``convert(..., crop_start=, crop_stop=)``, which clips.
+
+    ``voxel_size``/``units``/``axes``/``offset`` are read from the source when it
+    carries them and only need passing for a source that does not (bare arrays, HDF5,
+    image stacks) or to override what it says.
     """
-    if isinstance(src, dict):
-        src_spec = dict(src)
-    else:
-        from ..source_metadata import detect_backend
-        fmt = src_format or detect_backend(src)
-        if fmt is None:
-            raise ValueError(f"could not detect source format at {src!r}; pass src_format=")
-        src_spec = {"backend": fmt, "path": src}
-    src_backend = open_backend(src_spec)
-    src_shape = src_backend.shape
-    n_spatial = len(axes)
-
-    if has_channels is None:
-        has_channels = len(src_shape) == n_spatial + 1
-    if len(start) != n_spatial or len(stop) != n_spatial:
-        raise ValueError(f"start/stop must have {n_spatial} spatial entries")
-
-    # Full-ndim origin/shape for the crop view (channel axis taken in full).
-    if has_channels:
-        num_channels = int(src_shape[0])
-        origin = (0,) + tuple(int(s) for s in start)
-        out_shape = (num_channels,) + tuple(int(b - a) for a, b in zip(start, stop))
-    else:
-        num_channels = 1
-        origin = tuple(int(s) for s in start)
-        out_shape = tuple(int(b - a) for a, b in zip(start, stop))
-    if any(s <= 0 for s in out_shape):
-        raise ValueError(f"empty ROI: start={tuple(start)} stop={tuple(stop)}")
-
-    crop_spec = {"backend": "crop", "source": src_spec, "origin": list(origin),
-                 "shape": list(out_shape), "pad_value": pad_value}
-
-    # Physical offset of the ROI origin = base offset + start * voxel_size.
-    base_offset = tuple(offset) if offset else (0.0,) * n_spatial
-    roi_offset = tuple(o + a * v for o, a, v in zip(base_offset, start, voxel_size))
-    logger.info("extract_roi %s [%s:%s] -> %s (shape=%s)", src_spec, tuple(start), tuple(stop), dst, out_shape)
-
-    return materialize_multiscale(
-        src_spec=crop_spec, src_shape=out_shape, src_dtype=str(src_backend.dtype),
-        dst=dst, profile=profile, voxel_size=tuple(voxel_size), offset=roi_offset,
-        units=units, spatial_axes=tuple(axes), has_channels=has_channels,
-        num_channels=num_channels, dtype=dtype, kind=kind, encoding=encoding,
-        compressed_segmentation_block_size=tuple(compressed_segmentation_block_size),
-        multiscale=multiscale,
-        factors=factors, max_levels=max_levels, min_dim=min_dim, name=name,
-        chunk=chunk, shard=shard, client=client, npartitions=npartitions,
+    return convert(
+        src, dst, voxel_size=voxel_size, src_format=src_format, units=units,
+        axes=axes, offset=offset, has_channels=has_channels,
+        crop_start=start, crop_stop=stop, pad_value=pad_value, clip_crop=False,
+        profile=profile, chunk=chunk, shard=shard, dtype=dtype, kind=kind,
+        encoding=encoding,
+        compressed_segmentation_block_size=compressed_segmentation_block_size,
+        multiscale=multiscale, factors=factors, max_levels=max_levels,
+        min_dim=min_dim, name=name, client=client, npartitions=npartitions,
         delete_existing=delete_existing, resume=resume, verify=verify,
         progress_path=progress_path, validate=validate,
     )
