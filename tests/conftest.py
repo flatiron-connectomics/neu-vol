@@ -20,9 +20,29 @@ Escape hatches, in the order they win: an explicit `--basetemp` (pytest ignores 
 temproot entirely), an inherited `PYTEST_DEBUG_TEMPROOT`, and `EM_TESTS_TMPFS=0` to
 force the platform default.
 
-Duplicated verbatim in all three em-* repos, which are separate git repos and must
-stay independently testable — a shared copy would mean a test-time import across the
-layering. Keep the copies in step.
+The *code* below is duplicated in all three em-* repos, which are separate git repos and
+must stay independently testable — a shared copy would mean a test-time import across the
+layering. Keep the copies in step. The parallelism note that follows is specific to this
+suite, and is the only part that differs between them.
+
+## Running this suite in parallel
+
+`pytest-xdist` is in the `dev` extra and roughly halves this suite, but it is opt-in
+and deliberately **not** in `addopts`, so CI, the `em-vol-cv` environment, and anyone
+without it installed are all unaffected:
+
+    python -m pytest -q -n 4 --dist worksteal        # 21 s -> 10 s
+
+**Use a small explicit number; `-n auto` is actively wrong here.** Each worker re-pays
+a ~2 s import (dask, tensorstore, zarr) and tensorstore starts its own thread pools per
+process, so on a 32-core workstation `-n auto` picks 32 and lands at 20 s — no better
+than serial. Measured: serial 21 s, `-n 2` 13 s, **`-n 3` / `-n 4` 10 s**, `-n 6` 11 s,
+`-n 8` 13 s, `-n 16` 20 s, `-n auto` 20 s.
+
+Do **not** bother for the sibling repos, both measured: em-blockrun is 4x *slower* under
+xdist (a 1 s suite, so worker startup is all of it), and em-seg-morpho does not improve
+at any worker count because its real meshing/skeletonization already saturates ~2 cores
+through threaded libraries — more processes only oversubscribe.
 """
 
 import os

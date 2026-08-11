@@ -39,7 +39,7 @@ import os
 import sys
 from datetime import datetime
 
-from em_blockrun import bundled_configs, start_dask
+from em_blockrun import bundled_configs
 
 log = logging.getLogger("em-vol")
 
@@ -987,6 +987,10 @@ def _maybe_cluster(args):
     if getattr(args, "serial", False) or not args.workers:
         log.info("serial mode: no dask client")
         return contextlib.nullcontext(None)
+    # Imported here, not at module scope: it pulls in dask.distributed (~1 s), and the
+    # read-only subcommands that never reach this line should not pay for it.
+    from em_blockrun import start_dask
+
     return start_dask(args.workers, _configs(args), label="em-vol")
 
 

@@ -30,7 +30,10 @@ dependencies = [
 em-vol = "em_volume_tools.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest"]
+# pytest-xdist is opt-in and never in addopts: it pays off for THIS suite only, and
+# only at a small worker count. See tests/conftest.py for the measured numbers and
+# why `-n auto` is the wrong answer here.
+dev = ["pytest", "pytest-xdist"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["em_volume_tools"]

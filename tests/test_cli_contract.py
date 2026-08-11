@@ -48,15 +48,30 @@ def test_parse_args_still_goes_through_build_parser():
 
 
 def test_importing_the_cli_needs_no_conda_only_package():
-    """Run in a subprocess: this test session has already imported half of them."""
+    """Run in a subprocess: this test session has already imported half of them.
+
+    Checks two separate things in the one subprocess, because spawning a second
+    interpreter costs more than either assertion: nothing conda-only is reachable, and
+    dask is not imported either. The latter is a startup-latency contract, not a
+    packaging one — see em-blockrun's test_lazy_dask.
+    """
+    probe = CONDA_ONLY + ["dask", "distributed"]
     code = (
         "import sys; import em_volume_tools.cli; "
-        f"print(','.join(m for m in {CONDA_ONLY!r} "
+        f"print(','.join(m for m in {probe!r} "
         "if any(k == m or k.startswith(m + '.') for k in sys.modules)))"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          check=True).stdout.strip()
-    assert out == "", (
-        f"importing em_volume_tools.cli now pulls in {out}. The docs build installs "
+    got = set(filter(None, out.split(",")))
+
+    conda = sorted(got & set(CONDA_ONLY))
+    assert not conda, (
+        f"importing em_volume_tools.cli now pulls in {conda}. The docs build installs "
         f"from PyPI only; these are conda-only or heavy, so this would break it. Defer "
         f"the import into the function that needs it.")
+    heavy = sorted(got & {"dask", "distributed"})
+    assert not heavy, (
+        f"importing em_volume_tools.cli now pulls in {heavy}, which is ~1 s added to "
+        f"every invocation — including `em-vol info`, which never builds a cluster. "
+        f"Import start_dask inside _client(), not at module scope.")
