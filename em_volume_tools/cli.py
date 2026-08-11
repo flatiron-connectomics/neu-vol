@@ -1315,10 +1315,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="number region k from N*k+1 instead of consecutively, so the "
                         "region a label came from is readable off the id. Refuses if a "
                         "region holds more than N labels")
-    q.add_argument("--map", default=None, metavar="PATH",
-                   help="where to write the old->new mapping (default: "
-                        "'<destination>.relabel-<level>.json' here). It is the only way "
-                        "back from a new id to the region and label it came from")
+    q.add_argument("--map", default=None, metavar="PATH_OR_URL",
+                   help="where to write the old->new mapping — a local path or an object "
+                        "store location (s3://...), so it can sit beside a remote volume "
+                        "(default: '<destination>.relabel-<level>.json' here). It is the "
+                        "only way back from a new id to the region and label it came from")
     q.add_argument("--overwrite", action="store_true",
                    help="allow --out to replace an existing volume")
     q.add_argument("--dry-run", action="store_true",

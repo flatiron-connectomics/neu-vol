@@ -33,7 +33,6 @@ single-scale like :mod:`em_volume_tools.ops.write` and for the same reason. Run
 from __future__ import annotations
 
 import itertools
-import json
 import math
 from typing import Any, Sequence
 
@@ -192,8 +191,11 @@ def apply_relabel(plan: dict, *, dry_run: bool = False, overwrite: bool = False,
         "dry_run": bool(dry_run),
     }
     if map_path and not dry_run:
-        with open(map_path, "w") as f:
-            json.dump(result, f, indent=1)
+        # Through `location`, not `open()`, so the mapping can be written beside a remote
+        # volume. It is the only route from a new id back to its region and original
+        # label, so "keep it with the volume" has to be possible when the volume is on
+        # an object store.
+        write_json(map_path, result, indent=1)
         result["map_path"] = map_path
     return result
 

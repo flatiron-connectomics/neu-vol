@@ -187,6 +187,21 @@ def test_the_mapping_is_reversible(tmp_path):
     assert len(all_new) == len(set(all_new))
 
 
+def test_the_map_goes_through_the_kvstore_not_open(tmp_path):
+    """So `--map s3://...` works, letting the mapping sit beside a remote volume.
+
+    Pinned with a path whose parents do not exist: the file driver creates them, while
+    `open()` raises. That is the same code path a remote destination takes, and the only
+    part of it a test can exercise without a bucket.
+    """
+    src = _volume(tmp_path, "v", _colliding())
+    path = str(tmp_path / "no" / "such" / "dir" / "m.json")
+    result = relabel(src, out=str(tmp_path / "o"), map_path=path)
+    assert result["map_path"] == path
+    with open(path) as f:
+        assert len(json.load(f)["regions"]) == 2
+
+
 def test_in_place_renumbers_the_volume_itself(tmp_path):
     src = _volume(tmp_path, "v", _colliding())
     before = _read(src)
