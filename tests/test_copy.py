@@ -211,7 +211,7 @@ def test_copy_needs_a_volume_that_describes_itself(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# --crop-scale: real per-level voxel sizes, never 2**N
+# --bbox-scale: real per-level voxel sizes, never 2**N
 # --------------------------------------------------------------------------- #
 def test_crop_scale_uses_the_real_per_level_voxel_sizes(tmp_path):
     """An anisotropic pyramid is where 2**N is wrong, and it is the common case.
@@ -232,21 +232,23 @@ def test_crop_scale_uses_the_real_per_level_voxel_sizes(tmp_path):
     assert cli._level0_factor(src, 1) == (1, 2, 2)
 
     args = cli._parse_args(["copy", "--src", src, "--dst", "/x",
-                            "--crop-bbox", "2,1,1,6,4,4", "--crop-scale", "1"])
+                            "--crop-bbox", "2,1,1,6,4,4", "--bbox-scale", "1"])
     assert cli._crop_bbox(args) == ((2, 2, 2), (6, 8, 8))
 
 
-def test_crop_scale_beyond_the_pyramid_is_an_error(tmp_path, labels):
+def test_bbox_scale_beyond_the_pyramid_is_an_error(tmp_path, labels):
     src = _precomputed_source(str(tmp_path / "src"), labels)
     args = cli._parse_args(["copy", "--src", src, "--dst", "/x",
-                            "--crop-bbox", "0,0,0,4,4,4", "--crop-scale", "5"])
+                            "--crop-bbox", "0,0,0,4,4,4", "--bbox-scale", "5"])
     with pytest.raises(SystemExit, match="records only 1 level"):
         cli._crop_bbox(args)
 
 
-def test_crop_scale_without_a_box_is_rejected():
-    with pytest.raises(SystemExit):
-        cli._parse_args(["copy", "--src", "a", "--dst", "b", "--crop-scale", "2"])
+def test_a_bbox_convention_with_no_box_is_rejected():
+    """Half a command line: the run would copy everything and look fine."""
+    for extra in (["--bbox-scale", "2"], ["--bbox-order", "xyz"]):
+        with pytest.raises(SystemExit):
+            cli._parse_args(["copy", "--src", "a", "--dst", "b", *extra])
 
 
 def test_an_unaligned_crop_origin_warns_about_the_coarse_levels(tmp_path, caplog):

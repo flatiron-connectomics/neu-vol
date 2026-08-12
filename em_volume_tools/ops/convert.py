@@ -78,6 +78,46 @@ def _resolve_crop(
     return spec, out_shape, start
 
 
+def _resolve_masks(
+    data_spec: dict,
+    src_shape: Sequence[int],
+    boxes: Sequence[Sequence[Sequence[int]]],
+    *,
+    value: float,
+    n_spatial: int,
+    has_channels: bool,
+) -> dict:
+    """A mask view over ``data_spec``, blanking each spatial ``(lo, hi)`` box.
+
+    Boxes are spatial ``(z, y, x)`` in the source's own level-0 voxels; a channel axis is
+    always masked in full, since "exclude this region" is not a per-channel statement.
+
+    **A box that misses the volume raises.** The caller asked for a region to be excluded;
+    copying everything instead is the one outcome that cannot be allowed to pass quietly,
+    and a box in the wrong axis order or the wrong scale looks exactly like this.
+    """
+    spatial = tuple(int(s) for s in (src_shape[1:] if has_channels else src_shape))
+    full = []
+    for lo, hi in boxes:
+        if len(lo) != n_spatial or len(hi) != n_spatial:
+            raise ValueError(f"mask box must have {n_spatial} spatial entries per corner, "
+                             f"got {tuple(lo)} / {tuple(hi)}")
+        lo = tuple(int(v) for v in lo)
+        hi = tuple(int(v) for v in hi)
+        if any(b <= a for a, b in zip(lo, hi)):
+            raise ValueError(f"empty mask box {lo}:{hi}")
+        if any(b <= 0 or a >= d for a, b, d in zip(lo, hi, spatial)):
+            raise ValueError(
+                f"mask box {lo}:{hi} does not intersect the volume (spatial shape "
+                f"{spatial}), so nothing would be excluded. Check the axis order (these "
+                f"are z,y,x) and the scale the box is in.")
+        if has_channels:
+            lo, hi = (0,) + lo, (int(src_shape[0]),) + hi
+        full.append([list(lo), list(hi)])
+    logger.info("masking %d region(s) with fill value %r", len(full), value)
+    return {"backend": "mask", "source": dict(data_spec), "boxes": full, "value": value}
+
+
 def convert(
     src: str | dict,
     dst: str,
@@ -92,6 +132,8 @@ def convert(
     crop_stop: Sequence[int] | None = None,
     pad_value: float = 0,
     clip_crop: bool = True,
+    mask_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
+    mask_value: float = 0,
     profile: str = "local",
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
@@ -120,6 +162,11 @@ def convert(
     taken from the source where available; ``voxel_size`` is required if the source
     carries none. With ``resume=True`` an interrupted run continues, skipping
     already-done blocks instead of recreating them.
+
+    ``mask_boxes`` is a list of spatial ``(lo, hi)`` pairs to *exclude*: everything else
+    is copied and those regions are written as ``mask_value``. Because the pyramid is
+    derived from the output's own level 0, the hole propagates to every level. A box that
+    does not intersect the volume raises rather than quietly copying everything.
 
     ``crop_start``/``crop_stop`` copy only ``src[crop_start:crop_stop]`` (spatial
     ``(z, y, x)`` voxels of the source's level 0, either bound optional). The output's
@@ -179,14 +226,21 @@ def convert(
         )
     num_channels = int(src_shape[0]) if has_channels else 1
 
-    # The crop wraps the *resolved* data_spec, so the cropped read goes through the
-    # reader detection chose rather than a hand-built one (invariant 9), and the offset
+    # The views wrap the *resolved* data_spec, so the read goes through the reader
+    # detection chose rather than a hand-built one (invariant 9), and the crop's offset
     # shift keeps the output in the source's frame (invariant 1).
+    #
+    # Mask first, crop over it: the mask's boxes are then in the source's own coordinates
+    # rather than the crop's, which is what a caller means by "exclude this region of the
+    # volume" and keeps the two arguments independent.
     read_spec, read_shape = data_spec, src_shape
     out_offset = tuple(offset) if offset else (0.0,) * n_spatial
+    if mask_boxes:
+        read_spec = _resolve_masks(read_spec, src_shape, mask_boxes, value=mask_value,
+                                   n_spatial=n_spatial, has_channels=has_channels)
     if crop_start is not None or crop_stop is not None:
         read_spec, read_shape, start = _resolve_crop(
-            data_spec, src_shape, start=crop_start, stop=crop_stop,
+            read_spec, src_shape, start=crop_start, stop=crop_stop,
             n_spatial=n_spatial, has_channels=has_channels, pad_value=pad_value,
             clip=clip_crop)
         out_offset = tuple(o + a * v for o, a, v in zip(out_offset, start, voxel_size))

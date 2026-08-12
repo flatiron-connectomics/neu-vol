@@ -49,15 +49,35 @@ def _spatial(shape: Sequence[int], has_channels: bool) -> tuple[int, ...]:
     return tuple(int(s) for s in (shape[1:] if has_channels else shape))
 
 
+#: Level cap when the pyramid is computed and the caller named none. Matches
+#: :func:`~em_volume_tools.pyramid.downsample_schedule`'s own default, and like it counts
+#: level 0. Distinct from ``None``, which means "no cap" and is what keeps a mirrored
+#: reference whole.
+DEFAULT_MAX_LEVELS = 8
+
+
 def _cum_factor(voxel: Sequence[float], voxel0: Sequence[float]) -> tuple[int, ...]:
     """Cumulative downsample factor of a level, from its voxel size relative to level 0."""
     return tuple(max(1, int(round(v / v0))) for v, v0 in zip(voxel, voxel0))
 
 
 def _mirror_levels(ref: dict, has_channels: bool, voxel_size: Sequence[float],
-                   limit: int | None) -> tuple[list[tuple[int, ...]], list[tuple[float, ...]]]:
-    """Level shapes and voxel sizes copied from a reference volume."""
-    indices = sorted(ref["levels"])[: limit or None]
+                   limit: int | None, max_levels: int | None = None
+                   ) -> tuple[list[tuple[int, ...]], list[tuple[float, ...]]]:
+    """Level shapes and voxel sizes copied from a reference volume.
+
+    ``limit`` (``--levels``) and ``max_levels`` both truncate, and truncating is the only
+    thing they may do here: taking fewer of the reference's levels keeps each one
+    verbatim, whereas recomputing a schedule that "should" match is how two volumes meant
+    to share a frame end up a voxel apart at level 3.
+
+    ``max_levels`` is ``None`` unless the caller said otherwise, and that matters — with a
+    default of 8 it would silently drop level 8 from every mirror of a 9-level reference.
+    ``min_dim`` is deliberately *not* applied for the same reason: its default of 128 would
+    quietly discard every level below 128 voxels that the reference has.
+    """
+    caps = [n for n in (limit, max_levels) if n]
+    indices = sorted(ref["levels"])[: min(caps) if caps else None]
     per_level = ref["level_voxel_sizes"]
     shapes = [_spatial(ref["levels"][i]["shape"], has_channels) for i in indices]
     voxels = []
@@ -158,7 +178,7 @@ def plan_volume(
     shard: Sequence[int] | None = None,
     levels: int | None = None,
     factors: Sequence[Sequence[int]] | None = None,
-    max_levels: int = 8,
+    max_levels: int | None = None,
     min_dim: int = 128,
     kind: str | None = None,
     name: str = "image",
@@ -231,10 +251,17 @@ def plan_volume(
     # to share a frame end up disagreeing by a voxel at level 3.
     mirrored = bool(ref) and shape is None and factors is None and bool(ref["levels"])
     if mirrored:
-        level_shapes, level_voxels = _mirror_levels(ref, has_channels, voxel_size, levels)
+        level_shapes, level_voxels = _mirror_levels(ref, has_channels, voxel_size,
+                                                    levels, max_levels)
+        dropped = len(ref["levels"]) - len(level_shapes)
+        if dropped:
+            logger.info("mirroring %d of %s's %d levels (%d dropped by --levels/"
+                        "--max-levels); each kept level is copied verbatim",
+                        len(level_shapes), like, len(ref["levels"]), dropped)
     else:
         level_shapes, level_voxels = _scheduled_levels(
-            spatial0, voxel_size, factors=factors, max_levels=max_levels,
+            spatial0, voxel_size, factors=factors,
+            max_levels=DEFAULT_MAX_LEVELS if max_levels is None else max_levels,
             min_dim=min_dim, limit=levels)
 
     plan_levels = []

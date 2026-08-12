@@ -68,8 +68,15 @@ convert("in.precomputed", "crop.precomputed", kind="segmentation",
 negative and `stop` may pass the extent, and the margin is filled with `pad_value`
 instead of trimmed. It delegates to `convert()`.
 
-On the command line, `em-vol convert --crop-bbox z0,y0,x0,z1,y1,x1` (optionally
-`--crop-scale N`, resolved through the source's own per-level voxel sizes) does this, and
+`mask_boxes` is the complement — copy everything *except* those boxes, writing
+`mask_value` inside them. It masks on the read side, so every pyramid level inherits the
+hole; a box that misses the volume raises rather than quietly copying everything. Note
+that an all-fill block is **elided rather than written**, so a mask cannot erase a region
+the destination already holds from an earlier run.
+
+On the command line, `em-vol convert --crop-bbox z0,y0,x0,z1,y1,x1` and
+`--mask-bbox` (repeatable) do this, with `--bbox-scale N` and `--bbox-order xyz` applying
+to every box the command takes, and
 **`em-vol copy` is the same command with the source's own parameters as the defaults** —
 format, chunking, voxel size and image/segmentation type all read from the source, with
 anything it does not record an error rather than a guess. That last part is why it exists:
@@ -154,13 +161,15 @@ em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted on
 em-vol progress <volume>                     # chunks written, per level
 em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
+em-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
 em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
 em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates
 em-vol relabel <volume> --out ...            # one id range per occupied region
 em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 ```
 
-`info`, `progress`, `bboxes-json`, `annotate-json` and `ng-url-gen` read only. `downsample` rebuilds a pyramid **in place** from a
+`info`, `progress`, `align-bbox`, `bboxes-json`, `annotate-json` and `ng-url-gen` read
+only. `downsample` rebuilds a pyramid **in place** from a
 level you trust — cascaded downsampling means a bad level poisons everything above it
 — and `--dry-run` prints the schedule beside what is on disk, refusing if they
 disagree rather than leaving the pyramid inconsistent. Use `convert` to build a *new*
@@ -195,6 +204,30 @@ schedule, so the two volumes cannot drift a voxel apart partway up the pyramid.
 `write` reports whether the region is aligned to the destination's chunk grid: an
 unaligned edge means those chunks are read-modify-written, which is correct on its
 own but loses one of two updates if overlapping writes ever run at once.
+
+### Putting a box on the grid
+
+`align-bbox` moves a bounding box onto a block grid and prints it back, ready to
+substitute into `--crop-bbox` or `--roi`:
+
+```bash
+em-vol align-bbox --volume V --bbox 5600,4470,6790,5770,4740,7050 --to both
+em-vol copy --src V --dst D --crop-bbox $(em-vol align-bbox --volume V --bbox ... -q)
+```
+
+**Which grid is the question**, and there are three: the **write unit** (the chunk, or the
+**shard** where the level is sharded — a partial write is a read-modify-write, and two
+concurrent ones into a single object lose an update silently); the **pyramid's cumulative
+factor** (a crop that misses it has coarse levels on their own grid, level 0 still exact);
+and the **per-axis LCM** of the two, which is what a cropped copy wants. `--to read-chunk`
+asks the fourth question — read amplification — which is not a safety one.
+
+Modes: `outer` (cover; cannot fail), `inner` (be covered), `nearest`, and `origin`, which
+aligns the origin and keeps the extent exactly for a fixed-size crop. `--block z,y,x`
+needs no volume; `--scale N` takes the box in another level's voxels via the real per-level
+voxel sizes. Boxes are half-open, so a bound already on a boundary stays put, and a bound
+at the volume's own extent counts as aligned — that final block is partial in the volume
+too. `em-vol write` reports alignment through the same predicate, so the two agree.
 
 ### Finding the data in a sparse volume
 

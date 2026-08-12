@@ -399,3 +399,67 @@ def test_plan_writes_nothing(tmp_path):
     plan = plan_volume(out, like=_reference(tmp_path))
     assert plan["num_levels"] == 3
     assert not os.path.exists(out)
+
+
+# --------------------------------------------------------------------------- #
+# how many levels: --levels and --max-levels, mirrored and computed
+# --------------------------------------------------------------------------- #
+def test_max_levels_truncates_a_mirrored_pyramid(tmp_path):
+    """It used to be ignored entirely when mirroring, with no message.
+
+    Truncating is the only thing it may do here: the kept levels stay verbatim, because
+    recomputing a schedule that "should" match is how two volumes meant to share a frame
+    end up a voxel apart.
+    """
+    ref = _reference(tmp_path)                                    # 32^3, 3 levels
+    full = plan_volume(str(tmp_path / "a.zarr"), like=ref)
+    assert full["num_levels"] == 3
+
+    capped = plan_volume(str(tmp_path / "b.zarr"), like=ref, max_levels=2)
+    assert capped["num_levels"] == 2
+    assert [lv["shape"] for lv in capped["levels"]] == \
+        [lv["shape"] for lv in full["levels"][:2]], "the kept levels are still verbatim"
+    assert [lv["voxel_size"] for lv in capped["levels"]] == \
+        [lv["voxel_size"] for lv in full["levels"][:2]]
+
+
+def test_mirroring_keeps_every_level_when_no_cap_is_asked_for(tmp_path):
+    """The guard on the fix above: max_levels must default to *no cap* when mirroring.
+
+    The reference needs MORE levels than the ordinary default of 8, or a default cap
+    would pass this unnoticed — so it is 2048^3, built empty by `create_volume` rather
+    than converted. An empty volume of that size is a handful of metadata documents;
+    converting one would be 32,768 blocks.
+    """
+    ref = str(tmp_path / "big.zarr")
+    create_volume(ref, shape=(2048, 2048, 2048), voxel_size=(8, 8, 8), dtype="uint8",
+                  min_dim=8, max_levels=9)
+    assert len(describe(ref)["levels"]) == 9, "levels 0-8, one more than the old default"
+    assert plan_volume(str(tmp_path / "m.zarr"), like=ref)["num_levels"] == 9
+
+
+def test_min_dim_does_not_prune_a_mirrored_pyramid(tmp_path):
+    """Its default of 128 would otherwise discard every small level a reference has.
+
+    The reference here is 32^3, so *every* level is below the default min_dim; mirroring
+    must still reproduce all of them.
+    """
+    ref = _reference(tmp_path)
+    plan = plan_volume(str(tmp_path / "s.zarr"), like=ref)      # min_dim defaults to 128
+    assert plan["num_levels"] == len(describe(ref)["levels"]) == 3
+
+
+def test_levels_and_max_levels_together_take_the_smaller(tmp_path):
+    ref = _reference(tmp_path)
+    assert plan_volume(str(tmp_path / "c.zarr"), like=ref,
+                       levels=3, max_levels=2)["num_levels"] == 2
+    assert plan_volume(str(tmp_path / "d.zarr"), like=ref,
+                       levels=1, max_levels=3)["num_levels"] == 1
+
+
+def test_max_levels_counts_level_zero_when_the_pyramid_is_computed(tmp_path):
+    for n in (1, 2, 4):
+        plan = plan_volume(str(tmp_path / f"e{n}.zarr"), shape=(512, 512, 512),
+                           voxel_size=(8, 8, 8), dtype="uint8", min_dim=1,
+                           max_levels=n)
+        assert plan["num_levels"] == n

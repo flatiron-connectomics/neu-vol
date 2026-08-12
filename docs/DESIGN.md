@@ -190,7 +190,10 @@ below `k` are never opened for writing.
   and lets the seed's shape be checked against what the schedule predicts.
 - **`min_dim` / `max_levels` / `factors` must match the original conversion**, or
   the two disagree on level count. `--dry-run` prints the computed schedule beside
-  the levels on disk, which is how you check.
+  the levels on disk, which is how you check. Note `max_levels` counts levels
+  **including level 0** — it bounds the schedule at `max_levels - 1`, since the schedule
+  covers levels 1..L. It formerly bounded the list itself and so allowed one level more
+  than it named; a volume built before that fix needs one higher a value here.
 - The seed goes through a separate `open_level` callback that only ever opens.
   Routing it through `create_level` would let `resume=False` recreate the very
   level being rebuilt from, destroying the input.
@@ -313,6 +316,8 @@ em_volume_tools/                # volume/EM-specific
 │   ├── hdf5.py         # h5py (read)
 │   ├── view.py         # CropBackend: read-only crop/pad view over a source
 │   └── (zarr2 read via the tensorstore driver)
+├── grid.py          # align a box to a block grid (outer/inner/nearest/origin), and
+│                    #   the one alignment predicate `write` and `align-bbox` share
 ├── pyramid.py       # downsample schedule + type-aware reducers + OME transforms
 ├── profiles.py      # storage target profiles (§5) + create-spec builders
 ├── ngff.py          # OME-NGFF 0.5 group metadata (build/validate/write)
@@ -320,6 +325,7 @@ em_volume_tools/                # volume/EM-specific
 │   ├── _multiscale.py  # shared copy+pyramid loop; zarr3 & precomputed targets
 │   ├── ingest.py    # image stack -> multiscale volume
 │   ├── convert.py   # any source backend -> multiscale volume, whole or cropped
+│   │                #   (crop view + mask view, both from backends/view.py)
 │   ├── roi.py       # extract_roi: convert + the crop-AND-PAD policy
 │   ├── create.py    # create_volume: an EMPTY volume (zarr3 or precomputed), specced
 │   │                #   by hand or `like=` a reference (§10) — no source, no data
@@ -340,8 +346,18 @@ em_volume_tools/                # volume/EM-specific
 
 em_volume_tools/cli.py          # the `em-vol` command:
                                 #   info / convert / copy / downsample / progress /
-                                #   create / write / bboxes-json / relabel / ng-url-gen
+                                #   create / write / align-bbox / bboxes-json /
+                                #   annotate-json / relabel / ng-url-gen
 ```
+
+**There are three block grids, and they answer different questions** — `grid.py` does the
+arithmetic, the CLI resolves which grid: the **write unit** (chunk, or shard when the
+level is sharded) governs whether a write is a read-modify-write; the **pyramid's
+cumulative factor** governs whether a crop's coarse levels land on the source's grid; and
+the **per-axis LCM of a source and destination chunking** governs how many times a source
+chunk is re-fetched (§ invariant 10, `plan_task_shape`). Aligning to the wrong one is
+alignment that buys nothing — most sharply on a sharded level, where the inner read chunk
+offers no protection against a partial-shard update.
 
 `convert` and `copy` are one implementation under two defaulting policies (`cli.
 _add_convert_args`): convert states the output it wants, copy takes the source's own

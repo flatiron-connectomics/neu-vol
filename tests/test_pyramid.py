@@ -65,6 +65,31 @@ def test_downsample_schedule_explicit_factors_passthrough():
     assert sched == [(2, 2, 2), (1, 2, 2)]
 
 
+def test_max_levels_counts_level_zero():
+    """``max_levels=N`` permits N levels, so at most N-1 downsample steps.
+
+    It used to bound the schedule itself, which made the flag named "max levels" allow
+    one more level than it said — `--max-levels 8` produced 9 — so at the default it read
+    as a no-op. The volume here is large enough that only max_levels can stop it.
+    """
+    for n in (1, 2, 5, 8):
+        sched = downsample_schedule((4096, 4096, 4096), (8, 8, 8), min_dim=1,
+                                    max_levels=n)
+        assert len(sched) == n - 1, f"max_levels={n} should permit {n} levels"
+
+
+def test_max_levels_below_one_is_refused():
+    """Zero levels is not a volume, and negative silently produced an empty pyramid."""
+    with pytest.raises(ValueError, match="at least 1"):
+        downsample_schedule((64, 64, 64), (8, 8, 8), max_levels=0)
+
+
+def test_max_levels_does_not_apply_to_an_explicit_schedule():
+    sched = downsample_schedule((64, 64, 64), (8, 8, 8), max_levels=2,
+                                factors=[(2, 2, 2), (2, 2, 2), (2, 2, 2)])
+    assert len(sched) == 3, "explicit factors are used verbatim"
+
+
 def test_cumulative_factors():
     cum = cumulative_factors([(2, 2, 2), (2, 2, 1)], ndim=3)
     assert cum == [(1, 1, 1), (2, 2, 2), (4, 4, 2)]

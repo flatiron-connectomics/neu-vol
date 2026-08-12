@@ -44,18 +44,29 @@ def downsample_schedule(
 ) -> list[tuple[int, ...]]:
     """Return per-level relative downsample factors for levels 1..L (level 0 excluded).
 
-    If ``factors`` is given it is used verbatim. Otherwise factors are derived
-    with :func:`auto_factor`, stopping when the volume's largest spatial
-    dimension is <= ``min_dim``, when no axis can be coarsened, or at
-    ``max_levels``.
+    If ``factors`` is given it is used verbatim — ``max_levels`` and ``min_dim`` do not
+    apply to an explicit schedule. Otherwise factors are derived with
+    :func:`auto_factor`, stopping when the volume's largest spatial dimension is <=
+    ``min_dim``, when no axis can be coarsened, or at ``max_levels``.
+
+    **``max_levels`` counts LEVELS, including level 0**, so it bounds the returned list
+    at ``max_levels - 1``: ``max_levels=8`` gives levels 0..7, and ``max_levels=1`` a
+    single-scale volume. It used to bound the list itself, which meant the flag named
+    "max levels" permitted one more level than it said — ``--max-levels 8`` produced 9
+    — and so read as a no-op at the default. Anything comparing a schedule against a
+    pyramid already on disk (``em-vol downsample``) needs the number that built it,
+    which is now one higher than the value that was passed then.
     """
     if factors is not None:
         return [tuple(int(x) for x in f) for f in factors]
+    if max_levels < 1:
+        raise ValueError(f"max_levels counts level 0, so it must be at least 1, "
+                         f"got {max_levels}")
 
     schedule: list[tuple[int, ...]] = []
     cur_shape = tuple(int(s) for s in shape)
     cur_vox = tuple(float(v) for v in voxel_size)
-    while len(schedule) < max_levels:
+    while len(schedule) < max_levels - 1:
         if max(cur_shape) <= min_dim:
             break
         f = auto_factor(cur_vox, isotropy_threshold=isotropy_threshold)

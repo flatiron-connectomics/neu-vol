@@ -173,14 +173,15 @@ def _tiles(start: Sequence[int], stop: Sequence[int], unit: Sequence[int]) -> li
 def _misaligned_axes(start, stop, shape, chunk) -> list[int]:
     """Axes where the region's edges fall inside a destination chunk.
 
-    An edge that coincides with the end of the volume is aligned by definition —
-    there is no neighbouring data in that chunk to read-modify-write against.
+    Delegates to :func:`em_volume_tools.grid.misaligned_axes`, which `em-vol align-bbox`
+    also uses — the volume-end exemption (an edge at the end of the volume is aligned by
+    definition, since there is no neighbouring data in that partial chunk to
+    read-modify-write against) has to be one rule, or the two commands will eventually
+    disagree about the same box.
     """
-    bad = []
-    for axis, (a, b, s, c) in enumerate(zip(start, stop, shape, chunk)):
-        if a % c or (b % c and b != s):
-            bad.append(axis)
-    return bad
+    from ..grid import misaligned_axes
+
+    return misaligned_axes(start, stop, chunk, extent=shape)
 
 
 def plan_subvolume_write(

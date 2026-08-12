@@ -11,6 +11,7 @@ continues where it stopped rather than starting over.
     em-vol progress <volume>                     # chunks written, per level
     em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
     em-vol write   <volume> --src ... --offset   # put one subvolume into it
+    em-vol align-bbox --volume ... --bbox ...     # move a box onto the block grid
     em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
     em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates
     em-vol relabel <volume> --out ...            # one id range per occupied region
@@ -98,21 +99,41 @@ def _add_convert_args(p, *, source_defaults: bool):
                    help="z,y,x shard (zarr only)" + from_source)
     p.add_argument("--crop-bbox", default=None, metavar="Z0,Y0,X0,Z1,Y1,X1",
                    help="copy only this box instead of the whole volume, in voxels at "
-                        "--crop-scale. Half-open, clipped to the volume. The output "
+                        "--bbox-scale. Half-open, clipped to the volume. The output "
                         "keeps the source's frame — its physical offset shifts by the "
                         "crop origin — so the two overlay in a viewer")
-    p.add_argument("--crop-scale", type=int, default=0, metavar="N",
-                   help="the scale --crop-bbox is given in (default: 0, level-0 "
+    p.add_argument("--mask-bbox", action="append", default=None,
+                   metavar="Z0,Y0,X0,Z1,Y1,X1",
+                   help="EXCLUDE this box: copy everything else, and write --mask-value "
+                        "inside it. Repeatable. The hole is inherited by every pyramid "
+                        "level, since each is derived from the one below. Coordinates "
+                        "are the SOURCE's, so a mask means the same box whether or not "
+                        "--crop-bbox is also given. A box that misses the volume is an "
+                        "error, not a no-op")
+    p.add_argument("--mask-value", type=float, default=0,
+                   help="what to write inside --mask-bbox (default: 0, which is "
+                        "background for a segmentation and is elided rather than stored)")
+    p.add_argument("--bbox-scale", type=int, default=0, metavar="N",
+                   help="the scale EVERY bbox argument is given in (default: 0, level-0 "
                         "voxels). Converted using the source's own per-level voxel "
                         "sizes, never an assumed 2**N, since real pyramids are "
                         "anisotropic. The same six values name a different box at "
                         "every scale, so check the resolved level-0 box that is logged")
+    p.add_argument("--bbox-order", choices=("zyx", "xyz"), default="zyx",
+                   help="the axis order of EVERY bbox argument (default: zyx, as "
+                        "everywhere else here). Pass xyz for numbers copied straight out "
+                        "of neuroglancer, which displays xyz; each corner is reversed, "
+                        "and the resolved zyx box is logged")
     p.add_argument("--profile", default=None,
                    help="storage profile name (default: chosen from --format and "
                         "whether --dst is remote)")
     p.add_argument("--factors", default=None,
-                   help="explicit per-level factors, e.g. '1,2,2;1,2,2' (default auto)")
-    p.add_argument("--max-levels", type=int, default=8)
+                   help="explicit per-level factors, e.g. '1,2,2;1,2,2' (default auto). "
+                        "An explicit schedule is used verbatim: --max-levels and "
+                        "--min-dim do not apply to it")
+    p.add_argument("--max-levels", type=int, default=8,
+                   help="at most this many levels, COUNTING LEVEL 0 (default: 8, i.e. "
+                        "levels 0-7). Usually --min-dim stops the pyramid first")
     p.add_argument("--min-dim", type=int, default=128,
                    help="stop when the largest spatial dim is <= this")
     p.add_argument("--single-level", action="store_true",
@@ -144,13 +165,21 @@ def _ftriple(value, name):
     return parts
 
 
-def _sextuple(value, name):
-    """'z0,y0,x0,z1,y1,x1' -> two 3-tuples of ints (start, stop)."""
+def _sextuple(value, name, order="zyx"):
+    """'z0,y0,x0,z1,y1,x1' -> two 3-tuples of ints (start, stop), always zyx.
+
+    ``order="xyz"`` reverses **each corner**, not the six values: the input is then
+    ``x0,y0,z0,x1,y1,z1``, which is the order neuroglancer displays and therefore the
+    order a box gets copied out of a viewer in.
+    """
     parts = tuple(int(v) for v in value.split(","))
     if len(parts) != 6:
         raise SystemExit(f"--{name} needs 6 comma-separated values "
-                         f"(z0,y0,x0,z1,y1,x1), got {value!r}")
+                         f"({','.join(order[i] + d for d in '01' for i in range(3))}), "
+                         f"got {value!r}")
     start, stop = parts[:3], parts[3:]
+    if order == "xyz":
+        start, stop = start[::-1], stop[::-1]
     if any(b <= a for a, b in zip(start, stop)):
         raise SystemExit(f"--{name} is empty or inverted: every start must be below its "
                          f"stop, got start={start} stop={stop}")
@@ -267,22 +296,22 @@ def _level0_factor(src: str, scale: int, per_level=None) -> tuple[int, ...]:
     if per_level is None:
         fmt = detect_backend(src)
         if fmt is None:
-            raise SystemExit(f"--crop-scale {scale} needs the source's per-level voxel "
+            raise SystemExit(f"--bbox-scale {scale} needs the source's per-level voxel "
                              f"sizes and nothing at {src} looks like a volume")
         per_level = read_level_voxel_sizes({"backend": fmt, "path": src})
     if not per_level:
-        raise SystemExit(f"--crop-scale {scale} needs the source's per-level voxel "
+        raise SystemExit(f"--bbox-scale {scale} needs the source's per-level voxel "
                          f"sizes, and {src} records none. Give --crop-bbox in level-0 "
-                         f"voxels instead (--crop-scale 0).")
+                         f"voxels instead (--bbox-scale 0).")
     if scale >= len(per_level):
-        raise SystemExit(f"--crop-scale {scale}: the source records only "
+        raise SystemExit(f"--bbox-scale {scale}: the source records only "
                          f"{len(per_level)} level(s) (0-{len(per_level) - 1})")
     factor = tuple(s / b for s, b in zip(per_level[scale], per_level[0]))
     if any(abs(f - round(f)) > 1e-6 for f in factor):
-        raise SystemExit(f"--crop-scale {scale}: its voxel size {per_level[scale]} is "
+        raise SystemExit(f"--bbox-scale {scale}: its voxel size {per_level[scale]} is "
                          f"not an integer multiple of level 0's {per_level[0]}, so a "
                          f"box there does not land on level-0 voxels. Use "
-                         f"--crop-scale 0.")
+                         f"--bbox-scale 0.")
     return tuple(int(round(f)) for f in factor)
 
 
@@ -296,19 +325,39 @@ def _src_voxel_size(src):
     return tuple(meta["voxel_size"]) if meta else None
 
 
+def _resolve_bbox(value, name, args, per_level=None):
+    """One ``--*-bbox`` value as ``(lo, hi)`` in level-0 zyx voxels.
+
+    Applies the command's two shared bbox conventions in order: ``--bbox-order``, then
+    ``--bbox-scale``. One flag each per command rather than per box argument, because a
+    crop at one scale and a mask at another is a mistake nobody makes on purpose — while
+    setting only one of two scale flags is a mistake anyone could make once, and it puts
+    the mask in the wrong place with nothing to show for it.
+    """
+    lo, hi = _sextuple(value, name, order=getattr(args, "bbox_order", "zyx"))
+    scale = getattr(args, "bbox_scale", 0) or 0
+    if scale:
+        factor = _level0_factor(args.src, scale, per_level)
+        lo = tuple(a * f for a, f in zip(lo, factor))
+        hi = tuple(b * f for b, f in zip(hi, factor))
+        log.info("--%s is in scale-%d voxels (%s level-0 voxels each): level-0 box "
+                 "%s:%s", name, scale, factor, lo, hi)
+    elif getattr(args, "bbox_order", "zyx") == "xyz":
+        log.info("--%s read as xyz: level-0 zyx box %s:%s", name, lo, hi)
+    return lo, hi
+
+
 def _crop_bbox(args, per_level=None):
     """``(start, stop)`` in level-0 voxels from ``--crop-bbox``, or ``(None, None)``."""
     if not getattr(args, "crop_bbox", None):
         return None, None
-    start, stop = _sextuple(args.crop_bbox, "crop-bbox")
-    scale = getattr(args, "crop_scale", 0) or 0
-    if scale:
-        factor = _level0_factor(args.src, scale, per_level)
-        start = tuple(a * f for a, f in zip(start, factor))
-        stop = tuple(b * f for b, f in zip(stop, factor))
-        log.info("--crop-bbox is in scale-%d voxels (%s level-0 voxels each): "
-                 "level-0 box %s:%s", scale, factor, start, stop)
-    return start, stop
+    return _resolve_bbox(args.crop_bbox, "crop-bbox", args, per_level)
+
+
+def _mask_bboxes(args, per_level=None):
+    """The ``--mask-bbox`` boxes as ``[(lo, hi), ...]`` in level-0 voxels."""
+    return [_resolve_bbox(v, "mask-bbox", args, per_level)
+            for v in (getattr(args, "mask_bbox", None) or [])]
 
 
 def _pyramid_levels(shape, voxel, args):
@@ -408,7 +457,29 @@ def _convert_targets(fmt, dst, profile_arg, chunk, shard):
     return targets
 
 
-def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop) -> int:
+def _warn_if_masking_a_destination_that_exists(args, dst, masks) -> None:
+    """The one way a mask leaks: a destination that already holds the region.
+
+    A block wholly inside the mask reads as all fill, and ``_copy_block`` returns "empty"
+    *without writing* — that elision is what keeps a sparse copy cheap (8,615 of 10,692
+    blocks on this dataset). So nothing clears an object already sitting at that key from
+    an earlier, unmasked run: the excluded region would survive in the new volume, and
+    every level above it, with the run reporting success.
+    """
+    from em_volume_tools.location import exists
+
+    if not masks or getattr(args, "fresh", False):
+        return
+    if any(exists(dst, marker) for marker in ("info", "zarr.json")):
+        log.warning(
+            "%s already exists and --mask-bbox was given without --fresh. Blocks wholly "
+            "inside a mask are written as fill, and an all-fill block is ELIDED rather "
+            "than written — so anything already stored in the masked region stays there, "
+            "in every level, and the run still reports success. Use --fresh (or delete "
+            "the destination) unless you are resuming a run that had the same mask.", dst)
+
+
+def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int:
     """The shared body of ``convert`` and ``copy``: block-map the copy per target."""
     from em_volume_tools import convert
 
@@ -417,12 +488,15 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop) -> int:
     crop_start, crop_stop = crop
     with _maybe_cluster(args) as client:
         for profile, target in _convert_targets(fmt, dst, args.profile, chunk, shard):
+            _warn_if_masking_a_destination_that_exists(args, target, masks)
             log.info("%s %s -> %s (%s)", args.command, args.src, target, kind)
             summary = convert(
                 args.src, target, voxel_size=voxel,
                 src_format=getattr(args, "src_format", None),
                 profile=profile, kind=kind, chunk=chunk,
                 crop_start=crop_start, crop_stop=crop_stop,
+                mask_boxes=[[lo, hi] for lo, hi in masks],
+                mask_value=args.mask_value,
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
                 client=client, resume=not args.fresh, delete_existing=args.fresh,
@@ -437,11 +511,13 @@ def cmd_convert(args) -> int:
     chunk = _triple(args.chunk, "chunk")
     voxel = _ftriple(args.voxel_size, "voxel-size")
     crop = _crop_bbox(args)
+    masks = _mask_bboxes(args)
     if crop[0] is not None:
         _warn_if_crop_unaligned(crop[0], tuple(b - a for a, b in zip(*crop)),
                                 voxel or _src_voxel_size(args.src), args)
     return _run_convert(args, fmt=args.format, voxel=voxel, chunk=chunk,
-                        shard=_triple(args.shard, "shard"), kind=args.kind, crop=crop)
+                        shard=_triple(args.shard, "shard"), kind=args.kind, crop=crop,
+                        masks=masks)
 
 
 def cmd_copy(args) -> int:
@@ -482,6 +558,7 @@ def cmd_copy(args) -> int:
     # shape and byte count are not what runs.
     spatial = tuple(d["shape"][1:] if d["has_channels"] else d["shape"])
     crop_start, crop_stop = _crop_bbox(args, d["level_voxel_sizes"])
+    masks = _mask_bboxes(args, d["level_voxel_sizes"])
     start = tuple(max(0, a) for a in crop_start) if crop_start else (0,) * len(spatial)
     stop = (tuple(min(b, s) for b, s in zip(crop_stop, spatial)) if crop_stop
             else spatial)
@@ -507,6 +584,12 @@ def cmd_copy(args) -> int:
     if crop_start or crop_stop:
         print("  crop        " + "  ".join(f"{ax} {a}:{b}"
                                            for ax, a, b in zip("zyx", start, stop)))
+    for i, (m_lo, m_hi) in enumerate(masks):
+        excluded = math.prod(b - a for a, b in zip(m_lo, m_hi))
+        print(f"  excluded    " + "  ".join(f"{ax} {a}:{b}" for ax, a, b
+                                            in zip("zyx", m_lo, m_hi))
+              + f"   = {excluded:,} voxels -> {args.mask_value:g}"
+              + (f"  [{i + 1} of {len(masks)}]" if len(masks) > 1 else ""))
     print(f"  copying     {tuple(out_shape)} = {_human_bytes(nbytes)} at level 0"
           f"{'' if (crop_start or crop_stop) else ' (the whole volume)'}")
     print(f"  levels      {len(levels)}"
@@ -521,7 +604,7 @@ def cmd_copy(args) -> int:
         print("--dry-run: nothing written")
         return 0
     return _run_convert(args, fmt=fmt, voxel=voxel, chunk=chunk, shard=shard,
-                        kind=kind, crop=(crop_start, crop_stop))
+                        kind=kind, crop=(crop_start, crop_stop), masks=masks)
 
 
 # --------------------------------------------------------------------------- #
@@ -1115,6 +1198,182 @@ def cmd_bboxes_json(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# align-bbox
+# --------------------------------------------------------------------------- #
+def _cumulative_factor(per_level, level: int, volume: str) -> tuple[int, ...]:
+    """How many level-0 voxels one voxel of ``level`` spans, per axis.
+
+    From the recorded per-level voxel sizes, never ``2**level`` (invariant 1). Shared by
+    both grid choices below, because both are questions about the same ratio: a chunk at
+    level N covers ``chunk * factor(N)`` level-0 voxels, and the pyramid's own grid *is*
+    the factor of its deepest level.
+    """
+    if not per_level:
+        raise SystemExit(f"{volume} records no per-level voxel sizes, so a level-{level} "
+                         f"grid cannot be expressed in level-0 voxels. Give the grid "
+                         f"directly with --block.")
+    if level >= len(per_level):
+        raise SystemExit(f"{volume} records {len(per_level)} level(s) "
+                         f"(0-{len(per_level) - 1}), so there is no level {level}")
+    factor = tuple(s / b for s, b in zip(per_level[level], per_level[0]))
+    if any(abs(f - round(f)) > 1e-6 for f in factor):
+        raise SystemExit(f"level {level} of {volume} has voxel size {per_level[level]}, "
+                         f"not an integer multiple of level 0's {per_level[0]}: its grid "
+                         f"does not land on level-0 voxels")
+    return tuple(int(round(f)) for f in factor)
+
+
+def _align_grid(args, d):
+    """``(block in level-0 voxels, where it came from)`` for ``--to`` / ``--block``."""
+    from em_volume_tools.grid import lcm_grid
+
+    if args.block:
+        return _triple(args.block, "block"), "--block"
+    per_level, levels = d["level_voxel_sizes"], d["levels"]
+
+    if args.level == 0 and not levels:
+        # A bare array reports no levels at all; its chunking is on the array itself.
+        read_chunk, write_unit = _level0_chunking(d, args.volume)
+        at = (1, 1, 1)
+    else:
+        if args.level not in levels:
+            raise SystemExit(f"{args.volume} has no level {args.level} "
+                             f"(present: {sorted(levels) or 'none'}). Give the grid "
+                             f"directly with --block.")
+        lvl = levels[args.level]
+        write_unit, read_chunk = lvl.get("chunks"), lvl.get("read_chunks")
+        # A level's own chunk is in ITS voxels; the box is in level-0 ones.
+        at = ((1, 1, 1) if args.level == 0
+              else _cumulative_factor(per_level, args.level, args.volume))
+
+    # The write unit is the SHARD where a level is sharded — that is the object a partial
+    # write rewrites. `read_chunks` is the inner chunk, which governs read amplification
+    # and offers no protection at all against a partial-shard update.
+    sharded = bool(read_chunk and write_unit and read_chunk != write_unit)
+
+    def scaled(block, what):
+        if not block:
+            raise SystemExit(f"level {args.level} of {args.volume} reports no {what}; "
+                             f"give the grid directly with --block")
+        return tuple(int(c) * f for c, f in zip(block, at)), (
+            f"level-{args.level} {what}"
+            + (f", x{at} to level-0 voxels" if any(f != 1 for f in at) else ""))
+
+    def pyramid_grid():
+        """The deepest level's cumulative factor — the grid every level shares."""
+        if not per_level or len(per_level) == 1:
+            return (1, 1, 1), "no pyramid: a single level constrains nothing"
+        deepest = len(per_level) - 1
+        return (_cumulative_factor(per_level, deepest, args.volume),
+                f"cumulative factor of level {deepest}, the deepest")
+
+    if args.to == "write-unit":
+        return scaled(write_unit, "shard" if sharded else "chunk")
+    if args.to == "read-chunk":
+        return scaled(read_chunk or write_unit, "read chunk")
+    if args.to == "pyramid":
+        return pyramid_grid()
+    unit, unit_from = scaled(write_unit, "shard" if sharded else "chunk")
+    deepest, _ = pyramid_grid()
+    return lcm_grid(unit, deepest), (f"LCM of the {unit_from} and the pyramid factor "
+                                     f"{deepest}")
+
+
+def _box_line(label: str, lo, hi) -> str:
+    """``label  z a:b  y a:b  x a:b   (extent) = N voxels``.
+
+    The voxel count is the number that says whether aligning outward matters: growing a
+    box by one block per axis is a small-looking change to three numbers and a large one
+    to the product.
+    """
+    extent = tuple(b - a for a, b in zip(lo, hi))
+    return (f"  {label:<12}" + "  ".join(f"{ax} {a}:{b}"
+                                        for ax, a, b in zip("zyx", lo, hi))
+            + f"   {extent} = {math.prod(extent):,} voxels")
+
+
+def cmd_align_bbox(args) -> int:
+    """Move a box onto a block grid, so the run that uses it does not straddle one.
+
+    Read-only and instant: it reads a volume's metadata for the grid and nothing else.
+    ``--quiet`` prints only the aligned box, which is what makes it composable —
+    ``--crop-bbox $(em-vol align-bbox ... -q)``.
+    """
+    from em_volume_tools.grid import align_box, clamp_box, misaligned_axes
+
+    if not (args.volume or args.block):
+        raise SystemExit("give --volume (to take the grid from it) or --block z,y,x")
+    boxes = [_sextuple(b, "bbox") for b in args.bbox]
+    d = _describe(args.volume) if args.volume else None
+    block, source = _align_grid(args, d)
+
+    extent = None
+    if d:
+        extent = tuple(d["shape"][1:] if d["has_channels"] else d["shape"])
+    factor = (_level0_factor(args.volume, args.scale) if args.scale else None)
+
+    out = sys.stdout if args.quiet else sys.stderr
+    if not args.quiet:
+        print(f"{args.volume or '(no volume)'}", file=out)
+        print(f"  grid        {'x'.join(str(b) for b in block)}  ({source})", file=out)
+        if extent:
+            print(f"  extent      {extent} (zyx, level-0 voxels)", file=out)
+        if factor:
+            print(f"  input scale {args.scale}: x{factor} to level-0 voxels", file=out)
+
+    for lo, hi in boxes:
+        if factor:
+            lo = tuple(a * f for a, f in zip(lo, factor))
+            hi = tuple(b * f for b, f in zip(hi, factor))
+        try:
+            a_lo, a_hi = align_box(lo, hi, block, args.mode)
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
+        clamped = False
+        if extent:
+            c_lo, c_hi = clamp_box(a_lo, a_hi, extent)
+            clamped = (c_lo, c_hi) != (a_lo, a_hi)
+            a_lo, a_hi = c_lo, c_hi
+            if any(b <= a for a, b in zip(a_lo, a_hi)):
+                raise SystemExit(f"the aligned box {a_lo}:{a_hi} does not intersect the "
+                                 f"volume (extent {extent})")
+        pasteable = ",".join(str(v) for v in (*a_lo, *a_hi))
+        if args.quiet:
+            print(pasteable)
+            continue
+
+        print("\n" + _box_line("requested", lo, hi), file=out)
+        print(_box_line("aligned", a_lo, a_hi), file=out)
+        grew = tuple((b - a) - (d_ - c) for a, b, c, d_ in zip(a_lo, a_hi, lo, hi))
+        moved = tuple(a - c for a, c in zip(a_lo, lo))
+        print(f"  change      mode {args.mode}; "
+              + ("already aligned" if not any(grew) and not any(moved) else
+                 f"extent {'+' if sum(grew) >= 0 else ''}{grew}, origin moved {moved}"),
+              file=out)
+        if clamped:
+            # Clamping can put the far edge back off the grid, and that edge is fine:
+            # the volume's own final block is partial there.
+            print(f"  clamped     to the volume's extent — an edge landing on it is "
+                  f"aligned by definition, since that block is partial in the volume "
+                  f"too", file=out)
+        left = misaligned_axes(a_lo, a_hi, block, extent=extent)
+        if left:
+            print(f"  NOTE        axis/axes {left} still off the grid"
+                  + (" — mode 'origin' preserves the extent, so only the origin is "
+                     "aligned" if args.mode == "origin" else ""), file=out)
+        if args.scale:
+            back = tuple(v / f for v, f in zip((*a_lo, *a_hi), (*factor, *factor)))
+            exact = all(abs(v - round(v)) < 1e-9 for v in back)
+            print(f"  at scale {args.scale}   "
+                  + (",".join(str(int(round(v))) for v in back) if exact else
+                     "not representable in whole scale-"
+                     f"{args.scale} voxels (the grid is finer than that scale)"),
+                  file=out)
+        print(f"  --crop-bbox {pasteable}", file=out)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # annotate-json
 # --------------------------------------------------------------------------- #
 #: ``--points FILE`` / ``--point z,y,x`` per kind. One flag per kind rather than
@@ -1529,7 +1788,10 @@ def build_parser() -> argparse.ArgumentParser:
                     "guess. Pass any of them to override.\n\n"
                     "--crop-bbox copies one box instead of the whole volume, and the "
                     "output keeps the source's coordinate frame (its physical offset "
-                    "shifts by the crop origin), so the two overlay in a viewer.\n\n"
+                    "shifts by the crop origin), so the two overlay in a viewer. "
+                    "--mask-bbox is the complement: copy everything EXCEPT a box, which "
+                    "is how you hold a region out of a copy. The two compose, and mask "
+                    "coordinates are always the source's.\n\n"
                     "The pyramid is REBUILT from the copied level 0, not copied: the "
                     "source's coarse levels are never read. For a crop that is what you "
                     "want — a slice of the source's coarse level is not the reduction of "
@@ -1557,7 +1819,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--kind", choices=("image", "segmentation"), default=None,
                    help="reducer (default: read from the volume)")
     q.add_argument("--min-dim", type=int, default=128)
-    q.add_argument("--max-levels", type=int, default=8)
+    q.add_argument("--max-levels", type=int, default=8,
+                   help="at most this many levels, COUNTING LEVEL 0 (default: 8). It "
+                        "must match what built the pyramid — --dry-run compares the "
+                        "schedule against the levels on disk and refuses if they "
+                        "disagree, rather than rebuilding a different pyramid")
     q.add_argument("--factors", default=None,
                    help="explicit per-level factors, e.g. '1,2,2;1,2,2'. MUST match "
                         "the original conversion, as must --min-dim/--max-levels")
@@ -1624,8 +1890,16 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--factors", default=None,
                    help="explicit per-level factors, e.g. '1,2,2;1,2,2'; forces the "
                         "pyramid to be computed rather than copied")
-    q.add_argument("--max-levels", type=int, default=8)
-    q.add_argument("--min-dim", type=int, default=128)
+    q.add_argument("--max-levels", type=int, default=None,
+                   help="at most this many levels, COUNTING LEVEL 0. Truncates a "
+                        "mirrored --like pyramid too (each kept level stays verbatim). "
+                        "Default: no cap when mirroring a reference, 8 when the pyramid "
+                        "is computed")
+    q.add_argument("--min-dim", type=int, default=128,
+                   help="stop when the largest spatial dim is <= this. Applies only when "
+                        "the pyramid is COMPUTED — a mirrored --like pyramid keeps every "
+                        "level the reference has, since dropping its small levels by "
+                        "default would silently break the shared frame")
     q.add_argument("--profile", default=None,
                    help="storage profile name, overriding --format and its chunk/"
                         "compressor defaults (local, ceph, local-neuroglancer, "
@@ -1771,6 +2045,67 @@ def build_parser() -> argparse.ArgumentParser:
                         "usable one the layer is unitless and will not line up")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_bboxes_json)
+
+    # --- align-bbox ---------------------------------------------------------
+    from em_volume_tools.grid import MODES
+
+    q = sub.add_parser(
+        "align-bbox", help="move a box onto a volume's block grid",
+        description="Align a bounding box to a block grid and print it back, ready to "
+                    "paste into --crop-bbox or --roi.\n\n"
+                    "WHICH GRID is the real question, and there are three, each with a "
+                    "different cost when a box straddles it:\n\n"
+                    "  write-unit  the chunk, or the SHARD where the level is sharded. "
+                    "A partial write is a read-modify-write: it keeps the object's "
+                    "existing data, but two concurrent partial writes into one object "
+                    "lose one of them, silently. Aligning to the inner chunk of a "
+                    "sharded level protects against nothing.\n"
+                    "  pyramid     the cumulative factor of the deepest level. A crop "
+                    "that misses it has coarse levels on their own grid, each level's "
+                    "voxel_offset rounding to it — level 0 stays exact, so nothing "
+                    "looks wrong.\n"
+                    "  both        the per-axis LCM of those two. What a cropped copy "
+                    "of a multiscale volume wants.\n"
+                    "  read-chunk  the inner chunk. Read amplification, not write "
+                    "safety.\n\n"
+                    "Boxes are half-open, so a bound already on a boundary stays put. "
+                    "Everything is per axis: real grids are anisotropic, and a level's "
+                    "chunk is converted to level-0 voxels through its own recorded "
+                    "voxel size, never an assumed 2**N.\n\n"
+                    "Reads a volume's metadata and nothing else. Writes nothing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("--bbox", action="append", required=True,
+                   metavar="Z0,Y0,X0,Z1,Y1,X1",
+                   help="the box to align, half-open, in voxels at --scale. Repeatable")
+    q.add_argument("--volume", default=None, metavar="PATH_OR_URL",
+                   help="take the grid and the extent from this volume. Required unless "
+                        "--block gives the grid outright")
+    q.add_argument("--block", default=None, metavar="Z,Y,X",
+                   help="align to this grid instead of one read from a volume, in "
+                        "level-0 voxels. Works with no --volume at all")
+    q.add_argument("--to", choices=("write-unit", "pyramid", "both", "read-chunk"),
+                   default="write-unit",
+                   help="which of the volume's grids to align to (default: write-unit). "
+                        "See above — they answer different questions")
+    q.add_argument("--level", type=int, default=0,
+                   help="take the chunk/shard from this level rather than 0. Its blocks "
+                        "are converted to level-0 voxels, so a 128-chunk at a level "
+                        "coarsened 4x is a 512-voxel grid (default: 0)")
+    q.add_argument("--mode", choices=MODES, default="outer",
+                   help="outer: grow to cover the box (never loses a voxel, cannot "
+                        "fail). inner: shrink to fit inside it. nearest: round both "
+                        "ends. origin: align the origin and keep the EXTENT exactly, "
+                        "for a fixed-size crop — its far edge then stays off the grid "
+                        "(default: outer)")
+    q.add_argument("--scale", type=int, default=0, metavar="N",
+                   help="the box is in scale-N voxels; convert to level 0 with the "
+                        "volume's real per-level voxel sizes. The aligned box is also "
+                        "reported back at scale N when it is exactly representable there")
+    q.add_argument("-q", "--quiet", action="store_true",
+                   help="print only the aligned box, one line per --bbox, so it can be "
+                        "substituted: --crop-bbox $(em-vol align-bbox ... -q)")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_align_bbox)
 
     # --- annotate-json ------------------------------------------------------
     q = sub.add_parser(
@@ -1957,10 +2292,13 @@ def _parse_args(argv=None):
         p.error("--src-format image_stack requires --voxel-size: image files record "
                 "no physical scale, so it cannot be read from the source "
                 "(e.g. --voxel-size 8,8,8 for 8 nm isotropic)")
-    # A scale with no box is the sign of a half-finished command line; saying so beats
-    # running the whole volume when a crop was meant.
-    if getattr(args, "crop_scale", 0) and not getattr(args, "crop_bbox", None):
-        p.error("--crop-scale has no effect without --crop-bbox")
+    # A bbox convention with no box to apply it to is the sign of a half-finished command
+    # line; saying so beats copying the whole volume when a crop or a mask was meant.
+    boxes = bool(getattr(args, "crop_bbox", None) or getattr(args, "mask_bbox", None))
+    if getattr(args, "bbox_scale", 0) and not boxes:
+        p.error("--bbox-scale has no effect without --crop-bbox or --mask-bbox")
+    if getattr(args, "bbox_order", "zyx") != "zyx" and not boxes:
+        p.error("--bbox-order has no effect without --crop-bbox or --mask-bbox")
     return args
 
 
