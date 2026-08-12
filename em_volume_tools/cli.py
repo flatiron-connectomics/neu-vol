@@ -113,6 +113,12 @@ def _add_convert_args(p, *, source_defaults: bool):
     p.add_argument("--mask-value", type=float, default=0,
                    help="what to write inside --mask-bbox (default: 0, which is "
                         "background for a segmentation and is elided rather than stored)")
+    p.add_argument("--background", default=None, metavar="V[,V...]",
+                   help="value(s) the SOURCE uses for background, replaced with 0 as it "
+                        "is read. Manual segmentation numbered from 0 makes background 1, "
+                        "and an all-background block of 1s is not all-fill, so without "
+                        "this every such block is stored and the volume stops answering "
+                        "'where is the data' by which chunks exist")
     p.add_argument("--bbox-scale", type=int, default=0, metavar="N",
                    help="the scale EVERY bbox argument is given in (default: 0, level-0 "
                         "voxels). Converted using the source's own per-level voxel "
@@ -504,6 +510,8 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
                 crop_start=crop_start, crop_stop=crop_stop,
                 mask_boxes=[[lo, hi] for lo, hi in masks],
                 mask_value=args.mask_value,
+                background=(_int_list(args.background, "background")
+                            if args.background else None),
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
                 sparse=args.sparse,
@@ -825,7 +833,9 @@ def cmd_write(args) -> int:
             offset_level=args.offset_level, offset_field=args.offset_field,
             voxel_size_field=args.voxel_size_field,
             offset_order=args.offset_order, src_format=args.src_format,
-            dataset=args.dataset, cast=args.cast, dry_run=args.dry_run)
+            dataset=args.dataset, cast=args.cast, dry_run=args.dry_run,
+            background=(_int_list(args.background, "background")
+                        if args.background else None))
     except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
         raise SystemExit(str(e).strip("'")) from None
 
@@ -1236,6 +1246,61 @@ def cmd_bboxes_json(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# mask-by-value
+# --------------------------------------------------------------------------- #
+def _int_list(value, name):
+    """'1' or '1,2,3' -> a list of ints."""
+    try:
+        return [int(v) for v in str(value).replace(" ", "").split(",") if v]
+    except ValueError:
+        raise SystemExit(f"--{name} takes whole numbers, got {value!r}") from None
+
+
+def cmd_mask_by_value(args) -> int:
+    """Replace label values with background in a volume that already holds them.
+
+    For data already written. Correcting it at ingest is better — `write`, `to-hdf5` and
+    `convert` all take --background — because that happens before the storage decision.
+    """
+    from em_volume_tools.ops.maskvalue import apply_mask_values, plan_mask_values
+
+    try:
+        plan = plan_mask_values(args.volume, _int_list(args.values, "values"),
+                                out=args.out, in_place=args.in_place, level=args.level,
+                                to=args.to)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+
+    print(f"{plan['volume']}  ->  "
+          f"{'itself (in place)' if plan['in_place'] else plan['destination']}")
+    print(f"  level       {plan['level']}  {plan['shape']} {plan['dtype']}  "
+          f"chunk {plan['chunk']}")
+    print(f"  replacing   {plan['values']} -> {plan['to']}")
+    print(f"  regions     {len(plan['regions'])} stored, {plan['n_voxels']:,} voxels to scan")
+    if plan["in_place"]:
+        print("  NOTE        in place: the original values are not recoverable afterwards. "
+              "Chunks that\n              become all-background are removed from the store, "
+              "so the sparsity is\n              restored either way.")
+    try:
+        result = apply_mask_values(plan, dry_run=args.dry_run, overwrite=args.overwrite)
+    except (FileExistsError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+
+    print(f"  replaced    {result['voxels_replaced']:,} voxel(s)")
+    if result["voxels_already_background"]:
+        print(f"  WARNING     {result['voxels_already_background']:,} voxel(s) already "
+              f"held {plan['to']}; those and the replaced ones are now one value")
+    print(f"  blocks      {result['blocks_written']} written"
+          + (f", {result['blocks_unchanged']} unchanged and left alone"
+             if result["blocks_unchanged"] else ""))
+    if result["stale_levels"]:
+        print(f"  stale       levels {result['stale_levels']} still hold the old values — "
+              f"run `em-vol downsample --start-level {plan['level']}`")
+    print("--dry-run: nothing written" if args.dry_run else "done")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # to-hdf5
 # --------------------------------------------------------------------------- #
 def cmd_to_hdf5(args) -> int:
@@ -1259,6 +1324,8 @@ def cmd_to_hdf5(args) -> int:
             dataset=args.dataset, src_dataset=args.src_dataset,
             src_format=args.src_format, dtype=args.dtype,
             voxel_size_field=args.voxel_size_field, offset_field=args.offset_field,
+            background=(_int_list(args.background, "background")
+                        if args.background else None),
             chunk=_triple(args.chunk, "chunk"),
             compression=None if args.compression == "none" else args.compression,
             overwrite=args.overwrite, dry_run=args.dry_run)
@@ -2052,6 +2119,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "is omitted. In an HDF5 file this is looked for in the "
                         "dataset's attributes, the root group's attributes, and a "
                         "top-level dataset of that name (default: voxel_offset)")
+    q.add_argument("--background", default=None, metavar="V[,V...]",
+                   help="value(s) the source uses for background, replaced with 0 as it is "
+                        "read. Manually segmented pieces numbered from 0 have background 1, "
+                        "and an all-background block of 1s is not all-fill, so without this "
+                        "it is stored as data")
     q.add_argument("--voxel-size-field", default="voxel_size", metavar="NAME",
                    help="what the source calls its recorded voxel size, if any. Used only "
                         "to CHECK it against the level being written into — a piece "
@@ -2162,6 +2234,54 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_bboxes_json)
 
+    # --- mask-by-value ------------------------------------------------------
+    q = sub.add_parser(
+        "mask-by-value", help="replace label values with background",
+        description="Replace one or more label values with 0 in a volume that already "
+                    "holds them.\n\n"
+                    "Manual segmentation does not always call background 0 — a tool "
+                    "numbering labels from 0 makes it 1 — and that one fact breaks more "
+                    "than it looks. Background becomes a body when meshed, and, worse, an "
+                    "all-background block of 1s is NOT all-fill, so it gets stored: the "
+                    "volume ends up with a chunk object everywhere data was written, and "
+                    "'which chunks exist' stops answering 'where is the data'. That is the "
+                    "question `bboxes-json`, `relabel`, `downsample --sparse` and "
+                    "em-seg-morpho's occupancy filter all ask.\n\n"
+                    "PREFER FIXING IT AT INGEST: `em-vol write`, `to-hdf5` and `convert` "
+                    "all take --background, and there the correction happens before the "
+                    "storage decision. This command is for data that has already landed.\n\n"
+                    "Either destination restores the sparsity — writing zeros over a "
+                    "stored chunk removes the object, on both formats — so --out is "
+                    "preferred for the ordinary reason instead: a sparse copy is cheap, "
+                    "and the original stays as the record of what was annotated.\n\n"
+                    "SINGLE-SCALE, like `write` and `relabel`: run `em-vol downsample "
+                    "--start-level <level>` afterwards.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("volume", help="the volume to read (path or s3://...)")
+    q.add_argument("--values", required=True, metavar="V[,V...]",
+                   help="the value(s) to replace, e.g. 1")
+    q.add_argument("--to", type=int, default=0,
+                   help="what to replace them with (default: 0, the only value the "
+                        "storage layer treats as empty)")
+    dest = q.add_mutually_exclusive_group(required=True)
+    dest.add_argument("--out", default=None, metavar="VOLUME",
+                      help="write the corrected volume here instead, created with "
+                           "`--like <volume>` so a voxel index means the same thing in "
+                           "both. Preferred: cheap on sparse data, and the original stays "
+                           "as the record of what was annotated")
+    dest.add_argument("--in-place", action="store_true",
+                      help="overwrite the values in the volume itself. Restores the "
+                           "sparsity too, but the original values are then unrecoverable")
+    q.add_argument("--level", type=int, default=0,
+                   help="which level to correct (default: 0)")
+    q.add_argument("--overwrite", action="store_true",
+                   help="allow --out to replace an existing volume")
+    q.add_argument("--dry-run", action="store_true",
+                   help="report and count what would change, writing nothing. Still "
+                        "reads, since the counts come from the voxels")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_mask_by_value)
+
     # --- to-hdf5 ------------------------------------------------------------
     from em_volume_tools.ops.pack import (DEFAULT_DATASET, DEFAULT_OFFSET_FIELD,
                                           DEFAULT_VOXEL_SIZE_FIELD)
@@ -2246,6 +2366,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "governs partial reads when the piece is written back")
     q.add_argument("--compression", choices=("gzip", "lzf", "none"), default="gzip",
                    help="dataset compression (default: gzip)")
+    q.add_argument("--background", default=None, metavar="V[,V...]",
+                   help="value(s) the source uses for background, replaced with 0 while "
+                        "packing, so the packed file is already correct and nothing "
+                        "downstream needs to know the source had this quirk")
     q.add_argument("--overwrite", action="store_true",
                    help="replace the dataset if that name is already used")
     q.add_argument("--dry-run", action="store_true",

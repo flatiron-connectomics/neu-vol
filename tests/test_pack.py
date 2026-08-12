@@ -434,6 +434,19 @@ def test_the_cli_dry_run_writes_nothing(tmp_path, capsys):
     assert not os.path.exists(out)
 
 
+def test_a_remote_path_is_refused_with_a_useful_error(tmp_path):
+    """h5py has no object-store driver, and its own error does not say so.
+
+    Left to it, it tries to *create a local file called* `s3://bucket/piece.h5` and reports
+    `errno = 2, No such file or directory`.
+    """
+    src, _ = _stack(tmp_path)
+    with pytest.raises(ValueError, match="ordinary filesystem path"):
+        pack_hdf5(src, "s3://bucket/piece.h5", voxel_size=(8, 8, 8))
+    with pytest.raises(ValueError, match="rclone|aws s3 cp"):
+        open_backend({"backend": "hdf5", "path": "s3://bucket/piece.h5"})
+
+
 def test_the_cli_refuses_a_bad_axes_string(tmp_path):
     src, _ = _stack(tmp_path)
     with pytest.raises(SystemExit, match="permutation of zyx"):

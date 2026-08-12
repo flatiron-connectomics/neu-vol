@@ -119,7 +119,15 @@ def resolve_source(src: str | dict, src_format: str | None = None, level: int = 
     per_level = read_level_voxel_sizes({"backend": fmt, "path": volume}) or []
     levels = existing_levels(volume, "neuroglancer_precomputed"
                              if fmt == PRECOMPUTED_GZ else fmt)
-    if levels and level not in levels:
+    if not levels:
+        # A bare zarr *array* carries a `zarr.json` too, so detection calls it zarr3 while
+        # it has no levels at all — addressing it as `<path>/0` finds nothing. Same
+        # distinction `copy` has to make.
+        if level:
+            raise ValueError(f"{volume} has no levels (it looks like a bare array, not a "
+                             f"multiscale volume), so --level {level} means nothing")
+        return source_spec(src, src_format, dataset), {}
+    if level not in levels:
         raise ValueError(f"{volume} has no level {level} (present: {sorted(levels)})")
     meta = read_source_metadata({"backend": fmt, "path": volume}) or {}
     frame = {}
@@ -196,6 +204,7 @@ def pack_hdf5(
     src_format: str | None = None,
     voxel_size_field: str = DEFAULT_VOXEL_SIZE_FIELD,
     offset_field: str = DEFAULT_OFFSET_FIELD,
+    background: Sequence[int] | None = None,
     dtype: str | None = None,
     chunk: Sequence[int] | None = None,
     compression: str | None = "gzip",
@@ -217,6 +226,11 @@ def pack_hdf5(
     """
     import h5py
 
+    from ..backends.hdf5 import require_local_path
+
+    # Up front, before any of the source is read: h5py has no object-store driver, and
+    # discovering that after streaming a volume through it would be a poor trade.
+    out = require_local_path(out, "the HDF5 file to write")
     name = dataset or DEFAULT_DATASET
     if not name.startswith("/"):
         name = "/" + name
@@ -251,6 +265,16 @@ def pack_hdf5(
     # volume costs no new machinery. Its origin becomes the piece's voxel_offset unless the
     # caller said otherwise: a region extracted from level N belongs back at that spot, and
     # having to restate it would be the one number nobody should have to type twice.
+    # Under the crop: it corrects what the source means by background, which is true of the
+    # data and not of any box over it. Doing it now also means the packed file is already
+    # correct, so nothing downstream has to know the source had this quirk.
+    if background:
+        spec = {"backend": "remap", "source": dict(spec),
+                "values": [int(v) for v in background], "to": 0}
+        backend = open_backend(spec)
+        logger.info("treating %s as background: replaced with 0 while packing",
+                    [int(v) for v in background])
+
     crop_origin = None
     if crop_start is not None or crop_stop is not None:
         from .convert import _resolve_crop

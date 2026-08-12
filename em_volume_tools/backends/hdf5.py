@@ -33,6 +33,26 @@ def _as_offset(value: Any, where: str) -> tuple[int, ...]:
     return tuple(int(v) for v in np.rint(arr.astype("float64")))
 
 
+def require_local_path(path: str, what: str = "an HDF5 file") -> str:
+    """``path`` if it is an ordinary filesystem path; a useful error if it is not.
+
+    h5py needs a real path — there is no kvstore in front of it as there is for zarr and
+    precomputed, and a container that cannot be read a chunk at a time would be a poor fit
+    for one anyway. Without this check the failure is h5py's: it tries to *create a local
+    file called* ``s3://bucket/piece.h5`` and reports ``errno = 2, No such file or
+    directory``, which says nothing about what is actually wrong.
+    """
+    from ..location import is_local
+
+    if not is_local(path):
+        raise ValueError(
+            f"{what} must be an ordinary filesystem path, and {path!r} is not: h5py has no "
+            f"object-store driver, so nothing here can read or write HDF5 on one. Copy the "
+            f"file to local storage first (`rclone copy`, `aws s3 cp`), or write it locally "
+            f"and upload it afterwards.")
+    return path
+
+
 def _as_floats(value: Any, where: str) -> tuple[float, ...]:
     """A stored physical vector as floats. Unlike an offset, these are not whole voxels."""
     arr = np.asarray(value).ravel()
@@ -60,7 +80,7 @@ def datasets(path: str, *, min_ndim: int = 3) -> list[str]:
     import h5py
 
     found: list[str] = []
-    with h5py.File(path, "r") as f:
+    with h5py.File(require_local_path(path), "r") as f:
         f.visititems(lambda name, obj: found.append("/" + name)
                      if isinstance(obj, h5py.Dataset) and obj.ndim >= min_ndim else None)
     return found
@@ -89,7 +109,7 @@ class HDF5Backend:
         import h5py
 
         self._spec = dict(spec)
-        self._path = str(spec["path"])
+        self._path = require_local_path(str(spec["path"]))
         self._dataset = str(spec.get("dataset", "/data"))
         self._file = h5py.File(self._path, "r")
         if self._dataset not in self._file:

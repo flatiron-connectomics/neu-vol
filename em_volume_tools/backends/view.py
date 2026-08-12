@@ -147,3 +147,86 @@ class MaskBackend:
 
 
 register_backend(MASK_TAG, MaskBackend.open)
+
+
+REMAP_TAG = "remap"
+
+
+class RemapBackend:
+    """A source with ``values`` replaced by ``to`` (default 0) as it is read.
+
+    Manual segmentation does not always call background 0 — a tool that numbers labels from
+    0 makes it 1 — and that single fact breaks the sparsity every other assumption here
+    rests on: **an all-background block of 1s is not all-fill, so it gets stored.** The
+    volume then has a chunk object everywhere data was written, whether or not it holds
+    anything, and "which chunks exist" stops answering "where is the data" — which is what
+    `bboxes-json`, `relabel`, `--sparse` and em-seg-morpho's occupancy all ask it.
+
+    Doing it here, on the read side, is therefore not a convenience: it is the only place
+    the correction happens *before* the storage decision. Applied after the fact, the dense
+    chunks are already written.
+    """
+
+    def __init__(self, spec: Mapping[str, Any]):
+        self._spec = dict(spec)
+        self._source = open_backend(dict(spec["source"]))
+        self._values = np.asarray(spec["values"]).ravel()
+        self._to = spec.get("to", 0)
+        if self._values.size == 0:
+            raise ValueError("remap needs at least one value to replace")
+
+    @classmethod
+    def open(cls, spec: Mapping[str, Any]) -> "RemapBackend":
+        return cls(spec)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self._source.shape
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._source.dtype
+
+    @property
+    def chunks(self) -> tuple[int, ...]:
+        return self._source.chunks
+
+    def read_region(self, region: Region) -> np.ndarray:
+        data = self._source.read_region(region)
+        if not data.flags.writeable:
+            data = data.copy()
+        values = self._values.astype(data.dtype, copy=False)
+        # `isin` for a handful of values is a small number of equality passes; building a
+        # lookup table would need one entry per possible value, which for uint64 is absurd.
+        data[np.isin(data, values)] = self._to
+        return data
+
+    def write_region(self, region: Region, data: np.ndarray) -> None:
+        raise TypeError("remap views are read-only")
+
+    # A remap changes values, not geometry, so everything the source recorded about where
+    # it sits and at what scale is still true and forwards. `ops/write` asks a source for
+    # these, and a wrapper that swallowed them would silently turn "the offset came from
+    # the file" back into "no offset given".
+    #
+    # A *crop* must not do this: it moves the data, so the source's recorded offset is no
+    # longer the view's. That asymmetry is why this is written out here rather than being a
+    # generic __getattr__ on every view.
+    def stored_offset(self, name: str = "voxel_offset"):
+        return self._forward("stored_offset", name)
+
+    def stored_axes(self, name: str = "axes"):
+        return self._forward("stored_axes", name)
+
+    def stored_voxel_size(self, name: str = "voxel_size"):
+        return self._forward("stored_voxel_size", name)
+
+    def _forward(self, capability: str, name: str):
+        read = getattr(self._source, capability, None)
+        return read(name) if read is not None else None
+
+    def to_spec(self) -> dict[str, Any]:
+        return dict(self._spec)
+
+
+register_backend(REMAP_TAG, RemapBackend.open)

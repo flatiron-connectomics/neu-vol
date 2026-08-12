@@ -134,6 +134,7 @@ def convert(
     clip_crop: bool = True,
     mask_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
     mask_value: float = 0,
+    background: Sequence[int] | None = None,
     profile: str = "local",
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
@@ -163,6 +164,12 @@ def convert(
     taken from the source where available; ``voxel_size`` is required if the source
     carries none. With ``resume=True`` an interrupted run continues, skipping
     already-done blocks instead of recreating them.
+
+    ``background`` names the values the source uses for background — manual segmentation
+    numbered from 0 makes it 1 — and replaces them with 0 as the source is read. Do this
+    rather than fixing it afterwards: an all-background block of 1s is not all-fill, so
+    every one of them would be *stored*, and the volume would no longer answer "where is
+    the data" by which chunks exist.
 
     ``sparse=True`` skips **pyramid** tasks whose input holds no stored chunk, which on a
     sparse volume is nearly all of them. It cannot skip any of the level-0 copy: the
@@ -241,6 +248,15 @@ def convert(
     # volume" and keeps the two arguments independent.
     read_spec, read_shape = data_spec, src_shape
     out_offset = tuple(offset) if offset else (0.0,) * n_spatial
+    if background:
+        # Innermost, under mask and crop: it corrects what the source *means* by background,
+        # which is true of the data itself and not of any box laid over it. It has to happen
+        # here rather than afterwards because an all-background block of 1s is not all-fill,
+        # so without it every such block is stored and the volume stops being sparse.
+        read_spec = {"backend": "remap", "source": dict(read_spec),
+                     "values": [int(v) for v in background], "to": 0}
+        logger.info("treating %s as background: replaced with 0 as the source is read",
+                    [int(v) for v in background])
     if mask_boxes:
         read_spec = _resolve_masks(read_spec, src_shape, mask_boxes, value=mask_value,
                                    n_spatial=n_spatial, has_channels=has_channels)

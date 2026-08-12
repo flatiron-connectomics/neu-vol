@@ -181,6 +181,7 @@ em-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
 em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
 em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates
 em-vol relabel <volume> --out ...            # one id range per occupied region
+em-vol mask-by-value <volume> --values 1     # background that is not 0, made 0
 em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 ```
 

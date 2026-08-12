@@ -216,6 +216,7 @@ def plan_subvolume_write(
     offset_field: str = "voxel_offset",
     voxel_size_field: str = "voxel_size",
     offset_order: str | None = None,
+    background: Sequence[int] | None = None,
     src_format: str | None = None,
     dataset: str | None = None,
     cast: bool = False,
@@ -239,6 +240,13 @@ def plan_subvolume_write(
     dst = open_backend(dst_spec)
 
     src_spec = source_spec(src, src_format, dataset)
+    if background:
+        # Under everything else, because it corrects what the source means by background.
+        # Applied here rather than to the volume afterwards: an all-background block of 1s
+        # is not all-fill, so writing it stores a chunk that holds nothing, and the volume
+        # stops answering "where is the data" by which chunks exist.
+        src_spec = {"backend": "remap", "source": dict(src_spec),
+                    "values": [int(v) for v in background], "to": 0}
     src_backend = open_backend(src_spec)
     src_shape = tuple(int(s) for s in src_backend.shape)
 
