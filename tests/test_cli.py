@@ -267,7 +267,9 @@ def test_downsample_refuses_to_seed_from_a_level_that_is_not_on_disk(tmp_path):
     was never written. Seeding from it would read nothing.
     """
     dst = _pyramid(tmp_path)
-    args = cli._parse_args(["downsample", dst, "--start-level", "2",
+    # --max-levels is explicit because the default now matches the volume's own two
+    # levels, and this case needs a schedule that reaches PAST what is on disk.
+    args = cli._parse_args(["downsample", dst, "--start-level", "2", "--max-levels", "3",
                             "--min-dim", "4", "--dry-run"])
     with pytest.raises(SystemExit, match="does not exist; nothing to seed from"):
         cli.cmd_downsample(args)

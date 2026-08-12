@@ -25,8 +25,30 @@ from ..source_metadata import detect_backend, read_source_metadata
 from ..location import default_progress_path
 from ..profiles import PROFILES
 from ._multiscale import materialize_multiscale
+from .create import DEFAULT_MAX_LEVELS
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_max_levels(recorded: Sequence[Any] | None) -> tuple[int, str]:
+    """The level cap for a rebuild, and why — from the volume where it says anything.
+
+    How many levels a pyramid has is a property of the volume, written in its own
+    metadata; it is not a preference, and it is certainly not a *conversion's* default.
+    Inheriting 8 from ``convert`` made a rebuild plan one level fewer than the 9-level
+    volume it was repairing, and because every shape matched, nothing caught it — the top
+    level was simply left serving whatever it held before.
+
+    **A volume recording one level or none is the opposite case**: there is no pyramid to
+    match, and `em-vol write` and `em-vol relabel` both end by telling you to run
+    `downsample` to *build* one. Deriving 1 there would turn that documented step into a
+    silent no-op, so it falls back to the conversion default instead.
+    """
+    n = len(recorded or ())
+    if n > 1:
+        return n, "matching the volume's recorded levels"
+    return DEFAULT_MAX_LEVELS, ("the volume records no pyramid to match, so building a "
+                                "default one — pass --max-levels to choose its depth")
 
 
 def _profile_for(fmt: str) -> str:
@@ -44,7 +66,7 @@ def rebuild_pyramid(
     profile: str | None = None,
     voxel_size: Sequence[float] | None = None,
     factors: Sequence[Sequence[int]] | None = None,
-    max_levels: int = 8,
+    max_levels: int | None = None,
     min_dim: int = 128,
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
@@ -54,6 +76,7 @@ def rebuild_pyramid(
     npartitions: int | None = None,
     resume: bool = False,
     verify: bool = False,
+    sparse: bool = False,
     progress_path: str | None = None,
     validate: bool = True,
 ) -> dict:
@@ -111,6 +134,12 @@ def rebuild_pyramid(
     if kind not in ("image", "segmentation"):
         raise ValueError(f"kind must be 'image' or 'segmentation', got {kind!r}")
 
+    if max_levels is None:
+        from ..source_metadata import read_level_voxel_sizes
+
+        max_levels, why = resolve_max_levels(read_level_voxel_sizes(spec))
+        logger.info("max_levels=%d (%s)", max_levels, why)
+
     # Keep the existing chunking by default: silently rechunking only the
     # regenerated levels would leave the pyramid internally inconsistent.
     if chunk is None:
@@ -156,6 +185,7 @@ def rebuild_pyramid(
         delete_existing=False,         # never destroy a volume we are repairing
         resume=resume,
         verify=verify,
+        sparse=sparse,
         progress_path=progress_path,
         validate=validate,
         # An int, never None: every level of a rebuild is seeded from one that exists,

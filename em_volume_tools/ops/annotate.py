@@ -55,6 +55,10 @@ from ..source_metadata import PRECOMPUTED_GZ, detect_backend, existing_levels, l
 ANNOTATION_TYPES = ("point", "line", "axis_aligned_bounding_box", "ellipsoid",
                     "polyline")
 
+#: Documents that sit beside a zarr array's chunks and are not chunks. v3 writes
+#: ``zarr.json``; the v2 names appear on volumes read through the same driver.
+ZARR_METADATA = {"zarr.json", ".zarray", ".zattrs", ".zgroup"}
+
 # OME-NGFF spells units out; precomputed always means nm. Anything not here leaves the
 # layer unitless, which the caller is warned about — a unitless annotation layer does
 # not align with a layer that has physical units.
@@ -126,7 +130,12 @@ def occupied_cells(volume: str, fmt: str, level: int,
     occupancy are the same question.
     """
     if fmt == "zarr3":
-        keys = list_keys(volume, str(level))
+        # The array's own metadata document is not a chunk and must not count towards the
+        # "objects exist but none are chunk keys" test below — an EMPTY level holds
+        # exactly `zarr.json`, and letting that through reported a freshly created volume
+        # as sharded.
+        keys = [k for k in list_keys(volume, str(level))
+                if k.rsplit("/", 1)[-1] not in ZARR_METADATA]
         cells = {c for c in (_zarr_cell(k, len(cell)) for k in keys) if c}
     else:
         info = read_json(volume.rstrip("/") + "/info") or {}

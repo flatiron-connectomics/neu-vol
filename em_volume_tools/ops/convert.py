@@ -151,6 +151,7 @@ def convert(
     delete_existing: bool = False,
     resume: bool = False,
     verify: bool = False,
+    sparse: bool = False,
     progress_path: str | None = None,
     validate: bool = True,
 ) -> dict:
@@ -162,6 +163,11 @@ def convert(
     taken from the source where available; ``voxel_size`` is required if the source
     carries none. With ``resume=True`` an interrupted run continues, skipping
     already-done blocks instead of recreating them.
+
+    ``sparse=True`` skips **pyramid** tasks whose input holds no stored chunk, which on a
+    sparse volume is nearly all of them. It cannot skip any of the level-0 copy: the
+    source there is foreign, and whether it has stored a chunk is not a question this
+    package can ask of it.
 
     ``mask_boxes`` is a list of spatial ``(lo, hi)`` pairs to *exclude*: everything else
     is copied and those regions are written as ``mask_value``. Because the pyramid is
@@ -279,6 +285,7 @@ def convert(
         delete_existing=delete_existing,
         resume=resume,
         verify=verify,
+        sparse=sparse,
         progress_path=progress_path,
         validate=validate,
     )

@@ -138,6 +138,13 @@ def _add_convert_args(p, *, source_defaults: bool):
                    help="stop when the largest spatial dim is <= this")
     p.add_argument("--single-level", action="store_true",
                    help="write level 0 only, no pyramid")
+    p.add_argument("--sparse", action="store_true",
+                   help="skip PYRAMID tasks whose input holds no stored chunk. On a "
+                        "sparse volume that is nearly all of them, and it is exact "
+                        "rather than a guess: an all-fill chunk is never stored, so a "
+                        "task with no stored input would write nothing anyway. One "
+                        "listing per level replaces the reads. It cannot skip any of "
+                        "the level-0 copy, whose source is foreign")
     p.add_argument("--fresh", action="store_true",
                    help="delete and restart instead of resuming")
     p.add_argument("--no-validate", action="store_true",
@@ -499,6 +506,7 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
                 mask_value=args.mask_value,
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
+                sparse=args.sparse,
                 client=client, resume=not args.fresh, delete_existing=args.fresh,
                 validate=not args.no_validate,
             )
@@ -627,8 +635,17 @@ def _downsample_plan(args):
     voxel = _triple(args.voxel_size, "voxel-size") or tuple(meta["voxel_size"])
     spatial = d["shape"][1:] if d["has_channels"] else d["shape"]
 
+    # The default comes from the volume, not from `convert`'s 8: how many levels this
+    # pyramid has is something it already records. Through the op's own resolver, so the
+    # --dry-run table cannot state a plan different from the one that runs.
+    max_levels = args.max_levels
+    if max_levels is None:
+        from em_volume_tools.ops.rebuild import resolve_max_levels
+
+        max_levels, why = resolve_max_levels(d["level_voxel_sizes"])
+        log.info("levels  at most %d (%s)", max_levels, why)
     schedule = downsample_schedule(spatial, voxel, factors=_factor_list(args.factors),
-                                   max_levels=args.max_levels, min_dim=args.min_dim)
+                                   max_levels=max_levels, min_dim=args.min_dim)
     shapes, voxels = [tuple(spatial)], [voxel]
     for factor in schedule:
         shapes.append(tuple(-(-s // f) for s, f in zip(shapes[-1], factor)))
@@ -675,6 +692,17 @@ def cmd_downsample(args) -> int:
             "a level on disk disagrees with the computed schedule — --min-dim / "
             "--max-levels / --factors probably differ from the original conversion. "
             "Rebuilding now would leave the pyramid inconsistent.")
+    # Levels the schedule does not reach are left exactly as they are — whatever that is.
+    # Empty (never built) means the volume vanishes at the coarsest zooms; populated from
+    # before the data changed means it serves the OLD data there. Every shape matches
+    # either way, so the mismatch check above cannot see this; only the count differs.
+    extra = sorted(i for i in existing if i >= len(shapes))
+    if extra:
+        log.warning("levels %s exist on disk but are ABOVE this schedule, so they are "
+                    "left untouched: whatever they hold now — nothing, or data from "
+                    "before the change you are rebuilding for — is what they keep "
+                    "serving at the coarsest zooms. Raise --max-levels to %d to rebuild "
+                    "them (it counts level 0), or delete them.", extra, max(extra) + 1)
     if args.dry_run:
         log.info("--dry-run: nothing executed")
         return 0
@@ -683,7 +711,7 @@ def cmd_downsample(args) -> int:
               voxel_size=_triple(args.voxel_size, "voxel-size"),
               factors=_factor_list(args.factors), max_levels=args.max_levels,
               min_dim=args.min_dim, chunk=_triple(args.chunk, "chunk"),
-              encoding=args.encoding, resume=args.resume,
+              encoding=args.encoding, resume=args.resume, sparse=args.sparse,
               progress_path=args.progress_path)
     with _maybe_cluster(args) as client:
         summary = rebuild_pyramid(args.volume, client=client, **kw)
@@ -1819,11 +1847,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--kind", choices=("image", "segmentation"), default=None,
                    help="reducer (default: read from the volume)")
     q.add_argument("--min-dim", type=int, default=128)
-    q.add_argument("--max-levels", type=int, default=8,
-                   help="at most this many levels, COUNTING LEVEL 0 (default: 8). It "
-                        "must match what built the pyramid — --dry-run compares the "
-                        "schedule against the levels on disk and refuses if they "
-                        "disagree, rather than rebuilding a different pyramid")
+    q.add_argument("--max-levels", type=int, default=None,
+                   help="at most this many levels, COUNTING LEVEL 0. Defaults to as many "
+                        "as the volume records, since that is a property of the pyramid "
+                        "being repaired rather than a preference — pass it only to "
+                        "EXTEND a pyramid. --dry-run compares the schedule against the "
+                        "levels on disk and refuses if they disagree")
     q.add_argument("--factors", default=None,
                    help="explicit per-level factors, e.g. '1,2,2;1,2,2'. MUST match "
                         "the original conversion, as must --min-dim/--max-levels")
@@ -1834,6 +1863,16 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--profile", default=None, help="storage profile")
     q.add_argument("--resume", action="store_true",
                    help="continue an interrupted rebuild")
+    q.add_argument("--sparse", action="store_true",
+                   help="skip tasks whose input holds no stored chunk. On a sparse "
+                        "volume — ground truth, an ROI export — that is nearly every "
+                        "task, and it is EXACT rather than a guess: an all-fill chunk is "
+                        "never stored, so a task whose input objects are all absent "
+                        "would write nothing anyway. Each level costs one listing "
+                        "instead of a read per task. Refuses if the level it seeds from "
+                        "has no stored chunks at all, rather than writing nothing and "
+                        "reporting success. Not usable on a SHARDED level, which hides "
+                        "which of its chunks exist")
     q.add_argument("--progress-path", default=None)
     q.add_argument("--dry-run", action="store_true",
                    help="report the plan and exit, touching nothing")

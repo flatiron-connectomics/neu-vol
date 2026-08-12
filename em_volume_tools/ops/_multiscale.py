@@ -23,6 +23,7 @@ checks storage authoritatively per block.
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 import math
 import time
@@ -164,8 +165,77 @@ def _elapsed(seconds: float) -> str:
     return f"{h:d}h{m:02d}m{s:02d}s" if h else (f"{m:d}m{s:02d}s" if m else f"{s:d}s")
 
 
+class NothingStored(RuntimeError):
+    """A level to be downsampled from holds no stored chunks at all."""
+
+
+def _stored_cells_fn(dst: str, fmt: str):
+    """``(level, cell_shape) -> {stored chunk cells}`` for this destination.
+
+    Deferred to :func:`em_volume_tools.ops.annotate.occupied_cells`, which already knows
+    how each format spells a chunk key — precomputed's ``x0-x1_y0-y1_z0-z1`` in xyz under
+    a per-scale prefix, zarr v3's ``c/z/y/x``. It raises ``NoOccupancy`` on a **sharded**
+    level, which is the right answer rather than a wrong one: a shard hides which of its
+    chunks exist, so presence stops being the same question as occupancy.
+    """
+    def stored_cells(level: int, cell: tuple[int, ...]) -> set:
+        from .annotate import occupied_cells
+
+        return occupied_cells(dst, fmt, level, cell)
+
+    return stored_cells
+
+
+def _sparse_skip(stored_cells, src_level, src_shape, src_chunks, factor, has_channels,
+                 *, strict: bool):
+    """A predicate: does this output block's input contain no stored chunk at all?
+
+    **This is exact, not a heuristic, and that is what separates it from the occupancy
+    prefilters elsewhere** (CLAUDE.md invariant 6, where coarse-scale *label* occupancy
+    misses blocks and needs dilating). Here the question is not "does this region
+    probably hold labels" but "does the source object exist": TensorStore never persists
+    an all-fill chunk, so a chunk with no object *is* all fill. If none of the source
+    chunks a block reads exists, its input is entirely fill, its output is entirely fill,
+    and :func:`_downsample_block` would return ``"empty"`` and write nothing. Skipping
+    changes not one byte of output — it only skips the read that discovers the zeros.
+
+    The error direction is safe too: a writer that *did* store all-fill chunks (anything
+    not TensorStore) only makes this keep blocks it needn't, costing a read.
+
+    One listing per level, not one probe per block — an existence check per task is the
+    round trip we are trying to avoid.
+    """
+    spatial = slice(1, None) if has_channels else slice(None)
+    cell = tuple(int(c) for c in src_chunks[spatial])
+    cells = stored_cells(src_level, cell)
+    if not cells:
+        # An empty SEED means the run would write nothing and report success — invariant
+        # 4's failure mode, and what a wrong --start-level looks like. An empty level
+        # part-way up is ordinary: mode-reducing a handful of labelled voxels among
+        # background yields background, so sparse data legitimately dies out below the
+        # top of the pyramid. Nothing above an empty level can hold data either.
+        if strict:
+            raise NothingStored(
+                f"level {src_level} has no stored chunks, so every task above it would "
+                f"be skipped and the run would write nothing while reporting success. "
+                f"If the level really is empty there is nothing to downsample; "
+                f"otherwise check --start-level and the volume, and re-run without "
+                f"--sparse to be certain.")
+        logger.info("level %d holds no stored chunks: the data has reduced to nothing, "
+                    "so this level and everything above it stay empty", src_level)
+        return lambda block: True
+    logger.info("level %d holds %d stored chunks of %s", src_level, len(cells), cell)
+
+    def skip(block) -> bool:
+        region = _input_region(block.region, factor, src_shape)[spatial]
+        spans = [range(s.start // c, (s.stop - 1) // c + 1) for s, c in zip(region, cell)]
+        return not any(idx in cells for idx in itertools.product(*spans))
+
+    return skip
+
+
 def _run_level(manifest, level, backend, worker_factory, *, resume, verify, client,
-               npartitions, task_shape=None):
+               npartitions, task_shape=None, skip=None):
     """Dispatch one level's blocks, filtering already-done ones and recording results.
 
     The task total goes into the manifest **before** dispatch. It is the only place
@@ -174,13 +244,29 @@ def _run_level(manifest, level, backend, worker_factory, *, resume, verify, clie
     `em-vol progress` did exactly that. Logging is likewise before *and* after: the
     single after-the-fact line this replaced arrived only once the level finished,
     reporting "0 already done" about work that had by then all been done.
+
+    ``skip`` drops blocks before anything else, and therefore before the total is
+    recorded: the denominator has to be the work actually dispatched, or `em-vol
+    progress` reports against a grid the run never intended to cover.
     """
     unit = tuple(int(c) for c in (task_shape or backend.chunks))
     blocks = list(iter_blocks(backend.shape, unit))
+    grid_total = len(blocks)
+    skipped = 0
+    if skip is not None:
+        blocks = [b for b in blocks if not skip(b)]
+        skipped = grid_total - len(blocks)
+        logger.info("level %d: %d of %d grid tasks have input data; skipping %d whose "
+                    "input holds no stored chunk (their output is all fill, which is "
+                    "written nowhere)", level, len(blocks), grid_total, skipped)
     total = len(blocks)
     manifest.record_meta(level, total=total, task_shape=list(unit),
                          shape=[int(s) for s in backend.shape],
-                         chunks=[int(c) for c in backend.chunks])
+                         chunks=[int(c) for c in backend.chunks],
+                         # Recorded whenever the filter ran, even at zero, so a reader can
+                         # tell "nothing was skipped" from "nothing was filtered".
+                         **({"grid_total": grid_total, "skipped_empty": skipped}
+                            if skip is not None else {}))
     if resume and not verify:
         done = manifest.done_keys(level)
         blocks = [b for b in blocks if b.index not in done]
@@ -217,6 +303,8 @@ def _run_multiscale(
     progress_path: str | None,
     seed_level: int | None = None,
     open_level: Callable[[int, Sequence[int], Sequence[int]], TensorStoreBackend] | None = None,
+    sparse: bool = False,
+    stored_cells: Callable[[int, tuple[int, ...]], set] | None = None,
 ) -> tuple[list[tuple[int, ...]], list[tuple[int, ...]], dict[str, int]]:
     """Create + fill each level. Returns (level_shapes, cumulative_factors, status_counts).
 
@@ -238,6 +326,12 @@ def _run_multiscale(
     The seed is obtained through ``open_level``, never ``create_level``: opening
     for creation with ``resume=False`` would recreate the very level being
     regenerated from, destroying the input.
+
+    ``sparse`` skips pyramid tasks whose input holds no stored chunk — exact, not a
+    guess, see :func:`_sparse_skip`. It applies to levels 1..L only: **level 0 is never
+    filtered**, because its source is foreign and its emptiness is not ours to know. So
+    it makes a `downsample`/`rebuild` of a sparse volume nearly free while leaving a
+    `convert`'s level-0 copy exactly as expensive as it was.
     """
     src_shape = tuple(int(s) for s in src_shape)
     identity = tuple([1] * n_spatial)
@@ -298,6 +392,7 @@ def _run_multiscale(
                                                             verify=verify),
                        resume=resume, verify=verify, client=client, npartitions=npartitions,
                        task_shape=task_shape)
+            prev_shape, prev_chunks = lvl0.shape, lvl0.chunks
         else:
             seed = open_level(seed_level, level_shapes[seed_level], cum[seed_level])
             got = tuple(int(s) for s in seed.shape)
@@ -309,21 +404,31 @@ def _run_multiscale(
                     f"volume whose levels disagree; check voxel_size/factors, or "
                     f"rebuild from a level that matches.")
             prev_spec = seed.to_spec()
+            prev_shape, prev_chunks = seed.shape, seed.chunks
             logger.info("rebuilding from existing level %d %s (level%s below it "
                         "untouched)", seed_level, got,
                         f"s 0-{seed_level - 1}" if seed_level else " 0 is the seed; none")
 
+        if sparse and stored_cells is None:
+            raise ValueError("sparse=True needs stored_cells, which reports which chunk "
+                             "objects a level actually has")
         for i in range((0 if seed_level is None else seed_level) + 1, len(schedule) + 1):
             ff = _full_factor(schedule[i - 1], has_channels)
             lvl = create_level(i, level_shapes[i], cum[i])
             lvl_spec = lvl.to_spec()
             src_for_lvl = prev_spec
+            # The filter reads the level BELOW, which by now is written — for a rebuild
+            # that is the seed, for a conversion the level 0 just copied.
+            first = i - 1 == (0 if seed_level is None else seed_level)
+            skip = (_sparse_skip(stored_cells, i - 1, prev_shape, prev_chunks, ff,
+                                 has_channels, strict=first) if sparse else None)
             _run_level(manifest, i, lvl,
                        lambda *, verify, s=src_for_lvl, d=lvl_spec, fac=ff: functools.partial(
                            _downsample_block, src_spec=s, dst_spec=d, factor=fac, kind=kind,
                            verify=verify),
-                       resume=resume, verify=verify, client=client, npartitions=npartitions)
-            prev_spec = lvl_spec
+                       resume=resume, verify=verify, client=client, npartitions=npartitions,
+                       skip=skip)
+            prev_spec, prev_shape, prev_chunks = lvl_spec, lvl.shape, lvl.chunks
 
         return level_shapes, cum, manifest.counts()
     finally:
@@ -337,7 +442,7 @@ def materialize_zarr_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
-    resume=False, verify=False, progress_path=None, seed_level=None,
+    resume=False, verify=False, progress_path=None, seed_level=None, sparse=False,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),  # precomputed-only; ignored here
 ) -> dict:
     prof = get_profile(profile)
@@ -369,7 +474,8 @@ def materialize_zarr_multiscale(
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
         resume=resume, verify=verify, progress_path=progress_path,
-        seed_level=seed_level, open_level=open_level,
+        seed_level=seed_level, open_level=open_level, sparse=sparse,
+        stored_cells=_stored_cells_fn(dst, "zarr3"),
     )
 
     datasets, scales = [], []
@@ -406,7 +512,7 @@ def materialize_precomputed_multiscale(
     *, src_spec, src_shape, src_dtype, dst, profile, voxel_size, offset, units,
     spatial_axes, has_channels, num_channels, dtype, kind, multiscale, factors,
     max_levels, min_dim, name, chunk, shard, client, npartitions, delete_existing, validate,
-    resume=False, verify=False, progress_path=None, seed_level=None,
+    resume=False, verify=False, progress_path=None, seed_level=None, sparse=False,
     encoding=None, compressed_segmentation_block_size=(8, 8, 8),
 ) -> dict:
     prof = get_profile(profile)
@@ -450,7 +556,8 @@ def materialize_precomputed_multiscale(
         kind=kind, multiscale=multiscale, factors=factors, max_levels=max_levels,
         min_dim=min_dim, create_level=create_level, client=client, npartitions=npartitions,
         resume=resume, verify=verify, progress_path=progress_path,
-        seed_level=seed_level, open_level=open_level,
+        seed_level=seed_level, open_level=open_level, sparse=sparse,
+        stored_cells=_stored_cells_fn(dst, "neuroglancer_precomputed"),
     )
     scales = [[float(v * c) for v, c in zip(voxel_size, F)] for F in cum]
     logger.info("wrote precomputed multiscale info: %d scales (encoding=%s)", len(level_shapes), encoding)
