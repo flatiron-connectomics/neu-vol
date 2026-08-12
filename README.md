@@ -101,8 +101,23 @@ write_subvolumes("annotations.precomputed", glob("pieces/*.h5"))  # offsets from
 An offset may be **omitted** when the source records one — an HDF5 file's
 `voxel_offset`, looked for in the dataset's attributes, the root group's attributes,
 and a top-level dataset of that name. Any backend may supply one by implementing
-`stored_offset`. Check `offset_order=` if the value came from a precomputed-flavoured
-writer: that field name means *xyz* there, and everything here is zyx.
+`stored_offset`. The axis order is likewise read from the file when it states one (an
+`axes` attribute, via `stored_axes`), falling back to zyx; `offset_order=` overrides both.
+Check it if the value came from a precomputed-flavoured writer that records no `axes`:
+that field name means *xyz* there, and everything here is zyx.
+
+`pack_hdf5()` produces such a file — the inverse of `write_subvolume`. It packs an image
+stack (or any readable source) into one HDF5 dataset carrying `voxel_offset`, `voxel_size`,
+`offset`, `units` and `axes`, so the piece can be placed later with no arguments:
+
+```python
+from em_volume_tools import pack_hdf5
+pack_hdf5("slices/", "piece.h5", voxel_size=(40, 8, 8), voxel_offset=(24, 128, 256))
+```
+
+The dataset defaults to `/data`, which is what the reader assumes when it is not told. An
+existing file is added to if its recorded frame matches — several pieces of one volume in
+one file, each with its own `voxel_offset` — and refused if it does not.
 
 `write_subvolumes` plans **every** source — offsets, bounds, dtype — before writing
 any of them, so a mistyped offset in the last file is caught while the volume is still
@@ -161,6 +176,7 @@ em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted on
 em-vol progress <volume>                     # chunks written, per level
 em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
+em-vol to-hdf5 --src slices/ --out piece.h5  # pack a piece, frame and position included
 em-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
 em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
 em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates

@@ -80,7 +80,7 @@ def source_spec(src: str | Mapping[str, Any], src_format: str | None = None,
         f"(image_stack, hdf5, zarr3, neuroglancer_precomputed, ...)")
 
 
-def resolve_offset(backend, offset, *, field: str, order: str, ndim: int):
+def resolve_offset(backend, offset, *, field: str, order: str | None, ndim: int):
     """The offset to write at, as ``(offset, provenance)``, taking it from the source
     if none was given.
 
@@ -91,14 +91,31 @@ def resolve_offset(backend, offset, *, field: str, order: str, ndim: int):
     nothing here is specific to HDF5.
 
     ``order`` is the axis order of the numbers, ``"zyx"`` (this package's convention
-    everywhere else) or ``"xyz"``. It is asked for rather than guessed because
+    everywhere else) or ``"xyz"``. It has to be *said* rather than guessed because
     ``voxel_offset`` is precomputed's field name, and precomputed means xyz — so a
     stored value could legitimately be either, with a wrong guess placing the piece
-    mirrored through the z=x diagonal and nothing downstream able to tell. The
-    provenance string is returned so callers can print what was used.
+    mirrored through the z=x diagonal and nothing downstream able to tell.
+
+    ``order=None`` means "ask the file": a source may expose ``stored_axes()`` and say
+    which order it wrote, in which case reading it is not a guess at all. `em-vol to-hdf5`
+    records it; falling back to zyx when nothing does. An explicit ``order`` always wins,
+    and the provenance string says which of the three happened, because this is the one
+    decision here whose mistakes are invisible afterwards.
     """
-    if order not in ("zyx", "xyz"):
+    if order is not None and order not in ("zyx", "xyz"):
         raise ValueError(f"offset order must be 'zyx' or 'xyz', got {order!r}")
+    order_from = "given"
+    if order is None:
+        stated = getattr(backend, "stored_axes", None)
+        found = stated() if stated is not None else None
+        if found and found[0] in ("zyx", "xyz"):
+            order, order_from = found[0], f"recorded in the source, {found[1]}"
+        elif found:
+            raise ValueError(
+                f"the source records axes {found[0]!r} ({found[1]}), which is neither "
+                f"'zyx' nor 'xyz'; pass the order explicitly")
+        else:
+            order, order_from = "zyx", "this package's default, the source records none"
     provenance = "given"
     if offset is None:
         read = getattr(backend, "stored_offset", None)
@@ -114,9 +131,14 @@ def resolve_offset(backend, offset, *, field: str, order: str, ndim: int):
     if len(offset) != ndim:
         raise ValueError(f"offset {offset} ({provenance}) has {len(offset)} entries "
                          f"but the data is {ndim}-D")
+    # Only the source having *stated* an order is news; a given order and the zyx default
+    # were already the reader's assumption, so their wording stays as it was.
+    note = f", {order_from}" if order_from.startswith("recorded") else ""
     if order == "xyz":
         offset = offset[::-1]
-        provenance += " (read as xyz, reversed to zyx)"
+        provenance += f" (read as xyz{note}, reversed to zyx)"
+    elif note:
+        provenance += f" (read as zyx{note})"
     return offset, provenance
 
 
@@ -192,7 +214,8 @@ def plan_subvolume_write(
     level: int = 0,
     offset_level: int | None = None,
     offset_field: str = "voxel_offset",
-    offset_order: str = "zyx",
+    voxel_size_field: str = "voxel_size",
+    offset_order: str | None = None,
     src_format: str | None = None,
     dataset: str | None = None,
     cast: bool = False,
@@ -236,6 +259,27 @@ def plan_subvolume_write(
             f"the subvolume does not fit: {src_shape} at {start} would span "
             f"{tuple(zip(start, stop))} in a level-{level} volume of {dst_shape}")
 
+    # A piece that records its own scale can be checked against the level it is going
+    # into. Extracted at level 1 and written to level 0, the numbers all fit and the data
+    # is simply at the wrong resolution — nothing else here would notice.
+    scale_note = None
+    read_size = getattr(src_backend, "stored_voxel_size", None)
+    stored_size = read_size(voxel_size_field) if read_size is not None else None
+    if stored_size:
+        from ..source_metadata import read_level_voxel_sizes
+
+        per_level = read_level_voxel_sizes({"backend": fmt, "path": volume}) or []
+        if level < len(per_level):
+            want = tuple(float(v) for v in per_level[level])
+            got = tuple(stored_size[0])[-len(want):]
+            if not np.allclose(got, want):
+                scale_note = (
+                    f"the source records a voxel size of {got} ({stored_size[1]}) but "
+                    f"level {level} of this volume is {want}. The piece will be placed as "
+                    f"given — nothing rescales it — so check --level if it was extracted "
+                    f"from another one")
+                logger.warning("%s", scale_note)
+
     src_dtype, dst_dtype = np.dtype(src_backend.dtype), np.dtype(dst.dtype)
     if src_dtype != dst_dtype and not cast and not np.can_cast(src_dtype, dst_dtype, "safe"):
         raise ValueError(
@@ -262,6 +306,7 @@ def plan_subvolume_write(
         "tiles": tiles, "num_tiles": len(tiles),
         "nbytes": math.prod(extent) * dst_dtype.itemsize,
         "misaligned_axes": _misaligned_axes(start, stop, dst_shape, chunk),
+        "scale_note": scale_note,
     }
 
 

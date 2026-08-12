@@ -33,6 +33,28 @@ def _as_offset(value: Any, where: str) -> tuple[int, ...]:
     return tuple(int(v) for v in np.rint(arr.astype("float64")))
 
 
+def _as_floats(value: Any, where: str) -> tuple[float, ...]:
+    """A stored physical vector as floats. Unlike an offset, these are not whole voxels."""
+    arr = np.asarray(value).ravel()
+    if arr.size == 0:
+        raise ValueError(f"{where} is empty")
+    return tuple(float(v) for v in arr.astype("float64"))
+
+
+def axes_string(value: Any) -> str:
+    """An axis-order attribute as ``"zyx"``, however h5py handed it over.
+
+    ``"zyx"``, ``b"zyx"``, ``["z","y","x"]`` and ``[b"z",b"y",b"x"]`` are all things a
+    writer may leave behind, and h5py's own round-tripping decides which one comes back.
+    """
+    if isinstance(value, bytes):
+        return value.decode()
+    if isinstance(value, str):
+        return value.replace(" ", "")
+    return "".join(v.decode() if isinstance(v, bytes) else str(v)
+                   for v in np.asarray(value).ravel())
+
+
 def datasets(path: str, *, min_ndim: int = 3) -> list[str]:
     """Every dataset in the file with at least ``min_ndim`` dimensions, by path."""
     import h5py
@@ -116,6 +138,42 @@ class HDF5Backend:
         node = self._file.get(name)
         if isinstance(node, h5py.Dataset):
             return _as_offset(node[()], f"/{name}"), f"/{name}"
+        return None
+
+    def stored_voxel_size(self, name: str = "voxel_size"):
+        """A physical voxel size recorded in the file, as ``(value, where)``, or ``None``.
+
+        Same three places and same order as :meth:`stored_offset`, and ``name`` is a
+        parameter for the same reason: ``voxel_size`` is this package's own vocabulary, but
+        a file written by something else may have called it whatever it liked, and the
+        caller is the one who knows.
+        """
+        import h5py
+
+        for attrs, where in ((self._dset.attrs, f"{self._dataset}.attrs[{name!r}]"),
+                             (self._file.attrs, f"/.attrs[{name!r}]")):
+            if name in attrs:
+                return _as_floats(attrs[name], where), where
+        node = self._file.get(name)
+        if isinstance(node, h5py.Dataset):
+            return _as_floats(node[()], f"/{name}"), f"/{name}"
+        return None
+
+    def stored_axes(self, name: str = "axes"):
+        """The axis order the writer recorded, as ``(order, where)``, or ``None``.
+
+        This is what makes :meth:`stored_offset`'s numbers unambiguous. Without it the
+        order genuinely cannot be known — ``voxel_offset`` is precomputed's field name and
+        means xyz there, while everything in this package is zyx — so ``ops/write`` has to
+        ask. A file written by ``em-vol to-hdf5`` says which, and then nobody has to.
+
+        Searched on the dataset first and the root group second, as :meth:`stored_offset`
+        does.
+        """
+        for attrs, where in ((self._dset.attrs, f"{self._dataset}.attrs[{name!r}]"),
+                             (self._file.attrs, f"/.attrs[{name!r}]")):
+            if name in attrs:
+                return axes_string(attrs[name]), where
         return None
 
     def read_region(self, region: Region) -> np.ndarray:

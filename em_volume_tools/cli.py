@@ -775,10 +775,19 @@ def cmd_create(args) -> int:
 
 
 def _source_label(spec: dict) -> str:
-    """How a resolved source spec should be shown: where it is, and what was read."""
+    """How a resolved source spec should be shown: where it is, and what was read.
+
+    A view backend (crop, mask) carries the real source nested under ``source``, so unwrap
+    to it — printing the wrapper's dict tells the reader nothing about which file was read.
+    The views it passed through are named after the location.
+    """
+    views = []
+    while isinstance(spec.get("source"), dict):
+        views.append(spec["backend"])
+        spec = spec["source"]
     where = spec.get("path", spec.get("source", "?"))
-    return f"{where}  [{spec['backend']}" + \
-           (f":{spec['dataset']}]" if spec.get("dataset") else "]")
+    read_as = spec["backend"] + (f":{spec['dataset']}" if spec.get("dataset") else "")
+    return f"{where}  [{', '.join([read_as] + views)}]"
 
 
 def _print_one_write(r: dict) -> None:
@@ -814,6 +823,7 @@ def cmd_write(args) -> int:
         results = write_subvolumes(
             args.volume, args.src, offsets, level=args.level,
             offset_level=args.offset_level, offset_field=args.offset_field,
+            voxel_size_field=args.voxel_size_field,
             offset_order=args.offset_order, src_format=args.src_format,
             dataset=args.dataset, cast=args.cast, dry_run=args.dry_run)
     except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
@@ -1222,6 +1232,65 @@ def cmd_bboxes_json(args) -> int:
                                           "`em-vol ng-url-gen --layer`"), file=err)
     else:
         print(text)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# to-hdf5
+# --------------------------------------------------------------------------- #
+def cmd_to_hdf5(args) -> int:
+    """Pack a small volume into an HDF5 file that `em-vol write` can place.
+
+    The inverse of `write`: this makes the piece, that puts it somewhere. The frame and
+    the position travel with the data, so nobody re-types an offset — and because the
+    axis order is recorded, `write` no longer has to be told it.
+    """
+    from em_volume_tools.ops.pack import pack_hdf5
+
+    axes = tuple(args.axes)
+    if len(axes) != 3 or set(axes) != {"z", "y", "x"}:
+        raise SystemExit(f"--axes must be a permutation of zyx, got {args.axes!r}")
+    crop = _sextuple(args.crop_bbox, "crop-bbox") if args.crop_bbox else (None, None)
+    try:
+        plan = pack_hdf5(
+            args.src, args.out, voxel_size=_ftriple(args.voxel_size, "voxel-size"),
+            voxel_offset=_triple(args.offset, "offset"), units=args.units, axes=axes,
+            level=args.level, crop_start=crop[0], crop_stop=crop[1],
+            dataset=args.dataset, src_dataset=args.src_dataset,
+            src_format=args.src_format, dtype=args.dtype,
+            voxel_size_field=args.voxel_size_field, offset_field=args.offset_field,
+            chunk=_triple(args.chunk, "chunk"),
+            compression=None if args.compression == "none" else args.compression,
+            overwrite=args.overwrite, dry_run=args.dry_run)
+    except (FileNotFoundError, FileExistsError, ValueError, KeyError) as e:
+        raise SystemExit(str(e).strip("'")) from None
+
+    print(f"{plan['out']}{plan['dataset']}")
+    print(f"  source      {_source_label(plan['src_spec'])}"
+          + (f"  level {plan['level']}" if plan["level"] else ""))
+    if plan["crop_origin"] is not None:
+        print("  cropped     " + "  ".join(
+            f"{ax} {a}:{a + n}" for ax, a, n in zip(
+                plan["axes"], plan["crop_origin"], plan["shape"][-3:])))
+    print(f"  shape       {plan['shape']} {plan['dtype']}"
+          f"{'  (channel-leading)' if plan['has_channels'] else ''}"
+          f"   {_human_bytes(plan['nbytes'])}")
+    print(f"  voxel size  {'x'.join(f'{v:g}' for v in plan['voxel_size'])} {plan['units']}")
+    print("  voxel_offset " + "  ".join(f"{ax} {o}" for ax, o
+                                        in zip(plan['axes'], plan['voxel_offset'])))
+    print(f"  axes        {''.join(plan['axes'])}  (recorded, so `em-vol write` need not "
+          f"be told the order)")
+    print(f"  chunk       {plan['chunk'] or 'up to 64 per axis'}"
+          f"   compression {plan['compression'] or 'none'}")
+    if plan["other_datasets"]:
+        print(f"  also holds  {', '.join(plan['other_datasets'])}"
+              f"  — readers must name a dataset")
+    if plan["replacing"]:
+        print("  replacing   the existing dataset of that name")
+    print("--dry-run: nothing written" if args.dry_run else
+          f"wrote {plan['blocks']} block(s); place it with `em-vol write <volume> --src "
+          f"{plan['out']}" + (f" --dataset {plan['dataset']}"
+                              if plan["other_datasets"] else "") + "`")
     return 0
 
 
@@ -1983,12 +2052,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "is omitted. In an HDF5 file this is looked for in the "
                         "dataset's attributes, the root group's attributes, and a "
                         "top-level dataset of that name (default: voxel_offset)")
-    q.add_argument("--offset-order", choices=("zyx", "xyz"), default="zyx",
+    q.add_argument("--voxel-size-field", default="voxel_size", metavar="NAME",
+                   help="what the source calls its recorded voxel size, if any. Used only "
+                        "to CHECK it against the level being written into — a piece "
+                        "extracted from another level fits and places cleanly while being "
+                        "at the wrong resolution, which nothing else here would notice "
+                        "(default: voxel_size)")
+    q.add_argument("--offset-order", choices=("zyx", "xyz"), default=None,
                    help="axis order of the offset, whether typed or read from the "
-                        "source. Worth checking on a stored one: 'voxel_offset' is "
+                        "source. Default: whatever the source RECORDS (an `axes` "
+                        "attribute, as `em-vol to-hdf5` writes), else zyx. Worth "
+                        "checking on a stored offset from elsewhere: 'voxel_offset' is "
                         "precomputed's field name and precomputed means XYZ, while "
-                        "everything in this package is zyx — reversed, the piece "
-                        "lands mirrored through the z=x diagonal (default: zyx)")
+                        "everything in this package is zyx — reversed, the piece lands "
+                        "mirrored through the z=x diagonal. Whichever applied is echoed")
     q.add_argument("--level", type=int, default=0, help="which level to write into")
     q.add_argument("--offset-level", type=int, default=None,
                    help="the level whose voxels --offset is expressed in, when that "
@@ -2084,6 +2161,97 @@ def build_parser() -> argparse.ArgumentParser:
                         "usable one the layer is unitless and will not line up")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_bboxes_json)
+
+    # --- to-hdf5 ------------------------------------------------------------
+    from em_volume_tools.ops.pack import (DEFAULT_DATASET, DEFAULT_OFFSET_FIELD,
+                                          DEFAULT_VOXEL_SIZE_FIELD)
+
+    q = sub.add_parser(
+        "to-hdf5", help="pack a small volume into one HDF5 file, with its frame",
+        description="Pack an image stack (or any readable source) into a single HDF5 "
+                    "file, recording where it belongs and at what scale.\n\n"
+                    "The inverse of `em-vol write`: that places a piece into a large "
+                    "volume, this produces the piece. An image stack off a microscope or "
+                    "an annotation tool has no coordinates attached, so this attaches "
+                    "them — and then `em-vol write <volume> --src piece.h5` needs no "
+                    "--offset at all.\n\n"
+                    "What it records: `voxel_offset` (whole voxels, on the dataset — the "
+                    "field `write` already looks for), and `voxel_size` / `offset` / "
+                    "`units` / `axes` in this package's own vocabulary, on the root and "
+                    "the dataset both. `axes` is the one that earns its keep: the axis "
+                    "order of a stored voxel_offset was previously unknowable from the "
+                    "file — precomputed means xyz, this package means zyx, and reversed, "
+                    "a piece lands mirrored through the z=x diagonal. A file written here "
+                    "says which.\n\n"
+                    f"The dataset defaults to {DEFAULT_DATASET}, which is also what the "
+                    "reader assumes, so a file packed with no arguments reads with none. "
+                    "An existing file is ADDED TO when its recorded frame matches — "
+                    "several pieces of one volume in one file is a legitimate "
+                    "arrangement, each with its own voxel_offset — and refused when it "
+                    "does not. A name already in use needs --dataset or --overwrite.\n\n"
+                    "Reads are blocked, so a volume larger than advertised streams rather "
+                    "than filling memory. Serial and in-process, like `create`/`write`.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("--src", required=True,
+                   help="image stack (directory or glob of ordered 2D slices), or any "
+                        "readable volume")
+    q.add_argument("--out", required=True, metavar="FILE.h5",
+                   help="the HDF5 file to write. Created, or added to if it already "
+                        "records the same frame")
+    q.add_argument("--src-format", default=None,
+                   help="backend for --src (default: auto-detect, falling back to "
+                        "image_stack for a directory or glob of images)")
+    q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
+                   help="physical size of one voxel, e.g. 8,8,8. Required for a source "
+                        "that records none (an image stack, an HDF5 file, a bare array); "
+                        "read from the volume, at --level, when the source is one")
+    q.add_argument("--offset", default=None, metavar="Z,Y,X",
+                   help="whole-voxel position of this piece's (0,0,0) corner in the "
+                        "volume it belongs to, in --axes order. Defaults to the "
+                        "--crop-bbox origin, else 0,0,0")
+    q.add_argument("--level", type=int, default=0,
+                   help="which level of a multiscale --src to read (default: 0). The "
+                        "level's own recorded voxel size becomes the default frame, and "
+                        "--crop-bbox is in that level's voxels, so `em-vol write --level "
+                        "N` puts the piece back where it came from")
+    q.add_argument("--crop-bbox", default=None, metavar="Z0,Y0,X0,Z1,Y1,X1",
+                   help="pack only this box, in --level's voxels. Half-open, clipped to "
+                        "the source. Its origin becomes the recorded voxel_offset unless "
+                        "--offset says otherwise")
+    q.add_argument("--src-dataset", default=None, metavar="NAME",
+                   help="dataset to read, when --src is itself an HDF5 file with more "
+                        "than one")
+    q.add_argument("--voxel-size-field", default=DEFAULT_VOXEL_SIZE_FIELD, metavar="NAME",
+                   help=f"attribute to record the voxel size under, and to READ it from "
+                        f"when --src is an HDF5 file that carries one (default: "
+                        f"{DEFAULT_VOXEL_SIZE_FIELD}, this package's own name). Set it to "
+                        f"match files another tool wrote, so a file stays readable by "
+                        f"whatever wrote its siblings")
+    q.add_argument("--offset-field", default=DEFAULT_OFFSET_FIELD, metavar="NAME",
+                   help=f"attribute to record the voxel offset under (default: "
+                        f"{DEFAULT_OFFSET_FIELD}, which is what `em-vol write` looks for; "
+                        f"change both together or write will not find it)")
+    q.add_argument("--units", default="nm",
+                   help="unit for --voxel-size (default: nm)")
+    q.add_argument("--axes", default="zyx",
+                   help="axis order of the array AND of --voxel-size/--offset, recorded "
+                        "in the file so no reader has to guess (default: zyx)")
+    q.add_argument("--dataset", default=None, metavar="NAME",
+                   help=f"dataset to write (default: {DEFAULT_DATASET}, which is what a "
+                        f"reader assumes when it is not told)")
+    q.add_argument("--dtype", default=None,
+                   help="cast to this dtype (default: the source's)")
+    q.add_argument("--chunk", default=None, metavar="Z,Y,X",
+                   help="HDF5 storage chunk (default: up to 64 per axis). This is what "
+                        "governs partial reads when the piece is written back")
+    q.add_argument("--compression", choices=("gzip", "lzf", "none"), default="gzip",
+                   help="dataset compression (default: gzip)")
+    q.add_argument("--overwrite", action="store_true",
+                   help="replace the dataset if that name is already used")
+    q.add_argument("--dry-run", action="store_true",
+                   help="report what would be written, and write nothing")
+    q.add_argument("--store-logs", action="store_true")
+    q.set_defaults(func=cmd_to_hdf5)
 
     # --- align-bbox ---------------------------------------------------------
     from em_volume_tools.grid import MODES

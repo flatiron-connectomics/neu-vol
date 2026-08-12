@@ -17,7 +17,7 @@ from .backends.base import (ArrayBackend, clear_backend_cache, open_backend,
 from .retry import is_transient, with_retry
 from .profiles import StorageProfile, PROFILES, get_profile
 from .ops import (convert, create_volume, extract_roi, ingest_image_stack,
-                  plan_subvolume_write, plan_volume, rebuild_pyramid,
+                  pack_hdf5, plan_subvolume_write, plan_volume, rebuild_pyramid,
                   write_subvolume, write_subvolumes)
 from .source_metadata import describe, existing_levels, level_spec
 # Location handling + byte/JSON I/O that works the same for local paths and
@@ -52,6 +52,7 @@ __all__ = [
     "write_subvolume",
     "write_subvolumes",
     "plan_subvolume_write",
+    "pack_hdf5",
     "describe",
     "existing_levels",
     "level_spec",
