@@ -361,6 +361,92 @@ def test_an_hdf5_source_supplies_its_own_scale(tmp_path):
     assert plan["axes"] == ("z", "y", "x"), "the recorded order comes along too"
 
 
+def _legacy_file(tmp_path, name="legacy.h5", *, as_datasets=True):
+    """A file written elsewhere: data in `main`, offset and size beside it.
+
+    `as_datasets` puts them where `stored_offset`'s third search location looks — top-level
+    datasets rather than attributes — which is how the files in hand are written.
+    """
+    import h5py
+
+    path = str(tmp_path / name)
+    data = np.arange(8 * 8 * 8, dtype=np.uint16).reshape(8, 8, 8)
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+        if as_datasets:
+            f.create_dataset("voxel_offset", data=np.array([100, 200, 300], np.int64))
+            f.create_dataset("voxel_size", data=np.array([40.0, 8.0, 8.0]))
+        else:
+            f["main"].attrs["voxel_offset"] = np.array([100, 200, 300], np.int64)
+            f["main"].attrs["voxel_size"] = np.array([40.0, 8.0, 8.0])
+    return path, data
+
+
+@pytest.mark.parametrize("as_datasets", [True, False], ids=["datasets", "attrs"])
+def test_a_file_that_describes_itself_is_repacked_without_losing_it(tmp_path, as_datasets):
+    """The offset used to be dropped: repacked, the piece claimed it belonged at 0,0,0.
+
+    Silent, and unrecoverable from the output — which is why this is the case worth pinning.
+    Also note `main` needs no --src-dataset: it is the only 3D dataset, and voxel_offset /
+    voxel_size are 1D, so `sole_dataset` finds it.
+    """
+    src, data = _legacy_file(tmp_path, as_datasets=as_datasets)
+    out = str(tmp_path / "repacked.h5")
+    plan = pack_hdf5(src, out)                       # no --voxel-size, no --offset
+
+    assert plan["voxel_offset"] == (100, 200, 300)
+    assert plan["voxel_size"] == (40.0, 8.0, 8.0)
+    arr, dattrs, _ = _h5(out)
+    np.testing.assert_array_equal(arr, data)
+    assert list(dattrs["voxel_offset"]) == [100, 200, 300]
+
+
+def test_a_box_out_of_a_self_describing_file_lands_at_the_sum(tmp_path):
+    """The piece knows where it sits; the crop knows where it started inside it."""
+    src, data = _legacy_file(tmp_path)
+    out = str(tmp_path / "box.h5")
+    plan = pack_hdf5(src, out, crop_start=(2, 3, 4), crop_stop=(6, 7, 8))
+
+    assert plan["voxel_offset"] == (102, 203, 304)
+    np.testing.assert_array_equal(_h5(out)[0], data[2:6, 3:7, 4:8])
+
+
+def test_an_explicit_offset_still_overrides_what_the_file_says(tmp_path):
+    src, _ = _legacy_file(tmp_path)
+    plan = pack_hdf5(src, str(tmp_path / "o.h5"), voxel_offset=(0, 0, 0))
+    assert plan["voxel_offset"] == (0, 0, 0)
+
+
+def test_a_repacked_file_round_trips_into_a_volume(tmp_path):
+    """The point of repacking: the canonical file places itself, order recorded and all."""
+    from em_volume_tools import write_subvolume
+
+    src, data = _legacy_file(tmp_path)
+    piece = str(tmp_path / "canonical.h5")
+    pack_hdf5(src, piece)
+
+    vol = str(tmp_path / "v.zarr")
+    create_volume(vol, shape=(128, 256, 320), voxel_size=(40, 8, 8), dtype="uint16",
+                  chunk=(8, 8, 8), levels=1)
+    result = write_subvolume(vol, piece)
+    assert result["offset"] == (100, 200, 300)
+    assert "recorded in the source" in result["offset_from"], "axes came from the file"
+    be = open_backend({"backend": "zarr3", "path": f"{vol}/0"})
+    np.testing.assert_array_equal(
+        be.read_region((slice(100, 108), slice(200, 208), slice(300, 308))), data)
+
+
+def test_a_recorded_xyz_order_is_honoured_when_repacking(tmp_path):
+    """If the file says its numbers are xyz, they are reversed once, not twice."""
+    import h5py
+
+    src, _ = _legacy_file(tmp_path, "xyz.h5")
+    with h5py.File(src, "a") as f:
+        f.attrs["axes"] = "xyz"
+    plan = pack_hdf5(src, str(tmp_path / "x.h5"))
+    assert plan["voxel_offset"] == (300, 200, 100), "reversed on the file's own authority"
+
+
 def test_the_offset_field_can_be_renamed(tmp_path):
     src, _ = _stack(tmp_path)
     out = str(tmp_path / "off.h5")

@@ -5,6 +5,12 @@ the piece. An image stack straight off a microscope or an annotation tool is a d
 of PNGs with no coordinates attached; packing it records **where it belongs and at what
 scale**, so `em-vol write` can later place it without anyone re-typing an offset.
 
+An HDF5 source that **already describes itself** is repacked without losing what it says:
+`voxel_offset`, `voxel_size` and any recorded `axes` are read back (as attributes or as
+top-level datasets — files written elsewhere do both) and become the defaults. That makes
+this the way to bring a foreign file into the canonical layout: point it at the file and
+pass nothing.
+
 The source is anything readable — an image stack, an HDF5 file, or **a volume**, in which
 case ``level`` and ``crop_start``/``crop_stop`` take a box out of one level of it. That
 direction closes a loop: extract a region, work on it, write it straight back. Both
@@ -74,7 +80,8 @@ DEFAULT_BLOCK_BYTES = 1 * 1024 ** 3
 
 def resolve_source(src: str | dict, src_format: str | None = None, level: int = 0,
                    dataset: str | None = None,
-                   voxel_size_field: str = "voxel_size") -> tuple[dict, dict]:
+                   voxel_size_field: str = "voxel_size",
+                   offset_field: str = "voxel_offset") -> tuple[dict, dict]:
     """The spec for the level to read, and what the source says about its own frame.
 
     Two kinds of source, and they need different handling:
@@ -104,6 +111,11 @@ def resolve_source(src: str | dict, src_format: str | None = None, level: int = 
         spec = source_spec(src, src_format, dataset)
         frame = {}
         if spec.get("backend") == "hdf5":
+            # An HDF5 file may already describe itself — files written elsewhere routinely
+            # carry `voxel_offset` and `voxel_size`, as attributes or as top-level datasets
+            # (`stored_*` searches both). Repacking one must not quietly drop what it says:
+            # a piece that arrives knowing where it belongs and leaves claiming the origin
+            # is the kind of loss nothing downstream can detect.
             backend = open_backend(spec)
             size = backend.stored_voxel_size(voxel_size_field)
             if size:
@@ -113,6 +125,16 @@ def resolve_source(src: str | dict, src_format: str | None = None, level: int = 
             if order:
                 frame["axes"] = tuple(order[0])
                 logger.info("axes taken from the source, %s", order[1])
+            found = backend.stored_offset(offset_field)
+            if found:
+                # Through `resolve_offset` so the axis-order rule lives in one place: a
+                # recorded `axes` decides it, else zyx, and the provenance says which.
+                from .write import resolve_offset
+
+                value, prov = resolve_offset(backend, None, field=offset_field,
+                                             order=None, ndim=len(found[0]))
+                frame["voxel_offset"] = tuple(value)
+                logger.info("voxel_offset taken %s", prov)
         return spec, frame
 
     volume = str(src).rstrip("/")
@@ -240,7 +262,8 @@ def pack_hdf5(
     # is in, so guessing image_stack from a directory or glob is worth doing rather than
     # demanding --src-format — and `level_spec` for a level of a volume, which also reports
     # the frame that volume already records.
-    spec, frame = resolve_source(src, src_format, level, src_dataset, voxel_size_field)
+    spec, frame = resolve_source(src, src_format, level, src_dataset, voxel_size_field,
+                                 offset_field)
     if voxel_size is None:
         voxel_size = frame.get("voxel_size")
         if voxel_size is None:
@@ -284,7 +307,12 @@ def pack_hdf5(
             has_channels=has_channels, pad_value=0, clip=True)
         backend = open_backend(spec)
     if voxel_offset is None:
-        voxel_offset = crop_origin if crop_origin is not None else (0,) * n_spatial
+        # Where the source says it sits, plus where in it the crop started: a box taken out
+        # of a piece that knows its own position belongs at the sum, not at the box's
+        # offset within the piece. Zeros only when the source records nothing.
+        base = frame.get("voxel_offset") or (0,) * n_spatial
+        voxel_offset = (tuple(b + c for b, c in zip(base, crop_origin))
+                        if crop_origin is not None else tuple(base))
     voxel_offset = tuple(int(v) for v in voxel_offset)
     if not (len(voxel_size) == len(voxel_offset) == len(axes)):
         raise ValueError(f"voxel_size {voxel_size}, voxel_offset {voxel_offset} and axes "

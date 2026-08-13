@@ -2333,8 +2333,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "read from the volume, at --level, when the source is one")
     q.add_argument("--offset", default=None, metavar="Z,Y,X",
                    help="whole-voxel position of this piece's (0,0,0) corner in the "
-                        "volume it belongs to, in --axes order. Defaults to the "
-                        "--crop-bbox origin, else 0,0,0")
+                        "volume it belongs to, in --axes order. Default: what an HDF5 "
+                        "--src already records (--offset-field, searched in the dataset's "
+                        "attributes, the root's, and a top-level dataset of that name), "
+                        "plus the --crop-bbox origin if one is given; else 0,0,0")
     q.add_argument("--level", type=int, default=0,
                    help="which level of a multiscale --src to read (default: 0). The "
                         "level's own recorded voxel size becomes the default frame, and "
