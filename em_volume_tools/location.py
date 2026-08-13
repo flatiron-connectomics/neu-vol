@@ -7,6 +7,7 @@ user-facing location into a kvstore and joins subpaths uniformly.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Mapping
 
 _SCHEMES = {"s3://": "s3", "gs://": "gcs"}
@@ -198,9 +199,33 @@ def write_json(location: str | Mapping[str, Any], obj: Any, *parts: str,
 
 
 def default_progress_path(dst: str | Mapping[str, Any]) -> str:
-    """Default manifest path for a destination (local: alongside it; remote: cwd)."""
+    """Default manifest path for a destination (local: alongside it; remote: cwd).
+
+    A manifest must be an ordinary file — it is appended to and fsynced per task — so for a
+    remote destination it cannot live beside the volume and lands in the working directory
+    instead. That is where the name has to do the disambiguating, and the **last path
+    component alone is not enough**: two prefixes ending in the same word are entirely
+    ordinary (``…/specimen3/gt_v1_eval`` and ``…/specimen5/gt_v1_eval``), and two runs
+    sharing a manifest do not merely interleave a log. They read each other's records on
+    resume and skip each other's blocks, and a ``--fresh`` run truncates the other's
+    history mid-flight. Nothing about the output looks wrong afterwards.
+
+    So a remote name carries a short digest of the **whole** location beside the readable
+    tail: ``gt_v1_eval.4f2a91c7.progress.jsonl``. The digest covers only the identity fields
+    — driver, bucket, path — rather than the kvstore dict, so a field added there later
+    cannot rename the manifest a run is in the middle of appending to. The trailing slash is
+    normalised away for the same reason: ``s3://b/k`` and ``s3://b/k/`` are one destination
+    and must resolve to one manifest, or a resumed run would start over and `em-vol
+    progress` would report on nothing.
+
+    Local destinations keep their old name: a path beside the volume is already unique, and
+    renaming those would orphan every manifest already on disk.
+    """
     kv = to_kvstore(dst)
     if kv.get("driver") == "file":
         return kv["path"].rstrip("/") + ".progress.jsonl"
-    name = kv.get("path", "").rstrip("/").split("/")[-1] or kv.get("bucket", "volume")
-    return name + ".progress.jsonl"
+    path = str(kv.get("path", "")).rstrip("/")
+    name = path.split("/")[-1] or str(kv.get("bucket", "volume"))
+    identity = f"{kv.get('driver', '')}|{kv.get('bucket', '')}|{path}"
+    digest = hashlib.blake2b(identity.encode(), digest_size=4).hexdigest()
+    return f"{name}.{digest}.progress.jsonl"

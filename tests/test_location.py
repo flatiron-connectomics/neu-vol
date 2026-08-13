@@ -44,7 +44,32 @@ def test_spec_kvstore_forms():
 
 def test_default_progress_path():
     assert default_progress_path("/a/vol.zarr") == "/a/vol.zarr.progress.jsonl"
-    assert default_progress_path("s3://b/data/seg").endswith("seg.progress.jsonl")
+    remote = default_progress_path("s3://b/data/seg")
+    assert remote.startswith("seg.") and remote.endswith(".progress.jsonl")
+
+
+def test_remote_manifests_do_not_collide_on_the_last_path_component():
+    """Two runs sharing a manifest skip each other's blocks on resume, silently.
+
+    `…/specimen3/gt_v1_eval` and `…/specimen5/gt_v1_eval` is an ordinary pair of
+    destinations, and the basename alone made them one file.
+    """
+    a = default_progress_path("s3://bucket/wasp-seg-gt/specimen3/gt_v1_eval")
+    b = default_progress_path("s3://bucket/wasp-seg-gt/specimen5/gt_v1_eval")
+    c = default_progress_path("s3://other-bucket/wasp-seg-gt/specimen3/gt_v1_eval")
+    assert a != b != c and a != c
+    assert all(p.startswith("gt_v1_eval.") for p in (a, b, c)), "still readable"
+
+
+def test_one_destination_is_one_manifest_however_it_is_spelled():
+    """Resume and `em-vol progress` both re-derive this name, so it has to be stable.
+
+    A trailing slash resolving to a second manifest would make a resumed run start over
+    and `em-vol progress` report on an empty file.
+    """
+    plain = default_progress_path("s3://b/data/seg")
+    assert default_progress_path("s3://b/data/seg/") == plain
+    assert default_progress_path({"driver": "s3", "bucket": "b", "path": "data/seg"}) == plain
 
 
 # --------------------------------------------------------------------------- #

@@ -503,6 +503,11 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
         for profile, target in _convert_targets(fmt, dst, args.profile, chunk, shard):
             _warn_if_masking_a_destination_that_exists(args, target, masks)
             log.info("%s %s -> %s (%s)", args.command, args.src, target, kind)
+            # Said before the run, not after: it is what you watch progress with, and the
+            # digest in a remote destination's name is not something to reconstruct by eye.
+            from em_volume_tools.location import default_progress_path
+
+            log.info("progress: %s", default_progress_path(target))
             summary = convert(
                 args.src, target, voxel_size=voxel,
                 src_format=getattr(args, "src_format", None),
