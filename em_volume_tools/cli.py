@@ -2605,10 +2605,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="zoom of the 3D panel")
     q.add_argument("--image-opacity", type=float, default=None, metavar="F",
                    help="opacity for the --image layers")
-    q.add_argument("--select", default=None, metavar="NAME",
-                   help="open the side panel on this layer")
+    q.add_argument("--select", default=None, metavar="LAYER_NAME",
+                   help="open the side panel on this layer, i.e. set the state's "
+                        "`selectedLayer` to {visible: true, layer: LAYER_NAME}. The name "
+                        "is the layer's, which for a volume is the last component of its "
+                        "path unless --name gave it another")
     q.add_argument("--select-last", action="store_true",
-                   help="open the side panel on the last layer added — with a bboxes "
+                   help="the same, on whichever layer was added last — with a bboxes "
                         "layer last, that is its clickable list of regions")
     q.add_argument("--viewer", default=DEFAULT_VIEWER,
                    help=f"viewer base URL (default: {DEFAULT_VIEWER})")
