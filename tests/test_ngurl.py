@@ -318,6 +318,20 @@ def test_select_last_opens_the_boxes_panel(tmp_path, capsys):
     assert state["selectedLayer"] == {"visible": True, "layer": "boxes"}
 
 
+def test_hide_slices_sets_show_slices_false_and_is_otherwise_absent(tmp_path, capsys):
+    """Omitted unless asked for, so a link without it opens as the viewer normally would.
+
+    Writing `showSlices: true` by default would look harmless and would override whatever
+    the person opening the link had configured.
+    """
+    vol = _volume(tmp_path, "v")
+    cli.cmd_ng_url_gen(cli._parse_args(["ng-url-gen", "--seg", vol]))
+    assert "showSlices" not in parse_url(capsys.readouterr().out.strip())
+
+    cli.cmd_ng_url_gen(cli._parse_args(["ng-url-gen", "--seg", vol, "--hide-slices"]))
+    assert parse_url(capsys.readouterr().out.strip())["showSlices"] is False
+
+
 def test_out_and_state_out_write_through_the_kvstore(tmp_path, capsys):
     """Parents that do not exist are created, which is what makes s3:// work too."""
     vol = _volume(tmp_path, "v")

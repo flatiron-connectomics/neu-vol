@@ -203,6 +203,7 @@ def build_state(layers: Sequence[dict], *, voxel_size_zyx=None, units: str | Non
                 cross_section_scale: float | None = None,
                 projection_scale: float | None = None,
                 selected: str | None = None,
+                show_slices: bool | None = None,
                 frame: tuple | None = None) -> dict:
     """A viewer state. ``position_zyx`` is zyx and is reversed here, like every coordinate.
 
@@ -213,6 +214,12 @@ def build_state(layers: Sequence[dict], *, voxel_size_zyx=None, units: str | Non
     position and the two zooms the caller did not specify — see :func:`default_view`.
     Without it the state carries none of the three and neuroglancer opens at the origin
     corner, fully zoomed in.
+
+    ``show_slices=False`` sets neuroglancer's ``showSlices``, which hides the cross-section
+    planes *inside the 3D panel* — worth it when the point of the link is meshes or
+    skeletons, which the slices otherwise sit across. It does not touch the 2D panels; use
+    ``layout="3d"`` for that. Left as ``None`` the key is omitted and the viewer's own
+    default (shown) applies.
     """
     from .annotate import output_dimensions
 
@@ -233,6 +240,11 @@ def build_state(layers: Sequence[dict], *, voxel_size_zyx=None, units: str | Non
         state["projectionScale"] = float(projection)
     if selected:
         state["selectedLayer"] = {"visible": True, "layer": selected}
+    if show_slices is not None:
+        # Written only when asked for, like the position and the two zooms above: a state
+        # that carries no `showSlices` gets neuroglancer's own default (true), which is
+        # what someone opening the link would otherwise expect.
+        state["showSlices"] = bool(show_slices)
     return state, warning
 
 

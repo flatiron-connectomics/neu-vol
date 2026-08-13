@@ -1846,6 +1846,7 @@ def cmd_ng_url_gen(args) -> int:
         layout=args.layout, cross_section_scale=args.cross_section_scale,
         projection_scale=args.projection_scale,
         selected=args.select or (layers[-1]["name"] if args.select_last else None),
+        show_slices=False if args.hide_slices else None,
         frame=fit)
     url = state_url(state, args.viewer)
 
@@ -2585,6 +2586,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "use numbers copied straight out of the viewer (default: zyx)")
     q.add_argument("--layout", default="4panel", choices=LAYOUTS,
                    help="neuroglancer panel layout (default: 4panel)")
+    q.add_argument("--hide-slices", action="store_true",
+                   help="set showSlices false, hiding the cross-section planes inside the "
+                        "3D panel — the usual thing to want when the link is about meshes "
+                        "or skeletons. The 2D panels are unaffected; use --layout 3d for "
+                        "those. Omitted from the state unless passed, so a link without it "
+                        "opens the way the viewer normally would")
     q.add_argument("--cross-section-scale", type=float, default=None, metavar="S",
                    help="zoom of the 2D panels: nm per screen pixel, smaller is closer")
     q.add_argument("--projection-scale", type=float, default=None, metavar="S",
