@@ -21,7 +21,7 @@ import logging
 from typing import Any, Sequence
 
 from ..backends.base import open_backend
-from ..source_metadata import detect_backend, read_source_metadata
+from ..source_metadata import detect_backend, location_spec, read_source_metadata
 from ._multiscale import materialize_multiscale
 
 logger = logging.getLogger(__name__)
@@ -135,11 +135,13 @@ def convert(
     mask_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
     mask_value: float = 0,
     background: Sequence[int] | None = None,
+    supervoxels: bool = False,
+    prefer_locked: bool = False,
     profile: str = "local",
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
     dtype: str | None = None,
-    kind: str = "image",
+    kind: str | None = None,
     encoding: str | None = None,
     compressed_segmentation_block_size: Sequence[int] = (8, 8, 8),
     multiscale: bool = True,
@@ -199,16 +201,46 @@ def convert(
                 "pass src_format= explicitly (use 'image_stack' for a directory or "
                 "glob of ordered 2D slices)"
             )
-        # The image-stack backend addresses its input as `source` (a directory or a
-        # glob), not `path`. It is also never auto-detected — a directory of PNGs is
-        # not distinguishable from any other directory of PNGs — so it only arrives
-        # here when asked for by name.
-        src_spec = ({"backend": fmt, "source": src} if fmt == "image_stack"
-                    else {"backend": fmt, "path": src})
+        # Not every source is a store: an image stack is addressed by `source` and a
+        # DVID instance by server/uuid/instance. `location_spec` owns all three forms.
+        src_spec = location_spec(src, fmt)
+
+    if prefer_locked:
+        if src_spec.get("backend") != "dvid":
+            raise ValueError(
+                f"prefer_locked=True applies to DVID sources only, but the source is "
+                f"{src_spec.get('backend')!r}")
+        src_spec["prefer_locked"] = True
+
+    if supervoxels:
+        # Only set when asked, so a spec dict that already carries it is not clobbered
+        # by the default. Rejected rather than ignored for a non-DVID source: silently
+        # dropping it would copy agglomerated bodies while the caller believed they had
+        # asked for supervoxels, and nothing downstream could tell the difference.
+        if src_spec.get("backend") != "dvid":
+            raise ValueError(
+                f"supervoxels=True applies to DVID sources only, but the source is "
+                f"{src_spec.get('backend')!r}")
+        src_spec["supervoxels"] = True
+
     meta = read_source_metadata(src_spec)
 
     # The array/scale to actually read (level 0 of an OME group / finest precomputed scale).
     data_spec = meta["data_spec"] if meta else src_spec
+
+    # Warned here rather than in the metadata reader, which is also on the read-only
+    # inspection path: this is where an export is about to happen, which is what makes
+    # an open node a problem worth interrupting for.
+    if data_spec.get("backend") == "dvid" and meta:
+        from ..backends.dvid import resolve_node, spec_url
+
+        if not resolve_node(data_spec)["locked"]:
+            logger.warning(
+                "dvid node %s is OPEN (not locked), so its data can change while this "
+                "runs and this export is not reproducible. provenance.json will name "
+                "the node. For an immutable snapshot re-run with --dvid-locked, which "
+                "takes the newest locked ancestor. Source: %s",
+                data_spec.get("uuid"), spec_url(data_spec))
 
     # Resolve coordinate metadata: explicit arg > source metadata > default.
     if voxel_size is None:
@@ -225,6 +257,15 @@ def convert(
         offset = meta["offset"]
     if has_channels is None and meta is not None:
         has_channels = meta["has_channels"]
+    if kind is None:
+        # Explicit > what the source records > image. Falling back to `image` when the
+        # source SAYS `segmentation` was the old behaviour and it is indefensible: the
+        # pyramid would average label ids into ids that were never in the data, silently.
+        # That footgun is the reason `copy` exists; inheriting here narrows it to sources
+        # that genuinely record nothing (image stacks, HDF5, bare arrays).
+        kind = (meta or {}).get("kind") or "image"
+        if meta and meta.get("kind"):
+            logger.info("kind=%s, from the source's own metadata", kind)
 
     src_backend = open_backend(data_spec)
     src_shape = src_backend.shape
@@ -273,7 +314,7 @@ def convert(
                 data_spec, dst, read_shape, src_backend.dtype,
                 num_channels if has_channels else 1, tuple(voxel_size))
 
-    return materialize_multiscale(
+    summary = materialize_multiscale(
         src_spec=read_spec,
         src_shape=read_shape,
         src_dtype=str(src_backend.dtype),
@@ -305,3 +346,23 @@ def convert(
         progress_path=progress_path,
         validate=validate,
     )
+
+    # After the data, never before: a provenance record for a run that died half way
+    # through would claim a volume exists that does not. The spec recorded is the
+    # *resolved* one — for DVID that is the concrete node, not the branch ref, which is
+    # the entire point of writing this at all.
+    from . import provenance as _provenance
+
+    _provenance.write(dst, _provenance.build_record(
+        src_spec=(meta or {}).get("provenance_spec") or src_spec,
+        dst=dst,
+        kind=kind,
+        voxel_size=list(voxel_size),
+        crop_start=list(crop_start) if crop_start is not None else None,
+        crop_stop=list(crop_stop) if crop_stop is not None else None,
+        mask_boxes=[[list(lo), list(hi)] for lo, hi in mask_boxes] if mask_boxes else None,
+        background=list(background) if background else None,
+        num_levels=summary.get("num_levels"),
+        status_counts=summary.get("status_counts"),
+    ))
+    return summary

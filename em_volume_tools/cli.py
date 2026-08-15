@@ -79,18 +79,46 @@ def _add_convert_args(p, *, source_defaults: bool):
     crop, resume, the cluster — is identical, so it lives here and cannot drift.
     """
     from_source = " (default: from the source)" if source_defaults else ""
-    p.add_argument("--src", required=True, help="path, s3://..., precomputed or .zarr")
+    p.add_argument("--src", required=True,
+                   help="path, s3://..., precomputed, .zarr, or a DVID labelmap as "
+                        "dvid://SERVER/UUID/INSTANCE — three segments, always: SERVER "
+                        "may carry a port (emdata3:8900) and defaults to http, UUID may "
+                        "be abbreviated or carry a branch (93fdbc:main), INSTANCE is the "
+                        "labelmap name. Use dvid+https:// for a TLS server. e.g. "
+                        "dvid://dvid.example.org/93fdbc:main/labels")
+    p.add_argument("--dvid-supervoxels", action="store_true",
+                   help="read SUPERVOXELS rather than agglomerated bodies (DVID sources "
+                        "only). Default is bodies, i.e. the proofread segmentation")
+    p.add_argument("--dvid-locked", action="store_true",
+                   help="pull the newest LOCKED node at or before the given ref, rather "
+                        "than the ref itself (DVID sources only). A branch ref such as "
+                        "93fdbc:main resolves to the branch HEAD, which in a "
+                        "lock-and-spawn repo is the open, still-mutable node — legal to "
+                        "read, but its data can change while the run is going and the "
+                        "pull is not reproducible. Needs the repo:branch form, since "
+                        "walking ancestors uses DVID's ref~N syntax. Either way the "
+                        "resolved node id is recorded in provenance.json")
     p.add_argument("--dst", required=True,
                    help="destination base (path or s3://bucket/prefix). With "
-                        "--format both, '.precomputed' and '.zarr' are appended")
+                        "--format both, '.precomputed' and '.zarr' are appended. "
+                        "For a DVID source it may contain placeholders resolved from "
+                        "the node actually exported: {uuid} (8 hex chars; {uuid:N} for "
+                        "N, {uuid:full} for all 32), {branch}, {instance} — so "
+                        "'seg_{uuid}' names the export after the version it came from, "
+                        "which a branch ref alone does not")
     p.add_argument("--format", choices=("precomputed", "zarr", "both"),
                    default=None if source_defaults else "precomputed",
                    help="output format" + (from_source or " (default: precomputed)"))
+    # Default None for BOTH commands now: `convert` resolves explicit > source > image,
+    # so a source that records `segmentation` is no longer downgraded to `image` and
+    # averaged into label ids that were never in the data. Only a source recording
+    # nothing (image stack, HDF5, bare array) still falls back to image.
     p.add_argument("--kind", choices=("image", "probability", "segmentation"),
-                   default=None if source_defaults else "image",
+                   default=None,
                    help="reducer for the pyramid: mean for image/probability, "
                         "label-preserving mode for segmentation. Getting this wrong "
-                        "is silent — averaging label ids invents ids" + from_source)
+                        "is silent — averaging label ids invents ids. Default: from the "
+                        "source where it records one, else image")
     p.add_argument("--voxel-size", default=None,
                    help="z,y,x nm (default: from source)")
     p.add_argument("--chunk", default=None if source_defaults else "128,128,128",
@@ -226,16 +254,91 @@ from em_volume_tools.source_metadata import (describe, existing_levels,  # noqa:
 
 
 def _describe(volume: str) -> dict:
-    """``describe`` with a missing volume turned into a clean CLI exit."""
+    """``describe`` with a missing or unaddressable volume turned into a clean CLI exit.
+
+    ``ValueError`` is caught alongside ``FileNotFoundError`` because a location can now
+    be malformed rather than merely absent: a ``dvid://`` URL with the wrong number of
+    segments is a user typo, and its message already says exactly what is wrong, so it
+    should read as an error rather than as a traceback.
+    """
     try:
         return describe(volume)
-    except FileNotFoundError as e:
+    except (FileNotFoundError, ValueError) as e:
         raise SystemExit(str(e)) from None
 
 
 # --------------------------------------------------------------------------- #
 # info
 # --------------------------------------------------------------------------- #
+def _print_dvid_nodes(volume: str) -> None:
+    """Which node a ref points at now, and the newest locked one.
+
+    Both, because they are different answers to "which version would I get" and the
+    difference is exactly the reproducibility question: HEAD of a branch is the open,
+    still-mutable node in a lock-and-spawn repo. The uuids are printed in full so a
+    destination name can be built from one — that is the usual reason to run this.
+    """
+    from em_volume_tools.backends.dvid import node_summary
+    from em_volume_tools.source_metadata import location_spec
+
+    try:
+        summary = node_summary(location_spec(volume, "dvid"))
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"  nodes       (could not resolve: {type(exc).__name__}: {exc})")
+        return
+
+    head, locked = summary["head"], summary["locked"]
+    print(f"  requested   {head['ref']}")
+    print(f"  latest      {head['uuid']}  {'locked' if head['locked'] else 'OPEN'}")
+    if locked is None:
+        print(f"  latest lock (none reachable: {summary['locked_error']})")
+    elif locked["uuid"] == head["uuid"]:
+        print("  latest lock (same as above)")
+    else:
+        print(f"  latest lock {locked['uuid']}  locked, "
+              f"{locked['walked']} ancestor(s) back  [--dvid-locked]")
+    if not head["locked"]:
+        print("              the latest node is OPEN: its data can still change, so an "
+              "export from it\n              is not reproducible. --dvid-locked takes "
+              "the locked one instead.")
+
+
+def _print_provenance(volume: str, full: bool) -> None:
+    """Report ``provenance.json`` if the volume has one.
+
+    A one-line summary by default and the whole document under ``--provenance``: the
+    record is what answers "which proofreading snapshot is this", which is worth
+    surfacing without being asked, but it is too long to print in full every time.
+    """
+    import json
+
+    from em_volume_tools.location import read_json
+    from em_volume_tools.ops.provenance import FILENAME
+
+    try:
+        rec = read_json(volume, FILENAME)
+    except Exception:                                          # noqa: BLE001
+        return                                                 # not a store, or no access
+    if not rec:
+        if full:
+            print(f"\n  no {FILENAME} here — it is written by `em-vol convert`, so a "
+                  f"volume made\n  another way (or before provenance existed) has none.")
+        return
+
+    src = rec.get("source") or {}
+    if full:
+        print(f"\n  {FILENAME}:")
+        for line in json.dumps(rec, indent=2).splitlines():
+            print(f"    {line}")
+        return
+    written, origin = rec.get("written", "?"), src.get("url") or src.get("source") or "?"
+    print(f"\n  provenance  from {origin}")
+    if src.get("uuid"):
+        print(f"              node {src['uuid']} "
+              f"({'locked' if src.get('locked') else 'OPEN'})")
+    print(f"              written {written}   (--provenance for the full record)")
+
+
 def cmd_info(args) -> int:
     d = _describe(args.volume)
     meta = d["meta"] or {}
@@ -251,6 +354,10 @@ def cmd_info(args) -> int:
         print(f"  offset      {tuple(meta['offset'])}")
     if d["has_channels"]:
         print("  channels    yes (leading axis)")
+    if d["format"] == "dvid":
+        _print_dvid_nodes(args.volume)
+    else:
+        _print_provenance(args.volume, getattr(args, "provenance", False))
     if d["other_markers"]:
         # Two volumes in one directory. Whichever loses the detection order is
         # unreachable through every path in this package, but still occupies the store.
@@ -296,22 +403,56 @@ def _warn_if_no_aws(dst: str) -> None:
                     "S3 writes will fail with AccessDenied")
 
 
-def _level0_factor(src: str, scale: int, per_level=None) -> tuple[int, ...]:
+def _src_spec(args, src: str | None = None):
+    """The source spec for a peek at metadata, carrying this command's source options.
+
+    The crop helpers below read the source's voxel sizes *before* `convert` runs, so
+    they build their own spec — and if that spec omits `--dvid-locked`, the peek
+    resolves the branch ref to a different node than the run does, and warns that the
+    node is open when the run is about to use a locked one. One builder, so the peek and
+    the run always ask about the same thing.
+
+    Returns ``(spec, fmt)``; ``fmt`` is None when nothing at the location is a volume.
+    """
+    from em_volume_tools.source_metadata import detect_backend, location_spec
+
+    src = args.src if src is None else src
+    fmt = detect_backend(src)
+    if fmt is None:
+        return None, None
+    spec = location_spec(src, fmt)
+    if fmt == "dvid":
+        if getattr(args, "dvid_locked", False):
+            spec["prefer_locked"] = True
+        if getattr(args, "dvid_supervoxels", False):
+            spec["supervoxels"] = True
+    return spec, fmt
+
+
+def _level0_factor(src: str, scale: int, per_level=None, args=None) -> tuple[int, ...]:
     """How many level-0 voxels one scale-``scale`` voxel spans, per axis.
 
     Read from each level's OWN recorded voxel size, never ``2**scale``: real pyramids
     are anisotropic and ``(1, 2, 2)`` — halve x/y, leave z — is common (CLAUDE.md
     invariant 1). Shape ratios are not used either; ceil-division makes them inexact.
+
+    ``args`` is optional so the volume-argument commands (``align-bbox``, ``relabel``)
+    can keep calling with a bare path; where it is given the source options travel with
+    it, so a DVID peek resolves the same node the run will use.
     """
-    from em_volume_tools.source_metadata import (detect_backend,
+    from em_volume_tools.source_metadata import (detect_backend, location_spec,
                                                  read_level_voxel_sizes)
 
     if per_level is None:
-        fmt = detect_backend(src)
+        if args is not None:
+            spec, fmt = _src_spec(args, src)
+        else:
+            fmt = detect_backend(src)
+            spec = location_spec(src, fmt) if fmt else None
         if fmt is None:
             raise SystemExit(f"--bbox-scale {scale} needs the source's per-level voxel "
                              f"sizes and nothing at {src} looks like a volume")
-        per_level = read_level_voxel_sizes({"backend": fmt, "path": src})
+        per_level = read_level_voxel_sizes(spec)
     if not per_level:
         raise SystemExit(f"--bbox-scale {scale} needs the source's per-level voxel "
                          f"sizes, and {src} records none. Give --crop-bbox in level-0 "
@@ -328,13 +469,12 @@ def _level0_factor(src: str, scale: int, per_level=None) -> tuple[int, ...]:
     return tuple(int(round(f)) for f in factor)
 
 
-def _src_voxel_size(src):
+def _src_voxel_size(args):
     """The source's own level-0 voxel size, or ``None``. Metadata reads only."""
-    from em_volume_tools.source_metadata import (detect_backend,
-                                                 read_source_metadata)
+    from em_volume_tools.source_metadata import read_source_metadata
 
-    fmt = detect_backend(src)
-    meta = read_source_metadata({"backend": fmt, "path": src}) if fmt else None
+    spec, fmt = _src_spec(args)
+    meta = read_source_metadata(spec) if fmt else None
     return tuple(meta["voxel_size"]) if meta else None
 
 
@@ -350,7 +490,7 @@ def _resolve_bbox(value, name, args, per_level=None):
     lo, hi = _sextuple(value, name, order=getattr(args, "bbox_order", "zyx"))
     scale = getattr(args, "bbox_scale", 0) or 0
     if scale:
-        factor = _level0_factor(args.src, scale, per_level)
+        factor = _level0_factor(args.src, scale, per_level, args)
         lo = tuple(a * f for a, f in zip(lo, factor))
         hi = tuple(b * f for b, f in zip(hi, factor))
         log.info("--%s is in scale-%d voxels (%s level-0 voxels each): level-0 box "
@@ -492,11 +632,41 @@ def _warn_if_masking_a_destination_that_exists(args, dst, masks) -> None:
             "the destination) unless you are resuming a run that had the same mask.", dst)
 
 
+def _expand_dst(args, dst: str) -> str:
+    """Resolve ``{uuid}``-style placeholders in a destination, and say what they became.
+
+    Reported rather than done quietly: the resolved path is where the data lands and
+    what the progress manifest is named after, so it is the thing to copy out of the log.
+    """
+    from em_volume_tools.ops.naming import expand, has_placeholder
+
+    if not has_placeholder(dst):
+        return dst
+    spec, fmt = _src_spec(args)
+    if fmt is None:
+        raise SystemExit(f"--dst {dst!r} contains a placeholder, which is resolved from "
+                         f"the source, and nothing at {args.src} looks like a volume")
+    # Resolution has to match what the run will read, so go through the same spec
+    # builder — with --dvid-locked that is a different node than the ref points at.
+    from em_volume_tools.source_metadata import read_source_metadata
+
+    meta = read_source_metadata(spec) or {}
+    try:
+        out = expand(dst, meta.get("provenance_spec") or spec)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
+    log.info("--dst %s -> %s", dst, out)
+    return out
+
+
 def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int:
     """The shared body of ``convert`` and ``copy``: block-map the copy per target."""
     from em_volume_tools import convert
 
-    dst = args.dst.rstrip("/")
+    # Before anything derives from it: the format-suffixed targets, the progress
+    # manifest name and the resume check all take the destination as given, so a path
+    # still holding `{uuid}` would reach every one of them.
+    dst = _expand_dst(args, args.dst.rstrip("/"))
     _warn_if_no_aws(dst)
     crop_start, crop_stop = crop
     with _maybe_cluster(args) as client:
@@ -517,6 +687,8 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
                 mask_value=args.mask_value,
                 background=(_int_list(args.background, "background")
                             if args.background else None),
+                supervoxels=getattr(args, "dvid_supervoxels", False),
+                prefer_locked=getattr(args, "dvid_locked", False),
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
                 sparse=args.sparse,
@@ -535,7 +707,7 @@ def cmd_convert(args) -> int:
     masks = _mask_bboxes(args)
     if crop[0] is not None:
         _warn_if_crop_unaligned(crop[0], tuple(b - a for a, b in zip(*crop)),
-                                voxel or _src_voxel_size(args.src), args)
+                                voxel or _src_voxel_size(args), args)
     return _run_convert(args, fmt=args.format, voxel=voxel, chunk=chunk,
                         shard=_triple(args.shard, "shard"), kind=args.kind, crop=crop,
                         masks=masks)
@@ -543,20 +715,46 @@ def cmd_convert(args) -> int:
 
 def cmd_copy(args) -> int:
     """Copy a volume, or a box out of it, keeping the source's own parameters."""
+    # DVID is not a storage format we can reproduce, so there is nothing here to
+    # "copy": every one of `copy`'s source-derived defaults either does not exist
+    # (format) or is the wrong choice for an output (DVID's 64^3 blocks, which give 8x
+    # the object count of the usual 128^3 — and ceph enforces inode quotas). Calling it
+    # `copy` also suggests the result is a duplicate of a thing that is, in the open-node
+    # case, still changing. `convert` now inherits kind and voxel size from the source
+    # anyway, so it does everything `copy` would have here and says what it does.
+    from em_volume_tools.backends.dvid import is_url as _is_dvid_url
+
+    if _is_dvid_url(args.src):
+        raise SystemExit(
+            f"`copy` does not take a DVID source. Nothing is being duplicated — DVID is "
+            f"a server, not a storage format, so this is a conversion into precomputed "
+            f"or zarr. Use `convert`, which reads the kind and voxel size from the "
+            f"instance just as `copy` would:\n\n"
+            f"    em-vol convert --src {args.src} --dst {args.dst}\n\n"
+            f"Add --dvid-locked for an immutable node, and --crop-bbox to take a box.")
+
     try:
         d = describe(args.src)
+    except ValueError as e:
+        raise SystemExit(str(e)) from None       # malformed location, not a missing one
     except FileNotFoundError:
         raise SystemExit(
             f"no volume found at {args.src}. `copy` takes its format, chunking, voxel "
             f"size and image/segmentation type from the source, so it needs a volume "
-            f"that records them: precomputed (`info`) or an OME-NGFF zarr group. For an "
-            f"image stack, HDF5 or a bare array, use `em-vol convert` and state them.") \
+            f"that records them: precomputed (`info`), an OME-NGFF zarr group, or a "
+            f"DVID labelmap (dvid://server/uuid/instance). For an image stack, HDF5 or "
+            f"a bare array, use `em-vol convert` and state them.") \
             from None
     meta = d["meta"] or {}
 
     # A `.gz`-chunked source (CloudVolume) copies out as PLAIN precomputed, which is
     # much of the point: the copy is addressable by tensorstore, the original is not.
+    # DVID is the same case for a different reason: it is not a storage format we can
+    # write at all, so precomputed here is a DEFAULT rather than the source's own —
+    # which is why `from_source` below excludes it from the "(from the source)" note.
     fmt = args.format or ("zarr" if d["format"] == "zarr3" else "precomputed")
+    fmt_from_source = not args.format and d["format"] in ("zarr3",
+                                                          "neuroglancer_precomputed")
     kind = args.kind or meta.get("kind")
     if kind is None:
         raise SystemExit(
@@ -594,7 +792,7 @@ def cmd_copy(args) -> int:
     nbytes = float(np.dtype(d["dtype"]).itemsize) * math.prod(out_shape)
     dst = args.dst.rstrip("/")
     print(f"{args.src}  ->  {dst}")
-    print(f"  format      {fmt}{'' if args.format else ' (from the source)'}")
+    print(f"  format      {fmt}{' (from the source)' if fmt_from_source else ''}")
     print(f"  dtype       {d['dtype']}")
     print(f"  kind        {kind}{'' if args.kind else ' (from the source)'}")
     print(f"  voxel size  {'x'.join(f'{v:g}' for v in voxel)} nm"
@@ -1921,6 +2119,12 @@ def build_parser() -> argparse.ArgumentParser:
                        description="Report a volume's format, coordinate metadata "
                                    "and the levels present. Reads only.")
     q.add_argument("volume")
+    q.add_argument("--provenance", action="store_true",
+                   help="print the whole provenance.json record if the volume has one "
+                        "(a one-line summary is shown without this). Written by "
+                        "`convert`; it names the source a volume was made from — for a "
+                        "DVID export, the resolved node, which is the only way to say "
+                        "afterwards which proofreading snapshot this is")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_info)
 
@@ -1937,10 +2141,11 @@ def build_parser() -> argparse.ArgumentParser:
                        "defaulting them.",
                        formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("--src-format", default=None,
-                   help="backend for --src (default: auto-detect). Use 'image_stack' "
-                        "for a directory or glob of ordered 2D slices (PNG/TIFF) — "
-                        "that one is never auto-detected, and needs --voxel-size "
-                        "since image files carry no physical scale")
+                   help="backend for --src (default: auto-detect; a dvid:// URL is "
+                        "detected by its scheme). Use 'image_stack' for a directory or "
+                        "glob of ordered 2D slices (PNG/TIFF) — that one is never "
+                        "auto-detected, and needs --voxel-size since image files carry "
+                        "no physical scale")
     _add_convert_args(q, source_defaults=False)
     q.set_defaults(func=cmd_convert)
 

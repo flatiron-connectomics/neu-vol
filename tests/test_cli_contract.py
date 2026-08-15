@@ -14,7 +14,12 @@ import sys
 # conda-only on flyem-forge, or heavy enough that pulling them in would change the docs
 # job from "pip install" to "build a conda environment"
 CONDA_ONLY = ["vol2mesh", "dvidutils", "kimimaro", "DracoPy", "osteoid", "tensorstore",
-              "h5py"]
+              "h5py",
+              # neuclease needs libdvid-cpp and vigra, conda-only on flyem-forge, so it
+              # can never be a pip dep — and `import neuclease.dvid` costs ~9 s, which
+              # would land on every `em-vol --help`. Both reasons point the same way:
+              # the DVID backend must defer its import into the function that needs it.
+              "neuclease", "libdvid"]
 
 
 def test_build_parser_returns_the_parser_without_running_it():

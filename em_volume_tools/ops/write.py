@@ -54,6 +54,18 @@ def source_spec(src: str | Mapping[str, Any], src_format: str | None = None,
     or a directory of PNGs is a *guess* from the name. Here the guess is worth
     making: the inputs are files a person is pointing at one at a time, and a wrong
     guess fails immediately and visibly on open rather than reading zeros.
+
+    TODO: this does not resolve ``dvid://`` URLs, so `em-vol write` and `em-vol to-hdf5`
+    cannot take a DVID source — only `convert` can. `to-hdf5` is the one worth fixing:
+    it already has ``--level`` and ``--crop-bbox``, so taking a box straight out of DVID
+    into an HDF5 piece would close the extract-annotate-write-back loop without anyone
+    typing coordinates twice, and a DVID source only makes sense *with* a bbox anyway —
+    the whole instance is far too large for one file. The work is to route through
+    ``source_metadata.location_spec`` (which owns the three spec forms) while keeping
+    this function's more liberal guessing for the file cases, and to decide where the
+    DVID node options (``--dvid-locked`` / ``--dvid-supervoxels``) live on those
+    commands. Note the name clash: ``source_metadata.location_spec`` is the general
+    resolver; this ``source_spec`` is `write`'s own, more liberal one.
     """
     if isinstance(src, Mapping):
         return dict(src)

@@ -7,6 +7,10 @@ surface (observed: ``UNAVAILABLE ... CURL error SSL connect error: Recv failure:
 Connection reset by peer``, ``curl_code=35``, which killed a 10,692-block copy
 after it had already succeeded).
 
+The same applies to DVID sources, which are HTTP and answer overload with 503 — and
+which typically sit on a **shared** server, so throttling is expected rather than
+exceptional.
+
 **Classification is by message text, not exception type.** TensorStore maps absl
 status codes onto builtin Python exceptions, so both ``PERMISSION_DENIED`` and
 ``UNAVAILABLE`` arrive as ``ValueError`` — the type carries no signal. Permanent
@@ -56,6 +60,22 @@ TRANSIENT_MARKERS = (
     "ServiceUnavailable",
     "RequestTimeout",
     "http_response_code='50",  # 500/503
+
+    # DVID, which reaches us through `requests` rather than tensorstore and therefore
+    # spells everything differently — none of the markers above match a `requests`
+    # exception. Without these an overloaded DVID (which answers with 503) is
+    # unrecognized, and unrecognized means permanent, so one throttle kills the run.
+    # `requests` formats status errors as "<code> Server Error: <reason> for url: ...",
+    # so the code and the word are enough to be specific without matching a URL or a
+    # DVID error body that happens to contain a number.
+    "429 Client Error",      # too many requests: DVID/proxy throttling
+    "500 Server Error",
+    "502 Server Error",
+    "503 Server Error",      # DVID's own overload response
+    "504 Server Error",
+    "Max retries exceeded",  # requests.ConnectionError
+    "Connection aborted",
+    "Read timed out",
 )
 
 

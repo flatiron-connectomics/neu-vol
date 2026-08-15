@@ -100,6 +100,11 @@ def other_format_markers(location: str | Mapping[str, Any], fmt: str) -> list[st
     ``info`` first, so from then on the zarr is unreachable through every path in this
     package while its chunks still occupy the store — and nothing says so.
     """
+    # A DVID instance has no keyspace to shadow: the question this answers — "is there
+    # a second volume of another format underneath this one" — cannot arise, and asking
+    # it would mean reading `dvid://...` as a local path.
+    if fmt == "dvid":
+        return []
     kv = to_kvstore(location)
     if "path" in kv and not str(kv["path"]).endswith("/"):
         kv["path"] = str(kv["path"]) + "/"
@@ -113,11 +118,22 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
     """Detect a source's format from its marker file (no data read).
 
     ``info`` -> neuroglancer-precomputed; ``zarr.json`` -> zarr v3;
-    ``.zarray``/``.zgroup`` -> zarr v2. Returns ``None`` if none match.
+    ``.zarray``/``.zgroup`` -> zarr v2; a ``dvid://`` URL -> ``dvid``. Returns ``None``
+    if none match.
 
     Precomputed whose chunks are ``.gz``-suffixed reports :data:`PRECOMPUTED_GZ`
     instead, so callers fail loudly rather than reading zeros.
     """
+    # DVID is decided by scheme, BEFORE `to_kvstore`, because it is not a store at all:
+    # `to_kvstore` would read `dvid://server/uuid/instance` as a *local file path*,
+    # probe the filesystem for `info`/`zarr.json`, find nothing and return None — which
+    # reaches the user as "could not detect source format", pointing nowhere near the
+    # real problem.
+    from .backends.dvid import is_url as _is_dvid_url
+
+    if _is_dvid_url(location):
+        return "dvid"
+
     kv = to_kvstore(location)
     if "path" in kv and not str(kv["path"]).endswith("/"):
         kv["path"] = str(kv["path"]) + "/"
@@ -162,10 +178,32 @@ def _read_key(kvstore: Mapping[str, Any], key: str) -> bytes | None:
     return read_bytes(dict(kvstore), key)
 
 
+def location_spec(location: str, fmt: str) -> dict[str, Any]:
+    """The backend spec addressing ``location``, in the form ``fmt`` expects.
+
+    Three forms, because not every source is a store: most take ``path``, an image
+    stack takes ``source`` (a directory or glob), and DVID takes
+    ``server``/``uuid``/``instance``. Everything that turns a user-supplied location
+    into a spec goes through here, so a new non-store backend is one branch rather
+    than a search for every place that wrote ``{"backend": fmt, "path": ...}``.
+    """
+    if fmt == "dvid":
+        from .backends.dvid import parse_url
+
+        return {"backend": fmt, **parse_url(location)}
+    # The image-stack backend is never auto-detected — a directory of PNGs looks like
+    # any other directory — so it only arrives here when asked for by name.
+    if fmt == "image_stack":
+        return {"backend": fmt, "source": location}
+    return {"backend": fmt, "path": location}
+
+
 def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
     backend = spec.get("backend")
     if backend == "zarr3":
         return _read_zarr_ome(spec)
+    if backend == "dvid":
+        return _read_dvid(spec)
     # PRECOMPUTED_GZ reads the SAME `info` document — only the chunk keys differ, and
     # metadata does not live in chunks. Omitting it here silently loses voxel_size,
     # offset and kind, which makes `convert` demand --voxel-size and, worse, lose the
@@ -189,6 +227,16 @@ def read_level_voxel_sizes(spec: Mapping[str, Any]) -> list[tuple[float, ...]] |
     in ``(z, y, x)``, spatial axes only.
     """
     backend = spec.get("backend")
+    if backend == "dvid":
+        # DVID's downres really is a factor of 2 on every axis at every level — that is
+        # its documented model, not the `2**level` assumption invariant 1 warns about,
+        # and it must not be generalised to any other backend. The pyramid depth is
+        # whatever the instance recorded in MaxDownresLevel.
+        from .backends.dvid import geometry, instance_info
+
+        geom = geometry(instance_info(spec), spec)
+        return [tuple(v * 2 ** i for v in geom["voxel_size"])
+                for i in range(geom["max_scale"] + 1)]
     if backend in ("neuroglancer_precomputed", PRECOMPUTED_GZ):   # same `info`
         raw = _read_key(_kvstore_of(spec), "info")
         if raw is None:
@@ -246,6 +294,67 @@ def _read_zarr_ome(spec: Mapping[str, Any]) -> dict | None:
     }
 
 
+def _read_dvid(spec: Mapping[str, Any]) -> dict | None:
+    """Coordinate metadata for a DVID labelmap, from one ``/info`` request.
+
+    ``kind`` is **always** ``segmentation``: a labelmap is one by definition, and the
+    consequence of getting it wrong is silent — the pyramid would average label ids
+    into ids that were never in the data (CLAUDE.md invariant 9's sibling hazard, and
+    the reason `copy` exists at all).
+
+    ``offset`` is 0: the backend presents DVID's coordinates origin-anchored, so the
+    output frame already matches DVID's own. ``MinPoint`` is a fact about where data
+    *starts*, not a translation to apply.
+
+    **The branch ref is resolved to a concrete uuid here**, and that is what goes into
+    ``data_spec`` — so every worker reads the node the driver chose. Leaving the ref in
+    place would let a lock-and-spawn landing mid-run move HEAD, and the output would be
+    stitched from two versions of the segmentation with nothing to show it. Reading from
+    an *open* node is legal but not reproducible, so it is warned about.
+    """
+    import logging
+
+    from .backends.dvid import geometry, instance_info, resolve_node
+
+    node = resolve_node(spec, prefer_locked=bool(spec.get("prefer_locked")))
+    # Everything downstream addresses the concrete node. `prefer_locked` is dropped
+    # because it has now been *applied* — carrying it would invite a second resolution
+    # on a worker, which is the drift this exists to prevent.
+    resolved = {k: v for k, v in spec.items() if k != "prefer_locked"}
+    resolved["uuid"] = node["uuid"]
+    # Keep what was actually asked for. "the newest locked node on main" and "this node"
+    # are different provenance claims even when they name the same uuid today, and the
+    # resolved spec is what the record is built from.
+    resolved["requested_ref"] = node["ref"]
+    resolved["ancestors_walked"] = node["walked"]
+
+    # Resolution is reported; the fact that a node is OPEN is *warned about* by the op
+    # that is going to export it, not here. This function is also on the path of
+    # read-only inspection (`em-vol info`, the CLI's crop peeks), where a warning about
+    # reproducibility is noise — `info` prints the open/locked status in its own table.
+    log = logging.getLogger(__name__)
+    if node["uuid"] != str(spec.get("uuid")):
+        log.info("dvid %s resolved to node %s (%s)%s", spec.get("uuid"), node["uuid"],
+                 "locked" if node["locked"] else "OPEN",
+                 f", {node['walked']} ancestor(s) back" if node["walked"] else "")
+
+    geom = geometry(instance_info(resolved), resolved)
+    return {
+        # Carries the caller's backend through, like every other reader here
+        # (invariant 9): `data_spec` selects the reader and must not contradict what
+        # detection decided.
+        "data_spec": {**resolved, "backend": spec.get("backend") or "dvid",
+                      "scale_index": int(spec.get("scale_index", 0))},
+        "provenance_spec": resolved,
+        "voxel_size": geom["voxel_size"],
+        "offset": (0.0,) * len(geom["voxel_size"]),
+        "units": "nm",
+        "spatial_axes": ("z", "y", "x"),
+        "has_channels": False,
+        "kind": "segmentation",
+    }
+
+
 def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
     raw = _read_key(_kvstore_of(spec), "info")
     if raw is None:
@@ -295,6 +404,10 @@ def level_spec(volume: str, fmt: str, level: int) -> dict[str, Any]:
     """
     if fmt == "zarr3":
         return {"backend": fmt, "path": f"{volume.rstrip('/')}/{level}"}
+    if fmt == "dvid":
+        # A DVID level is a downres scale of one instance, addressed the same way
+        # precomputed addresses a scale — by index, not by a distinct location.
+        return {**location_spec(volume, fmt), "scale_index": int(level)}
     return {"backend": fmt, "path": volume, "scale_index": int(level)}
 
 
@@ -308,7 +421,7 @@ def describe(volume: str) -> dict:
     fmt = detect_backend(volume)
     if fmt is None:
         raise FileNotFoundError(f"no volume found at {volume}")
-    spec = {"backend": fmt, "path": volume}
+    spec = location_spec(volume, fmt)
     meta = read_source_metadata(spec)
     level0 = open_backend(meta["data_spec"] if meta else spec)
     shape = tuple(int(s) for s in level0.shape)

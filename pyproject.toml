@@ -25,6 +25,17 @@ dependencies = [
     "imageio",             # PNG / misc 2D image sources
     "em-blockrun",         # shared dask/SLURM chunked-map substrate
 ]
+# NOT declared, and cannot be:
+#   cloud-volume — reads .gz-chunked precomputed (backends/cloudvolume.py). It pins
+#     DracoPy<2 and would downgrade the DracoPy behind em-seg-morpho's mesh
+#     serialisation, so it lives in the separate `em-vol-cv` env.
+#   neuclease    — reads DVID labelmaps (backends/dvid.py). Its own dependencies
+#     include libdvid-cpp, vigra and dvidutils, all conda-only on flyem-forge, and
+#     libdvid is load-bearing rather than incidental: it is what inflates DVID's
+#     compressed label blocks. A pip extra would simply fail to install. Get it with
+#     `mamba install -n em-lib -c flyem-forge -c conda-forge neuclease`.
+# Both backends import cleanly without their library and raise an explanatory
+# ImportError only when a volume actually needs one.
 
 [project.scripts]
 em-vol = "em_volume_tools.cli:main"
