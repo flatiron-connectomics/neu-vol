@@ -311,6 +311,10 @@ def test_prefer_locked_on_a_non_dvid_source_raises(tmp_path):
 # --------------------------------------------------------------------------- #
 @pytest.fixture()
 def fake_repo(monkeypatch):
+    # Guarded like `fake_dag`: neuclease is conda-only, and CI installs from PyPI on purpose
+    # (see .github/workflows) — so a fixture that imports it must SKIP, not error. Without
+    # this, every test using it passes locally and errors in CI.
+    pytest.importorskip("neuclease")
     import neuclease.dvid as nd
 
     monkeypatch.setattr(nd, "fetch_maxlabel", lambda *a, **k: 139103922, raising=False)
