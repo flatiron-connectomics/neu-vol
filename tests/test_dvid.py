@@ -9,6 +9,7 @@ against a real instance; see NOTES-TODO for the measurements and the end-to-end 
 import numpy as np
 import pytest
 
+from em_volume_tools import dvid as canonical_dvid
 from em_volume_tools import source_metadata as sm
 from em_volume_tools.backends import dvid
 
@@ -126,12 +127,20 @@ def stub_info(monkeypatch):
     reached out to a live DVID server — so the suite needed the network, took a network
     round trip per test, and cached a real uuid that then leaked into tests expecting a
     fake one. Tests here must not touch a server at all.
+
+    Patched on `em_volume_tools.dvid`, the module that *defines* them. `backends.dvid`
+    re-exports the same names, but a re-export is a separate binding: patching it would
+    leave `source_metadata` — which imports from the canonical module — calling the real
+    thing. Both call sites reach these through the canonical module attribute so that one
+    patch here covers everything; see `test_stubbing_the_canonical_module_covers_...`.
     """
-    monkeypatch.setattr(dvid, "instance_info", lambda spec: INFO)
-    monkeypatch.setattr(dvid, "resolve_node", lambda spec, prefer_locked=False: {
-        "ref": str(spec.get("uuid")),
-        "uuid": "846e3a" if prefer_locked else "d38898",
-        "locked": bool(prefer_locked), "walked": 1 if prefer_locked else 0})
+    monkeypatch.setattr(canonical_dvid, "instance_info", lambda spec: INFO)
+    monkeypatch.setattr(canonical_dvid, "resolve_node",
+                        lambda spec, prefer_locked=False: {
+                            "ref": str(spec.get("uuid")),
+                            "uuid": "846e3a" if prefer_locked else "d38898",
+                            "locked": bool(prefer_locked),
+                            "walked": 1 if prefer_locked else 0})
 
 
 def test_geometry_is_origin_anchored_not_translated_by_minpoint(stub_info):
@@ -231,7 +240,7 @@ def test_the_backend_is_registered_under_its_tag():
 def fake_dag(monkeypatch):
     """A lock-and-spawn repo: HEAD open, every ancestor locked.
 
-    Matches dvid.example.org, where 447 of 448 nodes on `main` are locked and the one open
+    Matches a production instance, where 447 of 448 nodes on `main` are locked and the open
     node is HEAD.
     """
     pytest.importorskip("neuclease")
@@ -511,3 +520,80 @@ def test_convert_kind_defaults_to_none_so_the_source_can_decide():
     from em_volume_tools import cli
 
     assert cli._parse_args(["convert", "--src", "a", "--dst", "b"]).kind is None
+
+
+# --------------------------------------------------------------------------- #
+# the addressing / labelmap split
+# --------------------------------------------------------------------------- #
+def test_the_backend_reexports_the_shared_names_without_copying_them():
+    """One implementation, two import paths. If these ever drift, the module that got
+    patched and the module that got called stop being the same thing."""
+    for name in ("parse_url", "is_url", "spec_url", "resolve_node", "node_summary",
+                 "instance_info", "node_provenance", "clear_node_cache",
+                 "check_instance_type"):
+        assert getattr(dvid, name) is getattr(canonical_dvid, name), name
+
+
+def test_stubbing_the_canonical_module_covers_every_call_site(monkeypatch):
+    """The regression guard for the addressing split.
+
+    `source_metadata` and the backend both reach these through
+    `em_volume_tools.dvid.<name>`, so one patch governs both. When the backend held its
+    own copies, patching it left `source_metadata` calling the real function — the suite
+    passed only because a live DVID server happened to answer, which is the failure this
+    test exists to make impossible.
+    """
+    calls = []
+
+    def spy_info(spec):
+        calls.append("instance_info")
+        return INFO
+
+    def spy_node(spec, prefer_locked=False):
+        calls.append("resolve_node")
+        return {"ref": "r", "uuid": "d38898", "locked": True, "walked": 0}
+
+    monkeypatch.setattr(canonical_dvid, "instance_info", spy_info)
+    monkeypatch.setattr(canonical_dvid, "resolve_node", spy_node)
+
+    meta = sm.read_source_metadata(sm.location_spec(URL, "dvid"))
+    assert meta["kind"] == "segmentation"
+    assert "instance_info" in calls and "resolve_node" in calls
+
+    calls.clear()
+    dvid.DVIDBackend(sm.location_spec(URL, "dvid"))
+    assert "instance_info" in calls
+
+
+def test_instance_type_and_syncs_are_read_from_base():
+    ann = {"Base": {"TypeName": "annotation", "Syncs": ["labels"]}}
+    assert canonical_dvid.instance_type(ann) == "annotation"
+    assert canonical_dvid.synced_instances(ann) == ["labels"]
+    # A missing or null Syncs is a plain empty list, not None — callers iterate it.
+    assert canonical_dvid.synced_instances({"Base": {"TypeName": "keyvalue"}}) == []
+    assert canonical_dvid.synced_instances({"Base": {"Syncs": None}}) == []
+
+
+def test_check_instance_type_names_what_it_wanted():
+    spec = canonical_dvid.parse_url(URL)
+    assert canonical_dvid.check_instance_type(
+        {"Base": {"TypeName": "annotation"}}, spec, "annotation") == "annotation"
+    with pytest.raises(ValueError, match="expected annotation"):
+        canonical_dvid.check_instance_type({"Base": {"TypeName": "keyvalue"}},
+                                          spec, "annotation")
+    # More than one acceptable type reads as a list, not a tuple repr.
+    with pytest.raises(ValueError, match="expected annotation or keyvalue"):
+        canonical_dvid.check_instance_type({"Base": {"TypeName": "roi"}}, spec,
+                                          "annotation", "keyvalue")
+
+
+def test_node_provenance_carries_no_labelmap_fields(fake_repo, fake_dag):
+    """`maxlabel` and `supervoxels` describe a label array; the shared record must not
+    claim them, or a synapse table's provenance would assert things about labels."""
+    spec = canonical_dvid.parse_url(URL)
+    node = canonical_dvid.resolve_node(spec)
+    rec = canonical_dvid.node_provenance(spec, node)
+    assert "maxlabel" not in rec and "supervoxels" not in rec
+    assert rec["uuid"] == "d38898" and rec["source"] == "dvid"
+    # The labelmap backend is what adds them.
+    assert "supervoxels" in dvid.provenance(spec, node)

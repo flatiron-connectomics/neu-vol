@@ -56,7 +56,7 @@ def _values(src_spec: Mapping[str, Any]) -> dict[str, str]:
     """The substitutable values for this source, or ``{}`` if it offers none."""
     if src_spec.get("backend") != "dvid":
         return {}
-    from ..backends.dvid import resolve_node
+    from ..dvid import resolve_node
 
     # Cached, so this is free when the source metadata has already been read.
     node = resolve_node(src_spec)

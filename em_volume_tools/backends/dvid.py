@@ -1,8 +1,13 @@
 """Read-only backend over a DVID ``labelmap`` instance.
 
 DVID is not a kvstore, so this backend is addressed by ``server``/``uuid``/``instance``
-rather than by a path — see :func:`parse_url` for the URL form and
+rather than by a path — see ``em_volume_tools.dvid.parse_url`` for the URL form and
 ``source_metadata.detect_backend`` for where it is recognised.
+
+**Addressing and version resolution live in** ``em_volume_tools/dvid.py``, not here: they
+are the same for every instance type, and consumers above this package need them without
+wanting an array. This module is only the labelmap part — geometry and the array view.
+The shared names are re-exported below so existing callers keep working.
 
 **Blocks that hold no labels are omitted from DVID's response**, which is why there is
 no occupancy prefilter anywhere in this package for DVID sources: an empty region costs
@@ -27,240 +32,43 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from .. import dvid as _dvid
+# Re-exported: `em_volume_tools.dvid` is their home — addressing and version resolution
+# are the same for every DVID instance type, so they cannot live in a module whose
+# subject is the label array. These aliases exist because this is where callers have
+# always imported them from.
+from ..dvid import (MISSING, check_instance_type, clear_node_cache,  # noqa: F401
+                    instance_info, is_url, node_provenance, node_summary, parse_url,
+                    resolve_node, spec_url)
 from .base import Region, register_backend
 
 TAG = "dvid"
 
-#: Accepted URL schemes -> the scheme handed to neuclease. A bare host gets ``http://``
-#: prepended by neuclease's own ``dvid_api_wrapper``, so ``dvid://`` needs no prefix;
-#: ``dvid+https://`` exists because that wrapper cannot be told to use TLS otherwise.
-_SCHEMES = {"dvid+https://": "https://", "dvid://": ""}
-
-_MISSING = (
-    "Reading a DVID labelmap needs the `neuclease` package, which is not installed "
-    "here.\n\n"
-    "neuclease cannot be a pip dependency: it needs `libdvid-cpp`, `vigra` and "
-    "`dvidutils`, which are conda-only on flyem-forge — and libdvid is load-bearing "
-    "rather than incidental, since it is what inflates DVID's compressed label "
-    "blocks. Install it into the environment instead:\n"
-    "    mamba install -n em-lib -c flyem-forge -c conda-forge neuclease"
-)
-
-
-def parse_url(url: str) -> dict[str, str]:
-    """``dvid://<server>/<uuid>/<instance>`` -> the spec fields.
-
-    Three path segments, always, because all three are required to address an
-    instance and none of them may contain a ``/``:
-
-    - ``server`` may carry a port (``emdata3:8900``) and may be a bare host
-      (``dvid.example.org``), in which case neuclease prepends
-      ``http://``. Use the ``dvid+https://`` scheme for a TLS server.
-    - ``uuid`` may be a bare uuid (``93fdbc``), an abbreviated one, or the
-      ``uuid:branch`` form DVID accepts (``93fdbc:main``).
-    - ``instance`` is the labelmap instance name (``labels``, ``segmentation``).
-
-    Both colons above are why this splits on ``/`` only: a port and a branch
-    qualifier both contain ``:``, and neither contains a slash.
-    """
-    for scheme, prefix in _SCHEMES.items():
-        if url.startswith(scheme):
-            rest, server_prefix = url[len(scheme):], prefix
-            break
-    else:
-        raise ValueError(
-            f"not a DVID URL: {url!r} (expected dvid://server/uuid/instance)")
-
-    parts = [p for p in rest.split("/") if p != ""]
-    if len(parts) != 3:
-        raise ValueError(
-            f"malformed DVID URL {url!r}: expected exactly three segments after the "
-            f"scheme — server, uuid and instance, as in "
-            f"dvid://dvid.example.org/93fdbc:main/labels — but got "
-            f"{len(parts)} ({parts!r}). A port on the server and a ':branch' on the "
-            f"uuid are fine; neither adds a segment.")
-    server, uuid, instance = parts
-    return {"server": server_prefix + server, "uuid": uuid, "instance": instance}
-
-
-def is_url(location: Any) -> bool:
-    """True if this location names a DVID instance rather than a store."""
-    return isinstance(location, str) and location.startswith(tuple(_SCHEMES))
-
-
-def spec_url(spec: Mapping[str, Any]) -> str:
-    """The ``dvid://`` URL for a spec — for messages and provenance."""
-    server = str(spec["server"])
-    scheme = "dvid+https://" if server.startswith("https://") else "dvid://"
-    bare = server.split("://", 1)[-1]
-    return f"{scheme}{bare}/{spec['uuid']}/{spec['instance']}"
-
-
-#: How far back to walk looking for a locked node. In a nightly lock-and-spawn repo the
-#: answer is 1 (measured on dvid.example.org: 448 nodes on `main`, 447 locked, the single open
-#: one being HEAD), so a bound this size only ever matters if something is wrong.
-_MAX_LOCK_WALK = 100
-
-
-#: Resolutions already made, keyed by (server, ref, prefer_locked). A ref costs two
-#: HTTP requests to resolve (resolve_ref + fetch_commit) and several call sites ask
-#: independently — the CLI's crop helpers peek at source metadata before `convert` runs.
-#: Caching also keeps the "this node is OPEN" warning to one line instead of one per
-#: caller. Per process, like every other cache here.
-_NODES: dict[tuple[str, str, bool], dict] = {}
-
-
-def clear_node_cache() -> None:
-    """Drop memoized ref resolutions (tests, and any long-lived process)."""
-    _NODES.clear()
-
-
-def resolve_node(spec: Mapping[str, Any], *, prefer_locked: bool = False) -> dict:
-    """Resolve this spec's ``uuid`` **ref** to a concrete node, and say if it is locked.
-
-    ``uuid`` may be a branch ref (``93fdbc:main``) rather than a node id, and a branch
-    ref resolves to the branch HEAD — which in a lock-and-spawn workflow is the **open**
-    node. Two consequences, and the first is a correctness bug rather than a nicety:
-
-    - **The ref must be resolved once, in the driver, not per worker.** Workers reopen
-      the backend from ``data_spec``; if that carried the ref, a lock-and-spawn landing
-      mid-run would move HEAD and later workers would read a *different node* than
-      earlier ones, producing a volume stitched from two versions with nothing to show
-      it. So ``read_source_metadata`` resolves and puts the concrete uuid in
-      ``data_spec`` — the same discipline as invariant 9.
-    - **An open node is mutable**, so a pull from one is not reproducible even if
-      nothing goes wrong. That is worth saying out loud, which the caller does.
-
-    ``prefer_locked`` walks back to the newest locked node — DVID's own ``ref~N``
-    ancestor syntax, which needs the ``repo:branch`` form; a bare uuid cannot be walked
-    from on a multi-repo server, and is already a pinned node anyway.
-    """
-    try:
-        from neuclease.dvid import fetch_commit, resolve_ref
-    except ImportError as exc:
-        raise ImportError(_MISSING) from exc
-
-    server, ref, _instance = _address(spec)
-    cached = _NODES.get((server, ref, bool(prefer_locked)))
-    if cached is not None:
-        return dict(cached)
-
-    def _remember(node: dict) -> dict:
-        _NODES[(server, ref, bool(prefer_locked))] = dict(node)
-        return node
-
-    uuid = resolve_ref(server, ref, expand=True)
-    locked = bool(fetch_commit(server, uuid))
-    if locked or not prefer_locked:
-        return _remember({"ref": ref, "uuid": uuid, "locked": locked, "walked": 0})
-
-    if ":" not in ref:
-        raise ValueError(
-            f"cannot find a locked node from {ref!r}: walking ancestors uses DVID's "
-            f"'ref~N' syntax, which needs the repo:branch form (e.g. 93fdbc:main). A "
-            f"bare uuid already names one node — drop the locked-node request, or give "
-            f"the branch it is on.")
-    for n in range(1, _MAX_LOCK_WALK + 1):
-        candidate = resolve_ref(server, f"{ref}~{n}", expand=True)
-        if fetch_commit(server, candidate):
-            return _remember(
-                {"ref": ref, "uuid": candidate, "locked": True, "walked": n})
-    raise ValueError(
-        f"no locked node within {_MAX_LOCK_WALK} ancestors of {ref!r}; every one of "
-        f"them is still open, which is not what a lock-and-spawn repo looks like")
-
-
-#: Node fields worth keeping from the repo DAG. `Log` is deliberately omitted — it is
-#: the full mutation log and can be enormous.
-_NODE_FIELDS = ("Branch", "Note", "VersionID", "Created", "Updated")
-
-
-def node_summary(spec: Mapping[str, Any]) -> dict:
-    """Both candidate nodes for a ref: what it points at now, and the newest locked one.
-
-    ``em-vol info`` shows both because they are different answers to "which version
-    would I get", and the choice between them is the choice between a reproducible
-    export and a convenient one. Returns ``{"head": node, "locked": node | None,
-    "locked_error": str | None}``; ``locked`` is the same object as ``head`` when the
-    ref already points at a locked node, and ``None`` when no locked node is reachable
-    (a bare uuid on a multi-repo server cannot be walked back from).
-    """
-    head = resolve_node(spec)
-    if head["locked"]:
-        return {"head": head, "locked": head, "locked_error": None}
-    try:
-        return {"head": head, "locked": resolve_node(spec, prefer_locked=True),
-                "locked_error": None}
-    except Exception as exc:                                   # noqa: BLE001
-        return {"head": head, "locked": None,
-                "locked_error": f"{type(exc).__name__}: {exc}"}
+# Every call below goes through `_dvid.` rather than the aliases above, deliberately: the
+# aliases are separate bindings, so patching one module would leave the other pointing at
+# the real function. One module attribute is one patch point — and a test that stubs the
+# server has to actually stub it, or it silently starts needing the network.
+_MISSING = MISSING
 
 
 def provenance(spec: Mapping[str, Any], node: Mapping[str, Any]) -> dict:
-    """What this pull came from, for the record written beside the output.
+    """What this labelmap pull came from — the shared node record plus label facts.
 
-    The resolved ``uuid`` is the load-bearing field: a branch ref means something
-    different tomorrow, and the whole point of pulling successive proofreading
-    snapshots is being able to say which one you have. ``requested`` keeps the ref that
-    was actually typed, since "the newest locked node on main" and "this node" are
-    different provenance claims even when they name the same uuid today.
-
-    There is **no per-instance mutation id** to record: DVID's mutation id and lastmod
-    endpoints are both per-*body*. What characterises a snapshot instead is the node's
-    own DAG metadata plus ``maxlabel``, which advances as proofreading creates bodies.
+    ``maxlabel`` advances as proofreading creates bodies, so together with the node's DAG
+    metadata it characterises the snapshot. It is per-*instance*, unlike DVID's mutation
+    id and lastmod endpoints, which are both per-body and therefore useless here.
     """
-    server, ref, instance = _address(spec)
-    out = {
-        "source": "dvid",
-        # Pinned to the resolved node, so this URL is reproducible as written.
-        "url": spec_url({**dict(spec), "uuid": node["uuid"]}),
-        "server": server,
-        "requested": node.get("ref", ref),
-        "uuid": node["uuid"],
-        "locked": node["locked"],
-        "ancestors_walked": node.get("walked", 0),
-        "instance": instance,
-        "supervoxels": bool(spec.get("supervoxels", False)),
-    }
-    # Both of these are nice to have and neither is worth failing a completed run over,
-    # so each degrades to a recorded error rather than an exception.
-    try:
-        from neuclease.dvid import fetch_repo_info
-
-        info = fetch_repo_info(server, node["uuid"])
-        dag_node = info["DAG"]["Nodes"][node["uuid"]]
-        out["node"] = {k: dag_node.get(k) for k in _NODE_FIELDS}
-    except Exception as exc:                                   # noqa: BLE001
-        out["node_error"] = f"{type(exc).__name__}: {exc}"[:200]
+    out = _dvid.node_provenance(spec, node)
+    out["supervoxels"] = bool(spec.get("supervoxels", False))
+    # Nice to have, not worth failing a completed run over.
     try:
         from neuclease.dvid import fetch_maxlabel
 
-        out["maxlabel"] = int(fetch_maxlabel(server, node["uuid"], instance))
+        out["maxlabel"] = int(fetch_maxlabel(out["server"], node["uuid"],
+                                             out["instance"]))
     except Exception as exc:                                   # noqa: BLE001
         out["maxlabel_error"] = f"{type(exc).__name__}: {exc}"[:200]
     return out
-
-
-def _address(spec: Mapping[str, Any]) -> tuple[str, str, str]:
-    try:
-        return str(spec["server"]), str(spec["uuid"]), str(spec["instance"])
-    except KeyError as e:
-        raise ValueError(
-            f"DVID spec is missing {e}; it needs 'server', 'uuid' and 'instance'") from e
-
-
-def instance_info(spec: Mapping[str, Any]) -> dict:
-    """DVID's ``/info`` for this instance. Separate so metadata readers need no backend.
-
-    ``read_source_metadata`` calls this rather than opening a backend, keeping the
-    "what is this volume" path one HTTP request rather than a full open.
-    """
-    try:
-        from neuclease.dvid import fetch_instance_info
-    except ImportError as exc:
-        raise ImportError(_MISSING) from exc
-
-    return fetch_instance_info(*_address(spec))
 
 
 def geometry(info: Mapping[str, Any], spec: Mapping[str, Any]) -> dict:
@@ -274,22 +82,18 @@ def geometry(info: Mapping[str, Any], spec: Mapping[str, Any]) -> dict:
     with DVID's own.
     """
     ext = info.get("Extended", {})
-    type_name = info.get("Base", {}).get("TypeName")
-    if type_name != "labelmap":
-        raise ValueError(
-            f"{spec_url(spec)} is a {type_name!r} instance; this backend reads "
-            f"'labelmap' only")
+    _dvid.check_instance_type(info, spec, "labelmap")
 
     lo_xyz, hi_xyz = ext.get("MinPoint"), ext.get("MaxPoint")
     if lo_xyz is None or hi_xyz is None:
         raise ValueError(
-            f"{spec_url(spec)} reports no extents (MinPoint/MaxPoint are null), which "
-            f"DVID does for an instance that has been created but never written to. "
-            f"There is nothing to read.")
+            f"{_dvid.spec_url(spec)} reports no extents (MinPoint/MaxPoint are null), "
+            f"which DVID does for an instance that has been created but never written "
+            f"to. There is nothing to read.")
     lo = tuple(int(v) for v in lo_xyz[::-1])
     if any(v < 0 for v in lo):
         raise ValueError(
-            f"{spec_url(spec)} has a negative MinPoint {lo_xyz!r}. This backend "
+            f"{_dvid.spec_url(spec)} has a negative MinPoint {lo_xyz!r}. This backend "
             f"presents DVID's own coordinates origin-anchored, which would clip data "
             f"at negative indices. Support for a translated frame is not implemented.")
 
@@ -320,14 +124,14 @@ class DVIDBackend:
 
     def __init__(self, spec: Mapping[str, Any]):
         self._spec = dict(spec)
-        self._server, self._uuid, self._instance = _address(spec)
+        self._server, self._uuid, self._instance = _dvid.address(spec)
         self._scale = int(spec.get("scale_index", 0))
         self._supervoxels = bool(spec.get("supervoxels", False))
 
-        geom = geometry(instance_info(spec), spec)
+        geom = geometry(_dvid.instance_info(spec), spec)
         if self._scale > geom["max_scale"]:
             raise ValueError(
-                f"{spec_url(spec)} has scales 0..{geom['max_scale']} "
+                f"{_dvid.spec_url(spec)} has scales 0..{geom['max_scale']} "
                 f"(MaxDownresLevel), but scale {self._scale} was requested")
         self._shape = level_shape(geom["shape0"], self._scale)
         self._chunks = geom["chunks"]

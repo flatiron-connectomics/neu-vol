@@ -278,7 +278,7 @@ def _print_dvid_nodes(volume: str) -> None:
     still-mutable node in a lock-and-spawn repo. The uuids are printed in full so a
     destination name can be built from one — that is the usual reason to run this.
     """
-    from em_volume_tools.backends.dvid import node_summary
+    from em_volume_tools.dvid import node_summary
     from em_volume_tools.source_metadata import location_spec
 
     try:
@@ -722,7 +722,7 @@ def cmd_copy(args) -> int:
     # `copy` also suggests the result is a duplicate of a thing that is, in the open-node
     # case, still changing. `convert` now inherits kind and voxel size from the source
     # anyway, so it does everything `copy` would have here and says what it does.
-    from em_volume_tools.backends.dvid import is_url as _is_dvid_url
+    from em_volume_tools.dvid import is_url as _is_dvid_url
 
     if _is_dvid_url(args.src):
         raise SystemExit(

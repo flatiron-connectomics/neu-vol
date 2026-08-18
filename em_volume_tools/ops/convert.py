@@ -232,7 +232,7 @@ def convert(
     # inspection path: this is where an export is about to happen, which is what makes
     # an open node a problem worth interrupting for.
     if data_spec.get("backend") == "dvid" and meta:
-        from ..backends.dvid import resolve_node, spec_url
+        from ..dvid import resolve_node, spec_url
 
         if not resolve_node(data_spec)["locked"]:
             logger.warning(

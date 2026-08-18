@@ -129,7 +129,9 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
     # probe the filesystem for `info`/`zarr.json`, find nothing and return None — which
     # reaches the user as "could not detect source format", pointing nowhere near the
     # real problem.
-    from .backends.dvid import is_url as _is_dvid_url
+    # From `.dvid`, not `.backends.dvid`: this runs on nearly every op's first step, and
+    # the backend module pulls in numpy and registers itself just to answer a string test.
+    from .dvid import is_url as _is_dvid_url
 
     if _is_dvid_url(location):
         return "dvid"
@@ -188,7 +190,7 @@ def location_spec(location: str, fmt: str) -> dict[str, Any]:
     than a search for every place that wrote ``{"backend": fmt, "path": ...}``.
     """
     if fmt == "dvid":
-        from .backends.dvid import parse_url
+        from .dvid import parse_url
 
         return {"backend": fmt, **parse_url(location)}
     # The image-stack backend is never auto-detected — a directory of PNGs looks like
@@ -232,7 +234,8 @@ def read_level_voxel_sizes(spec: Mapping[str, Any]) -> list[tuple[float, ...]] |
         # its documented model, not the `2**level` assumption invariant 1 warns about,
         # and it must not be generalised to any other backend. The pyramid depth is
         # whatever the instance recorded in MaxDownresLevel.
-        from .backends.dvid import geometry, instance_info
+        from .backends.dvid import geometry
+        from .dvid import instance_info
 
         geom = geometry(instance_info(spec), spec)
         return [tuple(v * 2 ** i for v in geom["voxel_size"])
@@ -314,7 +317,8 @@ def _read_dvid(spec: Mapping[str, Any]) -> dict | None:
     """
     import logging
 
-    from .backends.dvid import geometry, instance_info, resolve_node
+    from .backends.dvid import geometry
+    from .dvid import instance_info, resolve_node
 
     node = resolve_node(spec, prefer_locked=bool(spec.get("prefer_locked")))
     # Everything downstream addresses the concrete node. `prefer_locked` is dropped

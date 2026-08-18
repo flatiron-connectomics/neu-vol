@@ -36,7 +36,8 @@ def source_provenance(spec: Mapping[str, Any]) -> dict[str, Any]:
     """
     backend = spec.get("backend")
     if backend == "dvid":
-        from ..backends.dvid import provenance, resolve_node
+        from ..backends.dvid import provenance
+        from ..dvid import resolve_node
 
         # Already resolved by `read_source_metadata`, so this re-reads a concrete node
         # rather than a ref and cannot pick a different one. `requested_ref` carries
