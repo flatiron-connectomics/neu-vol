@@ -178,14 +178,18 @@ em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
 em-vol write   <volume> --src ... --offset   # put one subvolume into it
 em-vol to-hdf5 --src slices/ --out piece.h5  # pack a piece, frame and position included
 em-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
-em-vol bboxes-json <volume>                  # a viewer layer of boxes over the data
-em-vol annotate-json --points syn.csv        # a viewer layer of your own coordinates
 em-vol relabel <volume> --out ...            # one id range per occupied region
 em-vol mask-by-value <volume> --values 1     # background that is not 0, made 0
-em-vol ng-url-gen --image ... --seg ...      # a neuroglancer link with a full state
 ```
 
-`info`, `progress`, `align-bbox`, `bboxes-json`, `annotate-json` and `ng-url-gen` read
+Anything a **viewer** consumes lives in [em-ngl](../em-ngl): `em-ngl gen` for a link or a
+state, `em-ngl bboxes` for a layer of boxes over a sparse volume's data, `em-ngl annotate`
+for a layer of your own coordinates. This package supplies the occupancy analysis those
+build on (`ops.annotate.labeled_regions`) and otherwise knows nothing about neuroglancer.
+The three used to be `em-vol bboxes-json`, `annotate-json` and `ng-url-gen`; the rename was
+a clean break with no aliases.
+
+`info`, `progress` and `align-bbox` read
 only. `downsample` rebuilds a pyramid **in place** from a
 level you trust — cascaded downsampling means a bad level poisons everything above it
 — and `--dry-run` prints the schedule beside what is on disk, refusing if they
@@ -248,91 +252,21 @@ too. `em-vol write` reports alignment through the same predicate, so the two agr
 
 ### Finding the data in a sparse volume
 
-A volume holding a few labeled boxes inside a large empty frame is hard to *view* —
-the boxes are needles in the frame. `bboxes-json` emits a neuroglancer annotation
-layer with one bounding box per written region, giving a clickable list that jumps
-between them:
+A volume holding a few labeled boxes inside a large empty frame is hard to *view* — the
+boxes are needles in the frame. Finding them is `ops.annotate.labeled_regions`, and the
+boxes come from the volume itself so they cannot drift from the data: an all-fill chunk is
+never stored, so *which chunk objects exist* is the occupancy question exactly — no voxel
+reads. Those cells are then covered with maximal boxes (not connected components: two
+regions written face to face merge into one, plus the empty corner between them), and each
+box is tightened to its nonzero voxels at a coarse level.
+
+`relabel`, `mask-by-value` and `downsample --sparse` all ask that same question. To *see*
+the answer, `em-ngl bboxes` turns it into a viewer layer:
 
 ```bash
-em-vol bboxes-json s3://.../gt_v1 --label gt        # layer JSON to stdout, table to stderr
-em-vol bboxes-json s3://.../gt_v1 --out layer.json  # or s3://... — both work
-em-vol bboxes-json s3://.../gt_v1 --state --out state.json   # a whole loadable state
+em-ngl bboxes s3://.../gt_v1 --label gt                     # layer JSON to stdout
+em-ngl bboxes s3://.../gt_v1 --format url --out link.txt    # or a whole link
 ```
-
-The boxes come from the volume itself, so they cannot drift from the data: an all-fill
-chunk is never stored, so *which chunk objects exist* is the occupancy question exactly
-— no voxel reads. Those cells are then covered with maximal boxes (not connected
-components: two regions written face to face merge into one, plus the empty corner
-between them), and each box is then tightened to its nonzero voxels.
-
-`--tighten-level` defaults to `--level`, so at the default level 0 the boxes are exact
-in the voxels they are reported in, and the reads cost what the level you picked costs.
-Raise it when the occupied footprint is large — each level is a factor smaller to read,
-at the price of quantizing every bound to one voxel there. `--no-tighten` leaves the
-boxes on the chunk grid and reads nothing.
-
-### Annotating coordinates you already have
-
-`annotate-json` is the counterpart: points, boxes, lines and ellipsoids you supply, in
-the same kind of layer. CSV columns are read **by name** (`z,y,x`; `z0,y0,x0,z1,y1,x1`;
-`z,y,x,rz,ry,rx`, plus optional `id`, `description` and `segments`), so a synapse table
-with its own column order and extra columns needs no preparation, and one layer may mix
-kinds. `-` reads stdin; `--point`/`--box`/`--line`/`--ellipsoid` take one inline.
-
-```bash
-em-vol annotate-json --volume s3://.../seg --points synapses.csv --out syn.json
-em-vol ng-url-gen --seg s3://.../seg --layer syn.json --select-last
-```
-
-Coordinates are **level-0 voxels** unless `--scale N` (converted with the volume's real
-per-level voxel sizes, never `2**N`) or `--nm` says otherwise. That is the one mistake
-worth guarding: a coordinate in the wrong unit is still a valid annotation, just
-somewhere else, so anything landing outside the volume's extent is reported.
-
-### Local annotations, and when to reach for the precomputed format
-
-The annotations both commands emit are **local** — inline in the state — because
-neuroglancer does not *list* precomputed annotations: it builds the annotation panel by
-iterating the layer's source, and the class behind every precomputed annotation source
-defines that iterator as empty. Those render in the viewport but cannot be clicked
-through, and there is no reverse "annotations on this segment" panel either.
-
-That bounds a local layer to what a state can carry — thousands. Beyond that,
-`neuroglancer_annotations_v1` is a real on-store format and the right answer: one
-annotation type per source, spatial index levels that subsample so a zoomed-out view
-draws a scattering rather than everything, and a relationship index keyed on segment id
-that makes "this body's synapses" a keyed fetch. Nothing here writes it — see the
-`em-annotate` design note in `NOTES-TODO.md`.
-
-### Sharing a view
-
-`ng-url-gen` builds a neuroglancer link carrying a whole viewer state — which volumes
-are loaded, where the view sits, which segments are selected. It reads the volumes to
-get the source scheme and the coordinate space right, which is the part that fails
-silently by hand: a `dimensions` block that disagrees with the data loads fine and puts
-every layer in the wrong place.
-
-```bash
-em-vol bboxes-json s3://.../gt_v2 --label gt --out gt.json
-em-vol ng-url-gen --image s3://.../em --seg s3://.../gt_v2 \
-    --layer gt.json --segments 1,2,3 --layout xy-3d --select-last
-```
-
-The opening view is centred on the largest volume and zoomed out to fit it, because
-neuroglancer with no `position` opens at the origin **corner** at one voxel per pixel —
-which on a large volume is a view of its empty edge. `--position`,
-`--cross-section-scale` and `--projection-scale` each override that part independently.
-With only `--layer` files, the annotations' own bounding box sets the view instead.
-
-It composes with `bboxes-json` through `--layer`, which takes either a bare layer or a
-whole state and uses its layers, so it does not matter which the other command emitted.
-`--position` is zyx like every other coordinate here; pass `--position-order xyz` to use
-numbers copied straight out of the viewer, since that is what neuroglancer displays.
-
-Everything after `#!` is a URL fragment and never reaches a server, so the link carries
-no data anywhere — but the whole state travels in it, and a large inline annotation layer
-makes for a long URL. `--state-out` writes the JSON alongside for pasting into the `{}`
-editor instead.
 
 ### Ground truth annotated chunk by chunk
 
@@ -347,7 +281,7 @@ em-vol relabel s3://.../gt_v1 --out s3://.../gt_v2             # then --start-le
 em-vol downsample s3://.../gt_v2 --start-level 0
 ```
 
-Regions are the same stored-chunk footprints `bboxes-json` uses, so they are pairwise
+Regions are the same stored-chunk footprints `labeled_regions` reports, so they are pairwise
 disjoint and chunk-aligned — no write is a partial-chunk update. It is serial by
 construction, since each range begins where the last ended, so it runs in the calling
 process with no dask. `--block-size N` numbers region *k* from `N*k+1` instead, making

@@ -134,28 +134,8 @@ def test_an_empty_scale_is_not_gzipped(tmp_path):
                         "chunk_sizes": [[8, 8, 8]]}) is False
 
 
-# --------------------------------------------------------------------------- #
-# what ng-url-gen is allowed to read
-# --------------------------------------------------------------------------- #
-def test_building_a_layer_does_not_open_every_level(tmp_path, monkeypatch):
-    """A link needs the voxel size and the format, both in `info`.
-
-    `describe` additionally opens every level and probes for a foreign marker — the
-    expensive tier — and using it here meant ~20 store opens for numbers already read.
-    """
-    from em_volume_tools.ops import ngurl
-    from em_volume_tools import source_metadata
-
-    dst = _precomputed(tmp_path)
-    calls = []
-    real = source_metadata.existing_levels
-    monkeypatch.setattr(source_metadata, "existing_levels",
-                        lambda *a, **k: calls.append(a) or real(*a, **k))
-
-    layer, frame = ngurl.volume_layer(dst)
-    assert layer["source"].startswith("precomputed://")
-    assert tuple(frame["voxel_size"]) == (8, 8, 8)
-    assert not calls, "volume_layer opened every level to build one layer"
+# The companion to these — that building a viewer layer must not open every level — moved
+# with `volume_layer` to em-ngl, where it is pinned against that package's own caller.
 
 
 def test_limit_is_documented_as_not_bounding_the_request():

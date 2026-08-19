@@ -38,9 +38,11 @@ def test_every_subcommand_is_reachable_from_the_parser():
     parser = cli.build_parser()
     subs = next(a for a in parser._actions
                 if isinstance(a, argparse._SubParsersAction)).choices
+    # bboxes-json, annotate-json and ng-url-gen moved to em-ngl as `bboxes`, `annotate`
+    # and `gen`. A clean break with no aliases, so an old invocation fails loudly.
     assert set(subs) == {"info", "convert", "copy", "downsample", "create", "write",
-                         "to-hdf5", "progress", "bboxes-json", "annotate-json",
-                         "align-bbox", "relabel", "mask-by-value", "ng-url-gen"}
+                         "to-hdf5", "progress",
+                         "align-bbox", "relabel", "mask-by-value"}
     for name, sub in subs.items():
         assert sub.format_usage().strip(), f"{name} renders no usage line"
 

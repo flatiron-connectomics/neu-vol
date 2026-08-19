@@ -332,10 +332,9 @@ em_volume_tools/                # volume/EM-specific
 │   ├── write.py     # write_subvolume: one piece into one level, at a voxel offset
 │   ├── rebuild.py   # rebuild_pyramid: levels above a trusted one, in place
 │   ├── relabel.py   # one disjoint id range per occupied region
-│   ├── annotate.py  # neuroglancer annotation layers: from occupancy (bboxes-json)
-│   │                #   or from supplied coordinates (annotate-json). LOCAL only —
-│   │                #   the precomputed annotation format is em-annotate's job
-│   └── ngurl.py     # a whole viewer state, and the URL that carries it
+│   └── annotate.py  # WHERE a sparse volume's data is: occupied chunks -> maximal
+│                    #   boxes. Analysis, not presentation — em-ngl turns these into
+│                    #   a viewer layer; relabel/maskvalue/--sparse want the boxes
 └── cli.py           # the `em-vol` command (below)
 
 ../em-blockrun/em_blockrun/      # shared dask/SLURM substrate (no EM deps)
@@ -346,8 +345,11 @@ em_volume_tools/                # volume/EM-specific
 
 em_volume_tools/cli.py          # the `em-vol` command:
                                 #   info / convert / copy / downsample / progress /
-                                #   create / write / align-bbox / bboxes-json /
-                                #   annotate-json / relabel / ng-url-gen
+                                #   create / write / to-hdf5 / align-bbox / relabel /
+                                #   mask-by-value
+
+../em-ngl/em_ngl/               # everything a VIEWER consumes (a separate package):
+                                #   em-ngl gen / annotate / bboxes / parse / shaders
 ```
 
 **There are three block grids, and they answer different questions** — `grid.py` does the
@@ -468,14 +470,17 @@ reported rather than silently accepted. These ops run in the calling process, no
 which is also what keeps that hazard confined to what the user does across invocations.
 
 
-## 11. Finding the data again: `bboxes-json`
+## 11. Finding the data again: occupancy boxes
 
 Create-then-write produces a volume that is mostly empty on purpose, and that makes it
 hard to *look at*: twelve labeled boxes in an 11260×9000×13750 frame are needles.
-`em-vol bboxes-json` closes that loop by emitting a neuroglancer annotation layer with
-one box per written region, so the viewer gets a list to click through. It is named for
-its output rather than for "annotations", which said nothing about what it produces —
-and `ng-url-gen` (§13) turns that layer into a link.
+`ops.annotate.labeled_regions` closes that loop by reporting one box per written region.
+
+**This is analysis, and its callers are mostly not viewers.** `relabel` needs the regions
+to give each one a disjoint id range, `mask-by-value` to know what to read, and
+`downsample --sparse` to skip tasks whose input has no stored chunk. Turning the boxes into
+something clickable is `em-ngl bboxes`, in a package above this one — which is why the
+JSON half of this module moved out and only the analysis stayed.
 
 **Occupancy comes from chunk presence, not from voxels.** TensorStore never persists a
 chunk that is entirely the fill value, so on a sparse volume the set of stored objects
@@ -510,27 +515,14 @@ refusing to annotate exactly those would be absurd. Finer means more exact and o
 slower, bounded by the occupied footprint — but it is reported, or an unexplained slow
 run looks like a hang.
 
-**The annotations are local, and that is forced by the viewer, not chosen.**
-Neuroglancer builds its annotation list by iterating the layer's source, and
-`MultiscaleAnnotationSource` — the class behind every *precomputed* annotation source —
-defines `[Symbol.iterator]` as an empty generator. So a precomputed annotation layer
-renders in the viewport and contributes **no rows** to the Annotations tab: nothing to
-click, and `[`/`]` do not step. Since the whole purpose here is navigation, the layer is
-emitted as inline `local://annotations` in the state instead. Two consequences worth
-recording: nothing is written to the store (this op is read-only, unlike every other
-write path in the package), and a precomputed annotation layer would not have helped
-anyway, because unlike meshes and skeletons annotations cannot be named from a volume's
-own `info` — a viewer must add them as a separate source regardless, so a state file is
-the distribution unit either way.
+**Nothing here is written to the store** — this op is read-only, unlike every other write
+path in the package.
 
 **Relabelling reuses the region finder, and that is the point of §12.**
 
-**The layer declares its own `outputDimensions`.** Annotation coordinates are read in
-the layer's frame rather than the viewer's, which is what lets one layer be pasted into
-any state of the same volume. That needs a real unit: precomputed always records nm and
-OME-NGFF spells its units out, but an unrecognised one leaves the layer unitless and
-misaligned, so it warns and points at `--voxel-size` rather than inventing a scale — a
-wrong scale would place every box somewhere plausible and wrong.
+The reasoning about *presenting* these boxes — why the annotations must be local rather than
+a precomputed source, and why the layer declares its own `outputDimensions` — moved to
+em-ngl with the code. It is in that package's README and `em_ngl/layers.py`.
 
 
 ## 12. `relabel`: one id range per occupied region
@@ -579,58 +571,27 @@ refuses rather than letting a region overflow into the next range — which woul
 the exact collision the operation exists to remove.
 
 
-## 13. `ng-url-gen`: the link is the state
+## 13. Why the viewer side is a separate package
 
-Neuroglancer keeps its entire state in the URL fragment, so a link *is* a configured
-viewer. That makes a link the natural unit for sharing a result — and hand-writing one
-the natural way to get it subtly wrong, because a state with the wrong `dimensions` or
-the wrong source scheme **loads without complaint** and shows the data in the wrong
-place, or shows nothing and appears to blame the store.
+Everything that produces something a *viewer* consumes now lives in **em-ngl**: states,
+links, annotation layers, shaders. This package writes volumes and does not know
+neuroglancer exists.
 
-So the values that can be read are read. `detect_backend` decides `precomputed://` vs
-`zarr://`; the coordinate space comes from a volume's recorded voxel size rather than
-being assumed. When no volume establishes one — every layer supplied as a `--layer` file,
-which carries its own frame but not the viewer's — it refuses and asks for
-`--voxel-size`, because that is the case where guessing produces a plausible, wrong
-picture.
+The split was not about file size. It was forced by a layering smell that appeared as soon
+as the viewer side grew: `ops/ngurl.py` had acquired a shader that reads `prop_conf_pre`,
+plus the `body_pre`/`body_post` relationship semantics of a synapse source — concepts owned
+by em-annotation, which sits *above* em-volume-tools. No import violated the layering, but
+the knowledge was in the wrong repository, and every further viewer feature would have
+dragged more of a higher layer's vocabulary downward. A package above both consumers is
+where that belongs.
 
-Decisions worth recording:
+What made it cheap is that the seam already existed. `ops/annotate.py` was two modules
+sharing a file, divided by a section banner: occupancy analysis (which `relabel`,
+`mask-by-value` and `downsample --sparse` all need) and neuroglancer JSON emission (which
+nothing here needs). The analysis stayed, the emission left, and `ops/ngurl.py` — a leaf
+nothing but the CLI imported — moved whole.
 
-**The classic `scheme://` source form, not the newer `kvstore|adapter:` pipeline syntax.**
-Both work in current builds; only the classic one works in older ones, and a link is the
-artefact most likely to be opened by someone running a different viewer than the author.
-
-**Segment ids are strings.** JSON numbers are doubles, so a uint64 body id above 2^53
-would arrive rounded and select a different segment — or nothing. The ids in this dataset
-already reach 3.37 million and there is no reason to assume a ceiling.
-
-**`--position` is zyx, with `--position-order xyz` to override.** Consistent with every
-other coordinate flag in the package (invariant: zyx in memory), but the tension is real
-and worth naming: neuroglancer *displays* xyz, so the numbers a user copies out of the
-viewer to build a link are xyz. The default follows the package; the flag exists because
-the common source of those numbers does not. Both are echoed on every run.
-
-**The opening view is computed, because neuroglancer's default is unusable.** With no
-`position` it opens at the origin **corner**, and with no `crossSectionScale` at one voxel
-per viewport pixel — so a link to an 11260×9000×13750 volume opens on a few microns of its
-empty edge, which reads as a broken link rather than a zoomed-in one. The centre and both
-zooms are derived from the largest volume's own extent, read from the `info` already
-fetched (precomputed carries every scale's `size` and `voxel_offset`), falling back to the
-union of the annotations when every layer came from a file. Each of the three is filled in
-only if the caller did not specify it.
-
-The zoom needs a viewport size, which is not knowable here — it depends on the window and
-the layout — so it assumes a nominal 1000 px and errs large, which errs zoomed *out*.
-Being a factor of two off is harmless and adjustable; opening on the corner is not. When
-nothing establishes a frame at all — a single annotation layer with no annotations — the
-state carries none of the three and says so, rather than inventing a position.
-
-**Layer files are accepted as either a layer or a whole state.** `bboxes-json` can emit
-both shapes, and which one the caller happened to produce is not a distinction worth
-making them care about — a state's `layers` are taken, a bare layer is used as-is.
-
-**Composition over integration.** `ng-url-gen` does not know how to find bounding boxes
-and `bboxes-json` does not know how to make a URL. They meet at a file of JSON, so either
-can be used alone, and neither grows the other's flags. The alternative — a `--bboxes
-<volume>` flag that generated boxes inline — would have duplicated §11 inside §13 and
-given two places for the region-finding behaviour to drift.
+`em-vol bboxes-json`, `annotate-json` and `ng-url-gen` became `em-ngl bboxes`, `annotate`
+and `gen`. A clean break with no aliases, as with the earlier `em-seg-morpho` →
+`em-morpho run` rename: an old invocation fails loudly rather than quietly doing something
+slightly different.
