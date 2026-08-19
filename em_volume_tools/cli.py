@@ -1990,11 +1990,15 @@ def cmd_ng_url_gen(args) -> int:
     """
     from em_volume_tools.ops.ngurl import (DEFAULT_VIEWER, LAYOUTS, LONG_URL,
                                            VolumeProblem, annotation_extent,
+                                           annotation_layer, annotation_layer_pair,
+                                           annotation_source_extent,
+                                           annotation_source_voxel_size,
                                            build_state, load_layer, state_url,
                                            volume_extent, volume_layer)
 
     err = sys.stderr
     layers, frame, extents = [], None, []
+    shader_notes: list[str] = []
     try:
         # --image before --seg so the segmentation draws over the image, which is the
         # order anyone wants and the opposite of alphabetical.
@@ -2014,13 +2018,39 @@ def cmd_ng_url_gen(args) -> int:
             layers.append(layer)
             frame = frame or info
             extents.append(volume_extent(volume, info["format"]))
+        # Annotations after the volumes: the relationships bind to a segmentation layer by
+        # NAME, so that layer has to exist first, and the first --seg is the one they refer to.
+        linked_layer = next((lyr for lyr in layers if lyr["type"] == "segmentation"), None)
+        linked = linked_layer["name"] if linked_layer else None
+        # On by default: following the selection is the point of the relationship index, and a
+        # link that opens with no annotations until a body is picked is the filter working. The
+        # checkbox to undo it lives in the layer's Annotations tab.
+        filtering = bool(args.filter_by_segmentation)
+        for source in args.annotations or []:
+            if args.annotation_split:
+                added, info = annotation_layer_pair(
+                    source, shader=args.annotation_shader, linked_segmentation=linked,
+                    filter_by_segmentation=filtering)
+            else:
+                layer, info = annotation_layer(
+                    source, shader=args.annotation_shader, linked_segmentation=linked,
+                    filter_by_segmentation=filtering)
+                added = [layer]
+            layers.extend(added)
+            shader_notes.append(f"{added[0]['name']}: {info['shader'] or 'no shader'}")
+            extents.append(annotation_source_extent(info["info"]))
+            if frame is None:
+                voxel = annotation_source_voxel_size(info["info"])
+                if voxel:
+                    frame = {"voxel_size": voxel, "units": "nm", "format": "annotations"}
         for path in args.layer or []:
             layers.extend(load_layer(path))
     except (VolumeProblem, ValueError, json.JSONDecodeError) as e:
         raise SystemExit(str(e)) from None
 
     if not layers:
-        raise SystemExit("nothing to show: pass at least one of --image, --seg or --layer")
+        raise SystemExit("nothing to show: pass at least one of --image, --seg, "
+                         "--annotations or --layer")
 
     voxel = _ftriple(args.voxel_size, "voxel-size")
     units = "nm" if voxel else (frame or {}).get("units")
@@ -2056,6 +2086,25 @@ def cmd_ng_url_gen(args) -> int:
     print(f"{len(layers)} layer(s): "
           + ", ".join(f"{lyr['name']} ({lyr['type']})" for lyr in layers), file=err)
     print(f"  voxel size {tuple(voxel)} zyx, units {units or '?'}", file=err)
+    for note in shader_notes:
+        print(f"  shader {note}", file=err)
+    selected_any = any(lyr.get("segments") for lyr in layers)
+    for lyr in layers:
+        if lyr.get("linkedSegmentationLayer"):
+            target = next(iter(lyr["linkedSegmentationLayer"].values()))
+            bound = ", ".join(sorted(lyr["linkedSegmentationLayer"]))
+            filtered = lyr.get("filterBySegmentation")
+            how = (f"; filtered on {', '.join(filtered)}" if filtered
+                   else "; showing every annotation")
+            print(f"  {lyr['name']}: {bound} bound to {target}{how}", file=err)
+            if filtered and not selected_any:
+                # Not a warning: it is what --filter-by-segmentation means. Said out loud
+                # because an empty viewport otherwise looks like a broken layer.
+                print(f"    no segments selected, so this opens EMPTY until you pick a body "
+                      f"(or pass --no-filter-by-segmentation)", file=err)
+        elif lyr["type"] == "annotation" and "source" in lyr:
+            print(f"  {lyr['name']}: NOT bound to a segmentation — pass --seg for the "
+                  f"relationship index to be usable", file=err)
     if position is not None:
         print(f"  position {tuple(position)} zyx "
               f"(given as {args.position_order})", file=err)
@@ -2759,7 +2808,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_relabel)
 
     # --- ng-url-gen ---------------------------------------------------------
-    from em_volume_tools.ops.ngurl import DEFAULT_VIEWER, LAYOUTS
+    from em_volume_tools.ops.ngurl import ANNOTATION_SHADERS, DEFAULT_VIEWER, LAYOUTS
 
     q = sub.add_parser(
         "ng-url-gen", help="a neuroglancer URL carrying a whole viewer state",
@@ -2787,6 +2836,31 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--segments", action="append", metavar="IDS",
                    help="comma-separated segment ids to select, applied to the --seg "
                         "volumes in order. Repeat for a second segmentation")
+    q.add_argument("--annotations", action="append", metavar="SOURCE",
+                   help="a precomputed ANNOTATION source — what `em-annot "
+                        "annotation-source` writes (repeatable). Added as its own layer, "
+                        "because unlike mesh and skeletons an annotation source is never "
+                        "named in a volume's info. Its relationships are bound to the first "
+                        "--seg layer, which is what makes 'only this body's synapses' work")
+    q.add_argument("--annotation-split", action="store_true",
+                   help="add each annotation source as TWO layers on the one source: "
+                        "'-pre' filtered on the presynaptic relationship (the selected body's "
+                        "OUTPUTS) and '-post' on the postsynaptic one (its INPUTS), each "
+                        "showing only its own endpoint marker. One layer filtered on both "
+                        "conflates the two directions and the markers overlap")
+    q.add_argument("--annotation-shader", default=None, metavar="NAME_OR_PATH",
+                   help="GLSL for the annotation layers: a built-in name ("
+                        + ", ".join(ANNOTATION_SHADERS) + "), a file, or 'none'. Default "
+                        "picks a built-in whose properties the source declares, since a "
+                        "shader naming an absent property fails to compile and the layer "
+                        "then draws nothing")
+    q.add_argument("--no-filter-by-segmentation", dest="filter_by_segmentation",
+                   action="store_false",
+                   help="show every annotation instead of only those on the selected "
+                        "segments. By default the filter is ON, so the annotations follow "
+                        "whatever you select — which means a link with no --segments opens "
+                        "showing none until you pick a body. Toggle it per relationship in "
+                        "the layer's ANNOTATIONS tab. The relationships stay bound either way")
     q.add_argument("--layer", action="append", metavar="PATH_OR_URL",
                    help="a JSON file holding a layer, or a state whose layers are taken "
                         "— e.g. the output of `em-vol bboxes-json` (repeatable)")

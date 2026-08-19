@@ -142,3 +142,125 @@ def test_planning_produces_a_usable_spec(tmp_path):
 def test_a_non_positive_key_count_is_refused():
     with pytest.raises(ValueError, match="must be positive"):
         sharded.plan_sharding(0)
+
+
+# --------------------------------------------------------------------------- #
+# compressed morton code — how a sharded index keys a GRID CELL
+# --------------------------------------------------------------------------- #
+def test_bits_are_spent_only_where_the_grid_subdivides():
+    """`2**i < size`, so ceil(log2(size)) — and ZERO for a flat axis. That is the compression."""
+    assert sharded.morton_bits([1, 1, 1]) == [0, 0, 0]
+    assert sharded.morton_bits([2, 1, 1]) == [1, 0, 0]
+    assert sharded.morton_bits([16, 8, 16]) == [4, 3, 4]
+    assert sharded.morton_bits([3, 5, 9]) == [2, 3, 4]
+
+
+def test_x_varies_fastest():
+    """Bit 0 of x is output bit 0, then bit 0 of y, then z — so on a 2x2x2 grid the code is
+    x + 2y + 4z. A row-major flattening gives 4x + 2y + z, i.e. x and z swapped."""
+    grid = [2, 2, 2]
+    assert sharded.compressed_morton_code([1, 0, 0], grid) == 1
+    assert sharded.compressed_morton_code([0, 1, 0], grid) == 2
+    assert sharded.compressed_morton_code([0, 0, 1], grid) == 4
+    assert sharded.compressed_morton_code([1, 1, 1], grid) == 7
+
+
+def test_bits_interleave_rather_than_concatenate():
+    """The whole point of a Morton code: neighbouring cells get nearby keys, so one shard holds
+    a spatially compact set. Concatenating the coordinates would not."""
+    grid = [4, 4, 1]
+    # x=2 (binary 10), y=1 (binary 01): bits go x0,y0,x1,y1 -> 0,1,1,0 -> 0b0110 = 6
+    assert sharded.compressed_morton_code([2, 1, 0], grid) == 6
+
+
+def test_a_flat_axis_contributes_nothing():
+    """grid [4,1,4] spends bits x0, z0, x1, z1 and none on y."""
+    grid = [4, 1, 4]
+    assert sharded.compressed_morton_code([3, 0, 3], grid) == 0b1111
+    # x=1 -> bits (1,0); z=2 -> bits (0,1); interleaved x0,z0,x1,z1 = 1,0,0,1
+    assert sharded.compressed_morton_code([1, 0, 2], grid) == 0b1001
+
+
+def test_the_code_is_a_bijection_over_the_grid():
+    """Every cell must get its own key, or two cells share an object and one is lost."""
+    import itertools
+
+    import numpy as np
+
+    grid = [4, 2, 8]
+    cells = np.array(list(itertools.product(range(4), range(2), range(8))))
+    codes = sharded.compressed_morton_code(cells, grid)
+    assert len(set(codes.tolist())) == len(cells) == 64
+    assert min(codes) == 0 and max(codes) == 63
+
+
+def test_it_agrees_with_a_row_major_index_exactly_where_that_is_misleading():
+    """Degenerate grids give identical keys, which is why substituting one for the other passes
+    every small test and then loses almost everything on a real multi-axis grid."""
+    import itertools
+
+    import numpy as np
+
+    def row_major(cells, grid):
+        return (cells[:, 0] * grid[1] + cells[:, 1]) * grid[2] + cells[:, 2]
+
+    for grid in ([1, 1, 1], [2, 1, 1], [8, 1, 1]):
+        cells = np.array(list(itertools.product(*(range(g) for g in grid))))
+        assert np.array_equal(sharded.compressed_morton_code(cells, grid),
+                              row_major(cells, grid)), grid
+
+    grid = [16, 8, 16]
+    cells = np.array(list(itertools.product(*(range(g) for g in grid))))
+    agree = sharded.compressed_morton_code(cells, grid) == row_major(cells, grid)
+    assert agree.sum() < 0.05 * len(cells), "a multi-axis grid must NOT agree"
+
+
+def test_a_position_of_the_wrong_rank_is_refused():
+    with pytest.raises(ValueError, match="axes"):
+        sharded.compressed_morton_code([1, 2], [4, 4, 4])
+
+
+def test_rewriting_an_index_replaces_it_rather_than_merging(tmp_path):
+    """A sharded index is a key-value store, so writing keys 1..N leaves any other key already
+    present. Rewriting an index whose KEY SPACE changed would then serve both generations, and
+    a reader asking for an old-only key gets a stale answer while every filename looks right."""
+    dst = str(tmp_path / "idx")
+    spec = sharded.plan_sharding(10)
+    sharded.write_all(dst, spec, [(i, b"old") for i in range(10)])
+    sharded.write_all(dst, spec, [(i, b"new") for i in range(5, 15)])
+
+    assert sharded.read_one(dst, spec, 7) == b"new"
+    assert sharded.read_one(dst, spec, 14) == b"new"
+    assert sharded.read_one(dst, spec, 0) is None, "a key only the old write used must be gone"
+
+
+def test_replace_false_keeps_what_was_there(tmp_path):
+    dst = str(tmp_path / "idx")
+    spec = sharded.plan_sharding(10)
+    sharded.write_all(dst, spec, [(i, b"old") for i in range(10)])
+    sharded.write_all(dst, spec, [(i, b"new") for i in range(5, 15)], replace=False)
+    assert sharded.read_one(dst, spec, 0) == b"old"
+    assert sharded.read_one(dst, spec, 7) == b"new"
+
+
+def test_clear_removes_the_shard_objects(tmp_path):
+    dst = str(tmp_path / "idx")
+    spec = sharded.plan_sharding(5_000)
+    sharded.write_all(dst, spec, [(i, b"v") for i in range(5_000)])
+    assert sharded.clear(dst) > 0
+    assert sharded.read_one(dst, spec, 1) is None
+    assert sharded.clear(dst) == 0        # idempotent
+
+
+def test_a_cell_written_at_its_morton_key_reads_back_by_position(tmp_path):
+    """The round trip that matters: write keyed by code, read keyed by code recomputed from the
+    grid position, which is what a viewer does."""
+    grid = [4, 2, 4]
+    spec = sharded.plan_sharding(32)
+    entries = [(sharded.compressed_morton_code([x, y, z], grid), f"{x}-{y}-{z}".encode())
+               for x in range(4) for y in range(2) for z in range(4)]
+    dst = str(tmp_path / "spatial")
+    sharded.write_all(dst, spec, entries)
+    for x, y, z in ((0, 0, 0), (3, 1, 3), (2, 0, 1)):
+        code = sharded.compressed_morton_code([x, y, z], grid)
+        assert sharded.read_one(dst, spec, code) == f"{x}-{y}-{z}".encode()

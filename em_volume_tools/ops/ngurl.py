@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import urllib.parse
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ..source_metadata import PRECOMPUTED_GZ, detect_backend, read_source_metadata
 
@@ -57,6 +57,81 @@ NOMINAL_VIEWPORT_PX = 1000
 
 # Leave a little space around the volume rather than cropping it to the panel edge.
 FIT_MARGIN = 1.15
+
+#: The `@type` a precomputed annotation source declares. Checked rather than assumed,
+#: because an annotation source and a volume are both addressed `precomputed://` and both
+#: have an `info` — pointing --annotations at a volume would otherwise produce a layer that
+#: loads and draws nothing.
+ANNOTATION_TYPE = "neuroglancer_annotations_v1"
+
+#: Shaders for a precomputed annotation layer, by name. A shader lives in the viewer state,
+#: not in the source, so a link is the only place it can be shipped — which is why these are
+#: here rather than in whatever wrote the annotations.
+#:
+#: Each entry names the properties it reads. `pick_shader` will not apply one whose
+#: properties the source does not declare: a shader referencing a `prop_` that does not
+#: exist fails to compile and neuroglancer then draws NOTHING, with the error only visible
+#: in the layer's shader tab.
+#: The endpoint markers, not the line, are what stays legible. A synapse is a few hundred
+#: nanometres long, so at any zoom that shows more than one the line is sub-pixel — and a line
+#: drawn in a blend of the two endpoint colours then swamps the markers and reads as a single
+#: flat colour. So `show_pre`/`show_post` gate the two markers independently and the line is
+#: drawn only when BOTH are on, which is also what makes one source usable as two layers.
+_SYNAPSE_SHADER = """\
+#uicontrol bool show_pre checkbox(default=true)
+#uicontrol bool show_post checkbox(default=true)
+
+#uicontrol float pre_size slider(min=0.0, max=20.0, default=6.0)
+#uicontrol float post_size slider(min=0.0, max=20.0, default=4.0)
+
+#uicontrol vec3 pre_color color(default="#ff2000")
+#uicontrol vec3 post_color color(default="#00c0ff")
+#uicontrol vec3 line_color color(default="#ffffff")
+
+#uicontrol float min_conf slider(min=0.0, max=1.0, default=0.0, step=0.01)
+
+void main() {
+  // NaN fails every comparison, so an UNKNOWN confidence is never hidden here. Unknown is
+  // not the same as low, and this is where that distinction survives into the viewer.
+  if (prop_conf_pre() < min_conf || prop_conf_post() < min_conf) discard;
+
+  setEndpointMarkerColor(vec4(pre_color, 1.0), vec4(post_color, 1.0));
+  setLineColor(line_color);
+
+  // The line is only meaningful when both ends are shown; otherwise it points at something
+  // deliberately hidden, and at these scales its colour would drown the markers.
+  if (show_pre && show_post) {
+    setLineWidth(1.0);
+    setEndpointMarkerSize(pre_size, post_size);
+  } else if (show_pre) {
+    setLineWidth(0.0);
+    setEndpointMarkerSize(pre_size, 0.0);
+  } else if (show_post) {
+    setLineWidth(0.0);
+    setEndpointMarkerSize(0.0, post_size);
+  } else {
+    setLineWidth(0.0);
+    setEndpointMarkerSize(0.0, 0.0);
+  }
+}
+"""
+
+ANNOTATION_SHADERS: dict[str, dict[str, Any]] = {
+    "synapse": {
+        "properties": ("conf_pre", "conf_post"),
+        "doc": "pre/post endpoint markers, independently toggleable, with a confidence "
+               "threshold",
+        "source": _SYNAPSE_SHADER,
+    },
+}
+
+#: `shaderControls` overrides for the two halves of a split pair. Set in the STATE rather than
+#: by generating two shaders, so both layers carry the same code and a user editing one can see
+#: exactly which control the other flipped.
+SPLIT_CONTROLS = {
+    "pre": {"show_pre": True, "show_post": False},
+    "post": {"show_pre": False, "show_post": True},
+}
 
 
 class VolumeProblem(RuntimeError):
@@ -171,6 +246,178 @@ def volume_layer(volume: str, *, kind: str | None = None, name: str | None = Non
         layer["opacity"] = float(opacity)
     return layer, {"voxel_size": meta.get("voxel_size"), "units": meta.get("units"),
                    "format": fmt}
+
+
+def read_annotation_info(source: str) -> dict:
+    """The ``info`` of a precomputed annotation source, refusing anything else.
+
+    A volume and an annotation source are both ``precomputed://`` with an ``info`` at the
+    root, so nothing about the URL distinguishes them — and an annotation layer pointed at a
+    volume loads happily and draws nothing at all. The ``@type`` is the only honest check.
+    """
+    from ..location import read_json
+
+    source = source.rstrip("/")
+    info = read_json(source, "info")
+    if info is None:
+        raise VolumeProblem(f"no info at {source}")
+    if info.get("@type") != ANNOTATION_TYPE:
+        raise VolumeProblem(
+            f"{source} is {info.get('@type') or 'not an annotation source'}, not "
+            f"{ANNOTATION_TYPE}. Volumes go to --image or --seg; --annotations wants a "
+            f"precomputed ANNOTATION source (what `em-annot annotation-source` writes).")
+    return info
+
+
+def pick_shader(info: Mapping[str, Any], name: str | None) -> tuple[str | None, str | None]:
+    """``(shader source, why)`` for an annotation layer.
+
+    ``name`` may be a built-in name, a path to a file of GLSL, ``"none"``, or ``None`` to
+    choose automatically — which means the first built-in whose properties the source
+    actually declares. Automatic rather than a fixed default because a shader naming a
+    ``prop_`` the source lacks does not degrade: it fails to compile and the layer draws
+    nothing, with the error only in the shader tab.
+    """
+    declared = {p["id"] for p in info.get("properties", []) or []}
+    if name == "none":
+        return None, None
+    if name is None:
+        for key, entry in ANNOTATION_SHADERS.items():
+            if declared.issuperset(entry["properties"]):
+                return entry["source"], f"auto-selected {key!r} ({entry['doc']})"
+        return None, ("no built-in shader matches this source's properties "
+                      + (f"({', '.join(sorted(declared))})" if declared else "(none)"))
+    if name in ANNOTATION_SHADERS:
+        entry = ANNOTATION_SHADERS[name]
+        missing = sorted(set(entry["properties"]) - declared)
+        if missing:
+            raise VolumeProblem(
+                f"shader {name!r} reads {', '.join(missing)}, which this source does not "
+                f"declare. A shader naming a property that is absent fails to compile and "
+                f"the layer draws nothing. Declared: "
+                + (", ".join(sorted(declared)) or "no properties"))
+        return entry["source"], f"built-in {name!r}"
+
+    from ..location import read_bytes
+
+    raw = read_bytes(name)
+    if raw is None:
+        raise VolumeProblem(
+            f"--annotation-shader {name!r} is neither a built-in name ("
+            + ", ".join(ANNOTATION_SHADERS) + ", none) nor a readable file")
+    return raw.decode(), f"from {name}"
+
+
+def annotation_layer(source: str, *, name: str | None = None,
+                     shader: str | None = None,
+                     linked_segmentation: str | None = None,
+                     filter_by_segmentation: bool = True,
+                     filter_relationships: Sequence[str] | None = None,
+                     controls: Mapping[str, Any] | None = None) -> tuple[dict, dict]:
+    """One annotation layer for a precomputed annotation source, plus its frame.
+
+    ``linked_segmentation`` is the name of a segmentation layer in the same state, and it is
+    **what makes the relationship index do anything in the viewer**. The source's
+    ``relationships`` are keyed on segment id, but neuroglancer only consults them once each
+    relationship is bound to a layer whose selected segments it can read; without the binding
+    the layer draws every annotation and "this body's synapses" is not available at all.
+
+    ``filter_relationships`` narrows which of them the filter uses. Every relationship stays
+    *bound* regardless — binding is what makes a relationship usable, filtering is what decides
+    whether it restricts the view — and filtering on a subset is what turns one source into
+    "this body's outputs" and "this body's inputs" as separate layers.
+    """
+    source = source.rstrip("/")
+    info = read_annotation_info(source)
+    layer: dict[str, Any] = {
+        "type": "annotation",
+        "name": name or source.rsplit("/", 1)[-1],
+        "source": f"precomputed://{source}",
+    }
+    shader_source, why = pick_shader(info, shader)
+    if shader_source:
+        layer["shader"] = shader_source
+    if controls:
+        layer["shaderControls"] = dict(controls)
+
+    relationships = [r["id"] for r in info.get("relationships", []) or []]
+    if linked_segmentation and relationships:
+        layer["linkedSegmentationLayer"] = {r: linked_segmentation for r in relationships}
+        if filter_by_segmentation:
+            picked = [r for r in (filter_relationships or relationships)
+                      if r in relationships]
+            if filter_relationships and not picked:
+                raise VolumeProblem(
+                    f"none of {', '.join(filter_relationships)} is a relationship of "
+                    f"{source}; it declares " + (", ".join(relationships) or "none"))
+            layer["filterBySegmentation"] = picked
+
+    return layer, {"info": info, "shader": why, "relationships": relationships}
+
+
+#: The relationship whose *own* end of the line is the given side, and the shader controls that
+#: show only that end. Filtering on `body_pre` gives the selected body's OUTPUTS; on `body_post`
+#: its INPUTS. Two layers on one source, which is how the reference dataset presents them.
+SPLIT_SIDES = (("pre", "body_pre"), ("post", "body_post"))
+
+
+def annotation_layer_pair(source: str, *, name: str | None = None,
+                          shader: str | None = None,
+                          linked_segmentation: str | None = None,
+                          filter_by_segmentation: bool = True) -> tuple[list[dict], dict]:
+    """Two layers on one source: the selected body's outputs, then its inputs.
+
+    A single layer filtered on both relationships answers "every synapse touching this body",
+    which conflates the two directions — and drawn together the endpoint markers overlap at any
+    zoom that shows more than a few. Splitting costs nothing on the store (one source, two
+    layers) and each half then has its own visibility, colour and marker size.
+    """
+    base = (name or source.rstrip("/").rsplit("/", 1)[-1])
+    layers, info = [], None
+    for side, relationship in SPLIT_SIDES:
+        layer, info = annotation_layer(
+            source, name=f"{base}-{side}", shader=shader,
+            linked_segmentation=linked_segmentation,
+            filter_by_segmentation=filter_by_segmentation,
+            filter_relationships=[relationship], controls=SPLIT_CONTROLS[side])
+        layers.append(layer)
+    return layers, info
+
+
+def annotation_source_extent(info: Mapping[str, Any]) -> tuple[tuple, tuple] | None:
+    """``(extent_zyx, offset_zyx)`` from an annotation source's declared bounds.
+
+    The format requires ``lower_bound``/``upper_bound``, so an annotations-only link can
+    still open framed on its data rather than at the origin corner — the same job
+    :func:`volume_extent` does for a volume.
+    """
+    lower, upper = info.get("lower_bound"), info.get("upper_bound")
+    if not lower or not upper or len(lower) != 3 or len(upper) != 3:
+        return None
+    lo = [float(v) for v in reversed(lower)]            # stored xyz, wanted zyx
+    hi = [float(v) for v in reversed(upper)]
+    return tuple(max(1.0, h - l) for l, h in zip(lo, hi)), tuple(lo)
+
+
+def annotation_source_voxel_size(info: Mapping[str, Any]) -> tuple | None:
+    """Level-0 voxel size in nm, zyx, from the source's ``dimensions``.
+
+    ``dimensions`` is ``{axis: [scale, unit]}`` in SI, so metres become nanometres here.
+    Lets an annotations-only link establish the viewer's frame without --voxel-size.
+    """
+    dims = info.get("dimensions")
+    if not isinstance(dims, Mapping):
+        return None
+    try:
+        scales = [dims[axis] for axis in ("x", "y", "z")]
+    except KeyError:
+        return None
+    out = []
+    for scale, unit in scales:
+        if unit != "m":
+            return None
+        out.append(float(scale) * 1e9)
+    return tuple(reversed(out))                        # xyz read, zyx returned
 
 
 def load_layer(path: str) -> dict:

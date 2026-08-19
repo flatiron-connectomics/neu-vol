@@ -356,3 +356,238 @@ def test_the_viewer_base_is_overridable(tmp_path, capsys):
 
 def test_ng_url_gen_is_wired():
     assert cli._parse_args(["ng-url-gen", "--image", "v"]).func is cli.cmd_ng_url_gen
+
+
+# --------------------------------------------------------------------------- #
+# precomputed annotation sources
+# --------------------------------------------------------------------------- #
+def _annotation_source(tmp_path, name="syn", *, properties=("conf_pre", "conf_post"),
+                       relationships=("body_pre", "body_post"),
+                       bounds=((0, 0, 0), (600, 800, 1000)), voxel=8e-9):
+    """An annotation source's `info`, which is all these code paths read.
+
+    No index files: nothing here opens one, and writing them would test the sharded kvstore
+    rather than the state assembly.
+    """
+    dst = tmp_path / name
+    dst.mkdir(parents=True, exist_ok=True)
+    (dst / "info").write_text(json.dumps({
+        "@type": "neuroglancer_annotations_v1",
+        "dimensions": {a: [voxel, "m"] for a in ("x", "y", "z")},
+        "lower_bound": list(bounds[0]), "upper_bound": list(bounds[1]),
+        "annotation_type": "line",
+        "properties": [{"id": p, "type": "float32"} for p in properties],
+        "relationships": [{"id": r, "key": f"by_rel_{r}"} for r in relationships],
+        "by_id": {"key": "by_id"},
+        "spatial": [],
+    }))
+    return str(dst)
+
+
+def test_an_annotation_source_becomes_an_annotation_layer(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    layer, _info = annotation_layer(_annotation_source(tmp_path))
+    assert layer["type"] == "annotation"
+    assert layer["source"].startswith("precomputed://")
+
+
+def test_a_volume_passed_as_annotations_is_refused(tmp_path):
+    """Both are `precomputed://` with an `info` at the root, so nothing about the URL tells
+    them apart — and an annotation layer pointed at a volume loads and draws nothing."""
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    with pytest.raises(VolumeProblem, match="neuroglancer_annotations_v1"):
+        annotation_layer(_volume(tmp_path, "v"))
+
+
+def test_the_shader_is_chosen_from_the_properties_the_source_declares(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    layer, info = annotation_layer(_annotation_source(tmp_path))
+    assert "prop_conf_pre()" in layer["shader"]
+    assert "synapse" in info["shader"]
+
+
+def test_no_shader_is_applied_when_the_properties_do_not_match(tmp_path):
+    """A shader naming an absent `prop_` does not degrade — it fails to compile and the layer
+    draws NOTHING, with the error only in the shader tab. So no shader beats a wrong one."""
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    src = _annotation_source(tmp_path, properties=("weight",))
+    layer, info = annotation_layer(src)
+    assert "shader" not in layer
+    assert "no built-in shader matches" in info["shader"]
+
+
+def test_asking_for_a_shader_the_source_cannot_feed_is_an_error(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    src = _annotation_source(tmp_path, properties=("weight",))
+    with pytest.raises(VolumeProblem, match="conf_pre"):
+        annotation_layer(src, shader="synapse")
+
+
+def test_a_shader_can_be_a_file_or_switched_off(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    src = _annotation_source(tmp_path)
+    glsl = tmp_path / "s.glsl"
+    glsl.write_text("void main() { setColor(vec4(1.0)); }")
+    layer, info = annotation_layer(src, shader=str(glsl))
+    assert layer["shader"].startswith("void main()") and str(glsl) in info["shader"]
+
+    layer, _info = annotation_layer(src, shader="none")
+    assert "shader" not in layer
+
+
+def test_an_unknown_shader_name_lists_the_built_ins(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    with pytest.raises(VolumeProblem, match="synapse"):
+        annotation_layer(_annotation_source(tmp_path), shader="nope")
+
+
+def test_relationships_bind_to_the_named_segmentation_layer(tmp_path):
+    """The binding is what makes the relationship index do anything: the source keys its
+    relationships on segment id, but neuroglancer only consults them once each one is bound to
+    a layer whose selection it can read."""
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    layer, _info = annotation_layer(_annotation_source(tmp_path), linked_segmentation="seg")
+    assert layer["linkedSegmentationLayer"] == {"body_pre": "seg", "body_post": "seg"}
+    assert layer["filterBySegmentation"] == ["body_pre", "body_post"]
+
+
+def test_without_a_segmentation_there_is_no_binding(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    layer, _info = annotation_layer(_annotation_source(tmp_path))
+    assert "linkedSegmentationLayer" not in layer
+    assert "filterBySegmentation" not in layer
+
+
+def test_a_split_pair_filters_each_layer_on_one_relationship(tmp_path):
+    """One source, two layers. Filtering on `body_pre` gives the selected body's outputs and on
+    `body_post` its inputs; one layer filtered on both conflates the directions."""
+    from em_volume_tools.ops.ngurl import annotation_layer_pair
+
+    layers, _info = annotation_layer_pair(_annotation_source(tmp_path),
+                                          linked_segmentation="seg")
+    assert [lyr["name"] for lyr in layers] == ["syn-pre", "syn-post"]
+    assert [lyr["filterBySegmentation"] for lyr in layers] == [["body_pre"], ["body_post"]]
+    # both stay BOUND in both layers — binding is what makes a relationship usable at all,
+    # filtering only decides whether it restricts the view
+    for lyr in layers:
+        assert set(lyr["linkedSegmentationLayer"]) == {"body_pre", "body_post"}
+    assert {lyr["source"] for lyr in layers} == {layers[0]["source"]}
+
+
+def test_each_half_of_a_split_pair_shows_only_its_own_endpoint(tmp_path):
+    """Drawn together the two markers overlap at any zoom showing more than a few synapses, and
+    the connecting line's colour swamps them. Each half shows one end."""
+    from em_volume_tools.ops.ngurl import annotation_layer_pair
+
+    layers, _info = annotation_layer_pair(_annotation_source(tmp_path),
+                                          linked_segmentation="seg")
+    assert layers[0]["shaderControls"] == {"show_pre": True, "show_post": False}
+    assert layers[1]["shaderControls"] == {"show_pre": False, "show_post": True}
+    # one shader, two control sets — so a user editing one layer can see what the other flipped
+    assert layers[0]["shader"] == layers[1]["shader"]
+
+
+def test_the_shader_draws_no_line_unless_both_ends_are_shown(tmp_path):
+    """A synapse is a few hundred nm long, so at any useful zoom the line is sub-pixel; drawn in
+    a blend of the endpoint colours it reads as one flat colour and hides the markers."""
+    from em_volume_tools.ops.ngurl import ANNOTATION_SHADERS
+
+    glsl = ANNOTATION_SHADERS["synapse"]["source"]
+    assert "if (show_pre && show_post)" in glsl
+    assert glsl.count("setLineWidth(0.0)") == 3      # every branch but the both-shown one
+
+
+def test_filtering_on_a_relationship_the_source_lacks_is_refused(tmp_path):
+    from em_volume_tools.ops.ngurl import annotation_layer
+
+    src = _annotation_source(tmp_path, relationships=("body_pre",))
+    with pytest.raises(VolumeProblem, match="body_post"):
+        annotation_layer(src, linked_segmentation="seg",
+                         filter_relationships=["body_post"])
+
+
+def test_the_cli_split_flag_adds_both_layers(tmp_path, capsys):
+    vol = _volume(tmp_path, "v", kind="segmentation", dtype="uint64")
+    cli.cmd_ng_url_gen(cli._parse_args(
+        ["ng-url-gen", "--seg", vol, "--annotations", _annotation_source(tmp_path),
+         "--segments", "7", "--annotation-split"]))
+    layers = parse_url(capsys.readouterr().out.strip())["layers"]
+    ann = [lyr for lyr in layers if lyr["type"] == "annotation"]
+    assert [lyr["name"] for lyr in ann] == ["syn-pre", "syn-post"]
+    assert [lyr["filterBySegmentation"] for lyr in ann] == [["body_pre"], ["body_post"]]
+
+
+def test_the_extent_and_voxel_size_come_from_the_sources_own_info(tmp_path):
+    """So an annotations-only link opens framed on its data, and needs no --voxel-size."""
+    from em_volume_tools.ops.ngurl import (annotation_source_extent,
+                                           annotation_source_voxel_size,
+                                           read_annotation_info)
+
+    info = read_annotation_info(_annotation_source(tmp_path))
+    extent, offset = annotation_source_extent(info)
+    assert extent == (1000.0, 800.0, 600.0)          # xyz bounds read back as zyx
+    assert offset == (0.0, 0.0, 0.0)
+    assert annotation_source_voxel_size(info) == (8.0, 8.0, 8.0)
+
+
+def test_the_cli_adds_the_layer_bound_to_the_first_segmentation(tmp_path, capsys):
+    vol = _volume(tmp_path, "v", kind="segmentation", dtype="uint64")
+    src = _annotation_source(tmp_path)
+    assert cli.cmd_ng_url_gen(cli._parse_args(
+        ["ng-url-gen", "--seg", vol, "--annotations", src, "--segments", "7"])) == 0
+    layers = parse_url(capsys.readouterr().out.strip())["layers"]
+    ann = [lyr for lyr in layers if lyr["type"] == "annotation"][0]
+    assert ann["linkedSegmentationLayer"] == {"body_pre": "v", "body_post": "v"}
+    assert ann["filterBySegmentation"] == ["body_pre", "body_post"]
+
+
+def test_filtering_is_on_by_default_even_with_nothing_selected(tmp_path, capsys):
+    """Following the selection is the point of the relationship index, so the filter is written
+    whether or not --segments picked anything. Such a link opens with no annotations until a body
+    is clicked, which is the filter working rather than a broken layer."""
+    vol = _volume(tmp_path, "v", kind="segmentation", dtype="uint64")
+    assert cli.cmd_ng_url_gen(cli._parse_args(
+        ["ng-url-gen", "--seg", vol, "--annotations", _annotation_source(tmp_path)])) == 0
+    out = capsys.readouterr()
+    ann = [lyr for lyr in parse_url(out.out.strip())["layers"]
+           if lyr["type"] == "annotation"][0]
+    assert ann["filterBySegmentation"] == ["body_pre", "body_post"]
+    assert ann["linkedSegmentationLayer"] == {"body_pre": "v", "body_post": "v"}
+    # and it says so, because an empty viewport is otherwise indistinguishable from a bug
+    assert "opens EMPTY" in out.err
+
+
+def test_no_filter_by_segmentation_overrides_a_selection(tmp_path, capsys):
+    vol = _volume(tmp_path, "v", kind="segmentation", dtype="uint64")
+    cli.cmd_ng_url_gen(cli._parse_args(
+        ["ng-url-gen", "--seg", vol, "--annotations", _annotation_source(tmp_path),
+         "--segments", "7", "--no-filter-by-segmentation"]))
+    ann = [lyr for lyr in parse_url(capsys.readouterr().out.strip())["layers"]
+           if lyr["type"] == "annotation"][0]
+    assert "filterBySegmentation" not in ann
+
+
+def test_an_annotations_only_link_needs_no_voxel_size(tmp_path, capsys):
+    src = _annotation_source(tmp_path)
+    assert cli.cmd_ng_url_gen(cli._parse_args(["ng-url-gen", "--annotations", src])) == 0
+    state = parse_url(capsys.readouterr().out.strip())
+    assert state["dimensions"]["x"] == [8e-9, "m"]
+    # the centre of the declared bounds, written xyz because that is what a state holds
+    assert state["position"] == [300.0, 400.0, 500.0]
+
+
+def test_annotations_count_as_something_to_show(tmp_path):
+    with pytest.raises(SystemExit, match="nothing to show"):
+        cli.cmd_ng_url_gen(cli._parse_args(["ng-url-gen"]))
+    # and the message names the option, so it is discoverable from the failure
+    with pytest.raises(SystemExit, match="--annotations"):
+        cli.cmd_ng_url_gen(cli._parse_args(["ng-url-gen"]))
