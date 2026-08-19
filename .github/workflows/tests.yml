@@ -21,17 +21,17 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # em-blockrun is a sibling package, not on PyPI. It is public, so no token is
       # needed — but pip would still try PyPI for the `em-blockrun` requirement, so
       # it has to be installed from source FIRST to satisfy that.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: flatiron-connectomics/em-blockrun
           path: .siblings/em-blockrun
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
