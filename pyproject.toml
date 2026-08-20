@@ -17,6 +17,12 @@ dependencies = [
     "numpy>=2",
     "tensorstore>=0.1.70", # zarr v3 array data + neuroglancer-precomputed
     "ngff-zarr>=0.39",     # OME-Zarr / OME-NGFF 0.5 multiscale group metadata
+    "wasmtime<48",         # UPSTREAM WORKAROUND, remove when itkwasm catches up:
+                           # ngff-zarr's reader goes through itkwasm, whose 1.0b*
+                           # `pipeline.py` imports DirPerms/FilePerms — removed in
+                           # wasmtime 48 — while declaring only `wasmtime>=28`. So a
+                           # fresh resolve takes 48 and every ngff-zarr read raises
+                           # ImportError. Not visible in `neu-env`, which holds 47.0.1.
     "zarr>=3",             # ngff-zarr's array backend; v3 metadata is required
     "jsonschema",          # ngff_zarr.validate() in ngff.validate_attrs — not
                            # optional: convert()/extract_roi() default validate=True
