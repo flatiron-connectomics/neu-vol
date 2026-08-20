@@ -1,6 +1,6 @@
 """HDF5-backed reader (h5py).
 
-Reads a dataset from an HDF5 file as a volume (docs/DESIGN.md §2). Read-focused
+Reads a dataset from an HDF5 file as a volume. Read-focused
 for v1; the dataset is assumed to be in canonical ``(z, y, x)`` / ``(c, z, y, x)``
 order. Each backend instance holds an open file handle, and is reopened from its
 spec on each dask worker (specs are picklable; open handles are not).

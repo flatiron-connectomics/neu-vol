@@ -1,7 +1,7 @@
 """Storage target profiles: destination-aware chunk/shard/compression defaults.
 
 Decouples the viewer-facing *read chunk* from the on-disk *file/object* size and
-picks sensible defaults per destination (docs/DESIGN.md §5). All values are
+picks sensible defaults per destination. All values are
 overridable at call sites.
 
   - ``local``              : zarr v3, 128^3 chunks, unsharded  (dev / smoke test)

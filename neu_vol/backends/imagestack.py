@@ -1,6 +1,6 @@
 """Read-only backend over a stack of 2D images or a multipage TIFF.
 
-Sources (docs/DESIGN.md §2):
+Sources:
   - a glob / directory of ordered 2D image files (TIFF/PNG), one per Z slice, or
   - a single multipage TIFF.
 

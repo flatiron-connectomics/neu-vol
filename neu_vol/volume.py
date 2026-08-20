@@ -2,7 +2,7 @@
 
 A ``Volume`` holds no data. It pairs an :class:`~.backends.base.ArrayBackend`
 (region I/O, shape/dtype/chunks) with a :class:`~.meta.VoxelMeta` (physical
-coordinates) and channel semantics. See docs/DESIGN.md §3.
+coordinates) and channel semantics.
 """
 
 from __future__ import annotations

@@ -5,8 +5,6 @@ leading ``c`` (channel) axis -> ``(c, z, y, x)``. ``VoxelMeta`` describes only t
 *spatial* axes; the channel axis carries no physical size. Backends translate
 to/from their native conventions (e.g. neuroglancer-precomputed's ``(x, y, z, c)``
 with resolution listed in ``(x, y, z)``).
-
-See docs/DESIGN.md §3.
 """
 
 from __future__ import annotations

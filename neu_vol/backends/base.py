@@ -7,7 +7,7 @@ for HDF5 shards) implement :class:`ArrayBackend`.
 
 Backends are opened from a JSON-serializable **spec** (a plain dict). This is the
 key to dask: a per-block task ships the spec (paths + params), not an open
-handle, and reopens the backend on the worker. See docs/DESIGN.md §3-4.
+handle, and reopens the backend on the worker.
 """
 
 from __future__ import annotations

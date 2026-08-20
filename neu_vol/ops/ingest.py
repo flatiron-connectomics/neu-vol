@@ -1,6 +1,6 @@
 """Ingest an image stack into a multiscale OME-NGFF 0.5 zarr v3 volume.
 
-The first vertical slice (docs/DESIGN.md §7): image stack (TIFF/PNG glob or
+The first vertical slice: image stack (TIFF/PNG glob or
 multipage TIFF) -> level-0 zarr array -> strict level-by-level pyramid -> OME
 group metadata. The heavy lifting is shared with ``convert`` in _multiscale.py.
 """

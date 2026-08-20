@@ -1,6 +1,6 @@
 """Multiscale pyramid: downsample schedule, type-aware reducers, OME transforms.
 
-Strict level-by-level coarsening (docs/DESIGN.md §6-6b): each level is produced
+Strict level-by-level coarsening: each level is produced
 from the previous (finer) level on disk. This module supplies the pure pieces —
 the *schedule* (per-level integer factors), the *reducers* (mean for
 image/probability, mode for label-preserving segmentation), and the

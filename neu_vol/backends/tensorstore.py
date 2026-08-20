@@ -1,9 +1,9 @@
 """TensorStore-backed reader/writer for zarr v3 and neuroglancer-precomputed.
 
-Primary read/write engine (docs/DESIGN.md §2). Handles array chunk data and
+Primary read/write engine. Handles array chunk data and
 codecs (incl. the zarr v3 sharding codec). ``.chunks`` reports the *array-level*
 chunk shape — the shard when sharding is on — which is the write-block
-granularity the engine tiles by (docs/DESIGN.md §6b).
+granularity the engine tiles by.
 
 Axis order: everything the engine sees is canonical ``(z, y, x)`` /
 ``(c, z, y, x)``. zarr v3 arrays are created in that order directly. Precomputed

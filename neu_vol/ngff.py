@@ -1,8 +1,8 @@
 """OME-NGFF 0.5 multiscale group metadata.
 
 TensorStore writes the per-level array data; this module writes the *group-level*
-``multiscales`` metadata that ties those arrays into an OME-Zarr pyramid
-(docs/DESIGN.md §6a). The attribute schema (``{"ome": {"version": "0.5",
+``multiscales`` metadata that ties those arrays into an OME-Zarr pyramid.
+The attribute schema (``{"ome": {"version": "0.5",
 "multiscales": [...]}}``) matches what ngff-zarr emits, and can be validated with
 :func:`validate_attrs` (needs the jsonschema dep).
 """

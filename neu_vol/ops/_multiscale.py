@@ -5,7 +5,7 @@ create level 0, block-copy the source in, build a strict level-by-level pyramid,
 then finalize metadata. The copy+pyramid loop is target-agnostic (``_run_multiscale``
 with a ``create_level`` callback); zarr v3 adds OME-NGFF group metadata after,
 while precomputed's multiscale ``info`` is written incrementally at scale create.
-See docs/DESIGN.md §6-7. A leading channel axis ``(c, z, y, x)`` is supported and
+A leading channel axis ``(c, z, y, x)`` is supported and
 never downsampled.
 
 Every per-block worker is wrapped in :func:`neu_vol.retry.with_retry`. At this

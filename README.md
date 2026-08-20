@@ -4,8 +4,7 @@ Chunked I/O, conversion, and multiscale generation for large 3D EM volumes
 (images, probabilities/affinities, segmentations), orchestrated with dask —
 locally on a workstation or across a SLURM cluster.
 
-- Architecture and design decisions: [`docs/DESIGN.md`](docs/DESIGN.md)
-- Dask + SLURM orchestration background: [`blockrun/docs/dask-slurm.md`](https://github.com/flatiron-connectomics/blockrun/blob/main/docs/dask-slurm.md)
+Dask + SLURM orchestration background: [`blockrun/docs/dask-slurm.md`](https://github.com/flatiron-connectomics/blockrun/blob/main/docs/dask-slurm.md)
 
 ## Environment
 
@@ -22,8 +21,9 @@ python -m pytest -q
 `blockrun` must be a **sibling directory** — the layering depends on it. The
 combined environment spec lives one level up, at `neu-suite/environment.yml`.
 
-Previously managed with pixi, with envs detached to ceph to dodge the GPFS home
-inode quota; see `docs/DESIGN.md` §8 for that history and why it changed.
+The environment must live somewhere the cluster's workers can also read: an env on
+a node's local disk is invisible to them, and the failure looks like a missing
+import rather than a path problem.
 
 ## Status
 
@@ -323,7 +323,7 @@ jobqueue:
 Unrecognised keys raise rather than merging silently. Site-specific configs are
 deliberately not in this repo; the top-level `configs/` is gitignored.
 
-Next: brightness/normalization + morphological transforms. See `docs/DESIGN.md`.
+Next: brightness/normalization + morphological transforms.
 
 ## License
 

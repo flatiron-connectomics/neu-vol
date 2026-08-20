@@ -1,8 +1,8 @@
 """neu-vol: chunked I/O, conversion, and multiscale generation for
 large 3D EM volumes, orchestrated with dask (local workstation or SLURM cluster).
 
-See docs/DESIGN.md for the architecture, and blockrun's docs/dask-slurm.md for
-the orchestration background.
+See the README for what it does, and blockrun's docs/dask-slurm.md for the
+orchestration background.
 """
 
 __version__ = "0.1.0"
