@@ -252,3 +252,98 @@ def test_the_aligned_box_silences_the_crop_warning(aniso, caplog, capsys):
         cli._warn_if_crop_unaligned(start, tuple(b - a for a, b in zip(start, stop)),
                                     (40, 8, 8), args)
     assert not caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# BBox — the object face of the same arithmetic
+# --------------------------------------------------------------------------- #
+
+def test_from_points_contains_its_own_extremes():
+    """The half-open `+1`. Without it the box drops the far face on every axis, and
+    nothing downstream can tell: it is a correctly shaped box, one voxel small."""
+    points = np.array([[0, 5, 2], [10, 5, 7], [4, 1, 2]])
+    box = grid.BBox.from_points(points)
+    assert box.lo == (0, 1, 2)
+    assert box.hi == (11, 6, 8)
+    assert box.contains(points).all()
+
+
+def test_from_points_refuses_an_empty_set():
+    with pytest.raises(ValueError, match="non-empty"):
+        grid.BBox.from_points(np.zeros((0, 3)))
+
+
+def test_from_points_floors_fractional_coordinates():
+    """Mesh vertices are floats; the box has to be integral without losing them."""
+    box = grid.BBox.from_points(np.array([[0.7, -0.2, 3.9], [2.1, 1.5, 4.0]]))
+    assert box.lo == (0, -1, 3)
+    assert box.hi == (3, 2, 5)
+
+
+def test_shape_size_and_slices_agree():
+    box = grid.BBox((2, 0, 4), (6, 3, 4))
+    assert box.shape == (4, 3, 0)
+    assert box.size == 0 and box.is_empty()
+    assert box.slices() == (slice(2, 6), slice(0, 3), slice(4, 4))
+
+
+def test_a_box_unpacks_into_the_two_sequences_the_functions_take():
+    lo, hi = grid.BBox((1, 2, 3), (4, 5, 6))
+    assert grid.align_box(lo, hi, (2, 2, 2)) == ((0, 2, 2), (4, 6, 6))
+
+
+def test_union_ignores_an_empty_operand():
+    """What makes `reduce(BBox.union, boxes, BBox.empty())` work: an empty seed at the
+    origin must not drag the result back to it."""
+    from functools import reduce
+
+    boxes = [grid.BBox((10, 10, 10), (12, 12, 12)), grid.BBox((20, 5, 8), (22, 7, 9))]
+    total = reduce(grid.BBox.union, boxes, grid.BBox.empty())
+    assert total == grid.BBox((10, 5, 8), (22, 12, 12))
+
+
+def test_intersect_without_overlap_is_empty_not_inverted():
+    box = grid.BBox((0, 0, 0), (4, 4, 4)).intersect(grid.BBox((9, 0, 0), (12, 4, 4)))
+    assert box.is_empty() and box.size == 0
+
+
+def test_contains_handles_a_single_point_and_an_array():
+    box = grid.BBox((0, 0, 0), (4, 4, 4))
+    assert box.contains(np.array([0, 0, 0])) is True
+    assert box.contains(np.array([4, 0, 0])) is False        # half-open at `hi`
+    assert list(box.contains(np.array([[1, 1, 1], [4, 4, 4]]))) == [True, False]
+
+
+def test_a_box_is_hashable_and_compares_by_value():
+    assert grid.BBox((0, 0, 0), (1, 1, 1)) == grid.BBox((0, 0, 0), (1, 1, 1))
+    assert len({grid.BBox((0, 0, 0), (1, 1, 1)),
+                grid.BBox((0, 0, 0), (1, 1, 1))}) == 1
+
+
+def test_construction_rejects_an_inverted_or_mismatched_box():
+    with pytest.raises(ValueError, match="hi must not be below lo"):
+        grid.BBox((5, 0, 0), (1, 1, 1))
+    with pytest.raises(ValueError, match="rank mismatch"):
+        grid.BBox((0, 0), (1, 1, 1))
+
+
+def test_the_methods_delegate_to_the_functions():
+    box = grid.BBox((3, 3, 3), (20, 20, 20))
+    assert box.aligned((8, 8, 8)) == grid.BBox(*grid.align_box(box.lo, box.hi, (8, 8, 8)))
+    assert box.misaligned_axes((8, 8, 8)) == [0, 1, 2]
+    assert box.aligned((8, 8, 8)).misaligned_axes((8, 8, 8)) == []
+
+
+def test_an_edge_at_the_volume_extent_is_aligned_by_definition():
+    """The exemption `misaligned_axes` documents, reachable from the method too."""
+    box = grid.BBox((0, 0, 0), (40, 8, 8))
+    assert box.misaligned_axes((16, 8, 8)) == [0]
+    assert box.misaligned_axes((16, 8, 8), extent=(40, 8, 8)) == []
+
+
+def test_clamping_a_box_off_the_volume_raises_rather_than_vanishing():
+    """An empty return would read downstream as `no data here` instead of `wrong frame`."""
+    with pytest.raises(ValueError, match="lies outside the volume"):
+        grid.BBox((200, 0, 0), (300, 4, 4)).clamped((100, 100, 100))
+    assert grid.BBox((0, 0, 0), (300, 4, 4)).clamped((100, 100, 100)) == \
+        grid.BBox((0, 0, 0), (100, 4, 4))

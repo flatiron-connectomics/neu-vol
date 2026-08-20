@@ -9,6 +9,8 @@ __version__ = "0.1.0"
 
 from .meta import VoxelMeta
 from .volume import Volume
+# The half-open box, shared so consumers do not each grow their own notion of one.
+from .grid import BBox
 # Orchestration substrate now lives in the shared em-blockrun package; re-export
 # the common names here for convenience / backward compatibility.
 from em_blockrun import Block, iter_blocks, block_map, idempotent
@@ -28,6 +30,7 @@ from .location import (exists, is_local, local_path, read_bytes, read_json,
 __all__ = [
     "__version__",
     "VoxelMeta",
+    "BBox",
     "Volume",
     "Block",
     "iter_blocks",
