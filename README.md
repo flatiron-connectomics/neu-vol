@@ -2,10 +2,10 @@
 
 Chunked I/O, conversion, and multiscale generation for large 3D EM volumes
 (images, probabilities/affinities, segmentations), orchestrated with dask —
-locally on a workstation or on the Flatiron Rusty cluster via SLURM.
+locally on a workstation or across a SLURM cluster.
 
 - Architecture and design decisions: [`docs/DESIGN.md`](docs/DESIGN.md)
-- Dask + SLURM orchestration cookbook: [`docs/dask-slurm-rusty.md`](docs/dask-slurm-rusty.md)
+- Dask + SLURM orchestration background: [`blockrun/docs/dask-slurm.md`](https://github.com/flatiron-connectomics/blockrun/blob/main/docs/dask-slurm.md)
 
 ## Environment
 

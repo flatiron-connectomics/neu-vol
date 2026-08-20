@@ -2,11 +2,11 @@
 
 A library for access, conversion, transformation, and storage of large 3D
 volumetric arrays (EM images, probabilities/affinities, segmentations), with
-chunked I/O and dask orchestration (local workstation or Rusty/SLURM). Replaces
+chunked I/O and dask orchestration (local workstation or SLURM cluster). Replaces
 ad-hoc chunkflow pipelines with a smaller, explicit toolkit.
 
-Orchestration foundation: see `docs/dask-slurm-rusty.md` (the `start_dask`
-cookbook). This library provides the *volume* layer that sits on top of it.
+Orchestration foundation: see blockrun's `docs/dask-slurm.md` (the `start_dask`
+background). This library provides the *volume* layer that sits on top of it.
 
 ---
 
