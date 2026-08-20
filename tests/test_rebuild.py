@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from em_volume_tools import convert, rebuild_pyramid
+from neu_vol import convert, rebuild_pyramid
 
 
 # min_dim must match between the conversion and the rebuild, or the two compute
@@ -22,8 +22,8 @@ def _volume(shape=(128, 128, 128), seed=0):
 
 
 def _src(tmp_path, vol, name="src.zarr"):
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-    from em_volume_tools.profiles import zarr3_create_spec
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
 
     path = str(tmp_path / name)
     be = TensorStoreBackend.create(
@@ -36,7 +36,7 @@ def _src(tmp_path, vol, name="src.zarr"):
 
 def _levels(dst, fmt="zarr3"):
     """Read every level back as an array."""
-    from em_volume_tools.backends.base import open_backend
+    from neu_vol.backends.base import open_backend
 
     out = []
     i = 0
@@ -64,7 +64,7 @@ def test_rebuild_reproduces_a_full_conversion(tmp_path):
     assert len(ref_levels) >= 3, "need a few levels for this test to mean anything"
 
     # Corrupt every level above 1, then rebuild from 1.
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
     for i in range(2, len(ref_levels)):
         be = open_backend({"backend": "zarr3", "path": f"{tgt}/{i}"})
         be.write_region(tuple(slice(0, s) for s in be.shape),
@@ -82,7 +82,7 @@ def test_rebuild_reproduces_a_full_conversion(tmp_path):
 
 def test_levels_at_or_below_start_are_untouched(tmp_path):
     """The seed level is input, never output — writing it would destroy the source."""
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
 
     src = _src(tmp_path, _volume())
     dst = str(tmp_path / "v.zarr")
@@ -109,7 +109,7 @@ def test_levels_at_or_below_start_are_untouched(tmp_path):
 
 def test_seed_is_opened_not_created_under_resume_false(tmp_path):
     """resume=False must not recreate the seed — that would erase the input."""
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
 
     src = _src(tmp_path, _volume())
     dst = str(tmp_path / "v.zarr")
@@ -143,9 +143,9 @@ def test_start_level_beyond_the_schedule_is_rejected(tmp_path):
 
 def test_a_seed_whose_shape_contradicts_the_schedule_is_refused(tmp_path):
     """Rebuilding onto a mismatched pyramid would leave levels disagreeing."""
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-    from em_volume_tools.profiles import zarr3_create_spec
-    from em_volume_tools.backends.base import clear_backend_cache
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
+    from neu_vol.backends.base import clear_backend_cache
 
     src = _src(tmp_path, _volume())
     dst = str(tmp_path / "v.zarr")
@@ -199,7 +199,7 @@ def test_rebuild_uses_a_distinct_progress_file(tmp_path):
 
 def test_precomputed_rebuild(tmp_path):
     """The s3 case, exercised locally: precomputed keeps info per scale."""
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
 
     src = _src(tmp_path, _volume())
     dst = str(tmp_path / "pc")
@@ -236,7 +236,7 @@ def _labels(tmp_path, shape=(64, 64, 64)):
 
 def test_kind_is_inferred_from_the_volume(tmp_path):
     """Neither reducer is a safe default, so it comes from what the volume records."""
-    from em_volume_tools.source_metadata import detect_backend, read_source_metadata
+    from neu_vol.source_metadata import detect_backend, read_source_metadata
 
     src = _src(tmp_path, _labels(tmp_path).astype(np.uint8), name="lab.zarr")
     for prof, sub in (("local", "z"), ("s3-neuroglancer", "pc")):
@@ -249,7 +249,7 @@ def test_kind_is_inferred_from_the_volume(tmp_path):
 
 def test_segmentation_rebuild_does_not_average_labels(tmp_path):
     """A mean reducer on labels invents ids that were never in the data."""
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
 
     vol = _labels(tmp_path).astype(np.uint8)
     src = _src(tmp_path, vol, name="lab.zarr")
@@ -277,7 +277,7 @@ def test_rebuild_from_level_0_seeds_from_it_instead_of_recreating_it(tmp_path):
     printed plan even said "level 0  SEED (read only)" immediately before trying to
     create it.
     """
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
 
     vol = _volume()
     dst = str(tmp_path / "v.zarr")
@@ -304,8 +304,8 @@ def test_rebuild_from_level_0_seeds_from_it_instead_of_recreating_it(tmp_path):
 def test_rebuild_from_level_0_works_on_precomputed_too(tmp_path):
     """The format the failure was reported on. Its scales share one `info`, so a
     create against an existing scale key is what raised ALREADY_EXISTS."""
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
-    from em_volume_tools.profiles import StorageProfile
+    from neu_vol.backends.base import clear_backend_cache, open_backend
+    from neu_vol.profiles import StorageProfile
 
     labels = np.zeros((64, 64, 64), np.uint64)
     labels[16:32, 16:32, 16:32] = 7                     # sparse, like a GT volume
@@ -347,11 +347,11 @@ def test_kind_is_validated(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# CLI (`em-vol downsample`)
+# CLI (`neu-vol downsample`)
 # --------------------------------------------------------------------------- #
 def _cli_downsample(argv):
     """Drive the real entry point. Was a script loaded by path from scripts/."""
-    from em_volume_tools.cli import main
+    from neu_vol.cli import main
 
     return main(["downsample", *argv])
 
@@ -365,7 +365,7 @@ def _converted(tmp_path, **kw):
 
 
 def test_cli_dry_run_touches_nothing(tmp_path):
-    from em_volume_tools.backends.base import clear_backend_cache
+    from neu_vol.backends.base import clear_backend_cache
 
     dst = _converted(tmp_path)
     before = [a.copy() for a in _levels(dst)]
@@ -379,7 +379,7 @@ def test_cli_dry_run_touches_nothing(tmp_path):
 
 
 def test_cli_rebuilds(tmp_path):
-    from em_volume_tools.backends.base import clear_backend_cache, open_backend
+    from neu_vol.backends.base import clear_backend_cache, open_backend
 
     dst = _converted(tmp_path)
     want = [a.copy() for a in _levels(dst)]
@@ -412,7 +412,7 @@ def test_cli_refuses_a_seed_level_that_is_absent_on_disk(tmp_path):
     """In the schedule but not written — there is nothing to derive from."""
     import shutil
 
-    from em_volume_tools.backends.base import clear_backend_cache
+    from neu_vol.backends.base import clear_backend_cache
 
     dst = _converted(tmp_path)
     shutil.rmtree(f"{dst}/2")

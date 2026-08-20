@@ -21,10 +21,10 @@ dask-job-logs/
 
 # Site-specific dask configs and dataset files live here, untracked. The LEADING
 # SLASH is load-bearing: a bare `configs/` matches at any depth. Generic dask
-# templates ship in em-blockrun (em_blockrun/configs/).
+# templates ship in blockrun (blockrun/configs/).
 /configs/
 
-# Run manifests. `em-vol convert` defaults its progress path to the cwd, so
+# Run manifests. `neu-vol convert` defaults its progress path to the cwd, so
 # running one from a repo checkout drops a multi-MB JSONL here (one record per
 # block — 42 MB for a 772k-block run).
 *.progress.jsonl

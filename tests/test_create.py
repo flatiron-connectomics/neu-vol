@@ -13,10 +13,10 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import convert, create_volume, describe, plan_volume
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import convert, create_volume, describe, plan_volume
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
 
 def _reference(tmp_path, *, shape=(32, 32, 32), voxel=(8, 8, 8), chunk=(8, 8, 8),
@@ -39,7 +39,7 @@ def _precomputed_reference(tmp_path, *, shape=(32, 32, 32), voxel=(40, 8, 8),
                            chunk=(8, 8, 8), name="ref"):
     """A real precomputed volume. Anisotropic by default, because its schedule then
     coarsens x/y before z and nothing may assume the levels are 2**n apart."""
-    from em_volume_tools.profiles import StorageProfile
+    from neu_vol.profiles import StorageProfile
 
     src = str(tmp_path / f"{name}.pc.src.zarr")
     be = TensorStoreBackend.create(
@@ -257,7 +257,7 @@ def test_overwriting_precomputed_does_not_delete_the_scales_it_just_created(tmp_
 
 def test_the_target_profile_follows_format_then_reference_then_destination():
     """One resolver, shared with the CLI, so `--format` cannot drift between them."""
-    from em_volume_tools.ops.create import profile_for
+    from neu_vol.ops.create import profile_for
 
     pc = {"format": "neuroglancer_precomputed"}
     assert profile_for(None, pc, "/local/path") == "local-neuroglancer"

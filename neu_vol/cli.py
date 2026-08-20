@@ -1,21 +1,21 @@
-"""em-vol: convert, downsample and inspect large 3D volumes, locally or on SLURM.
+"""neu-vol: convert, downsample and inspect large 3D volumes, locally or on SLURM.
 
 The command-line entry point for this package. Every write is block-mapped over a dask
 cluster (local or SLURM, chosen by ``--config``) and resumable, so an interrupted run
 continues where it stopped rather than starting over.
 
-    em-vol info    <volume>                      # what is it, what levels exist
-    em-vol convert --src ... --dst ...           # build a multiscale volume
-    em-vol copy    --src ... --dst ...           # copy one as it is, whole or a box
-    em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
-    em-vol progress <volume>                     # chunks written, per level
-    em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
-    em-vol write   <volume> --src ... --offset   # put one subvolume into it
-    em-vol align-bbox --volume ... --bbox ...     # move a box onto the block grid
-    em-vol relabel <volume> --out ...            # one id range per occupied region
+    neu-vol info    <volume>                      # what is it, what levels exist
+    neu-vol convert --src ... --dst ...           # build a multiscale volume
+    neu-vol copy    --src ... --dst ...           # copy one as it is, whole or a box
+    neu-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
+    neu-vol progress <volume>                     # chunks written, per level
+    neu-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
+    neu-vol write   <volume> --src ... --offset   # put one subvolume into it
+    neu-vol align-bbox --volume ... --bbox ...     # move a box onto the block grid
+    neu-vol relabel <volume> --out ...            # one id range per occupied region
 
-Anything a *viewer* consumes now lives in **em-ngl**: `em-ngl gen` for a link or a state,
-`em-ngl bboxes` for a layer of boxes over a sparse volume's data, `em-ngl annotate` for a
+Anything a *viewer* consumes now lives in **neu-glance**: `neu-glance gen` for a link or a state,
+`neu-glance bboxes` for a layer of boxes over a sparse volume's data, `neu-glance annotate` for a
 layer of your own coordinates. This package supplies the occupancy analysis those build on
 (``ops.annotate.labeled_regions``) and knows nothing about neuroglancer beyond it.
 
@@ -29,12 +29,12 @@ then each ``write`` places one image stack / HDF5 / array into one level of it a
 voxel offset. Single-scale by design — run ``downsample`` afterwards if the result
 needs a pyramid.
 
-``python -m em_volume_tools`` is equivalent. Run ``em-vol <subcommand> --help`` for the
+``python -m neu_vol`` is equivalent. Run ``neu-vol <subcommand> --help`` for the
 arguments of each.
 
 **--config takes a bundled template name or a path, and is repeatable**, deep-merged
 left to right — so a site config is the few keys that differ from a template rather
-than a fork of it. Templates and validation live in :mod:`em_blockrun.dask_config`;
+than a fork of it. Templates and validation live in :mod:`blockrun.dask_config`;
 site-specific configs do not belong in this repo.
 """
 
@@ -48,9 +48,9 @@ import os
 import sys
 from datetime import datetime
 
-from em_blockrun import bundled_configs
+from blockrun import bundled_configs
 
-log = logging.getLogger("em-vol")
+log = logging.getLogger("neu-vol")
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +251,7 @@ def _configs(args):
 # Volume inspection lives in source_metadata (it composes that module's readers, and
 # the ops need it too — `create --like` and `write` both do). Re-exported here because
 # `cli.describe` is where callers and tests already look for it.
-from em_volume_tools.source_metadata import (describe, existing_levels,  # noqa: E402
+from neu_vol.source_metadata import (describe, existing_levels,  # noqa: E402
                                              level_spec)
 
 
@@ -280,8 +280,8 @@ def _print_dvid_nodes(volume: str) -> None:
     still-mutable node in a lock-and-spawn repo. The uuids are printed in full so a
     destination name can be built from one — that is the usual reason to run this.
     """
-    from em_volume_tools.dvid import node_summary
-    from em_volume_tools.source_metadata import location_spec
+    from neu_vol.dvid import node_summary
+    from neu_vol.source_metadata import location_spec
 
     try:
         summary = node_summary(location_spec(volume, "dvid"))
@@ -314,8 +314,8 @@ def _print_provenance(volume: str, full: bool) -> None:
     """
     import json
 
-    from em_volume_tools.location import read_json
-    from em_volume_tools.ops.provenance import FILENAME
+    from neu_vol.location import read_json
+    from neu_vol.ops.provenance import FILENAME
 
     try:
         rec = read_json(volume, FILENAME)
@@ -323,7 +323,7 @@ def _print_provenance(volume: str, full: bool) -> None:
         return                                                 # not a store, or no access
     if not rec:
         if full:
-            print(f"\n  no {FILENAME} here — it is written by `em-vol convert`, so a "
+            print(f"\n  no {FILENAME} here — it is written by `neu-vol convert`, so a "
                   f"volume made\n  another way (or before provenance existed) has none.")
         return
 
@@ -416,7 +416,7 @@ def _src_spec(args, src: str | None = None):
 
     Returns ``(spec, fmt)``; ``fmt`` is None when nothing at the location is a volume.
     """
-    from em_volume_tools.source_metadata import detect_backend, location_spec
+    from neu_vol.source_metadata import detect_backend, location_spec
 
     src = args.src if src is None else src
     fmt = detect_backend(src)
@@ -442,7 +442,7 @@ def _level0_factor(src: str, scale: int, per_level=None, args=None) -> tuple[int
     can keep calling with a bare path; where it is given the source options travel with
     it, so a DVID peek resolves the same node the run will use.
     """
-    from em_volume_tools.source_metadata import (detect_backend, location_spec,
+    from neu_vol.source_metadata import (detect_backend, location_spec,
                                                  read_level_voxel_sizes)
 
     if per_level is None:
@@ -473,7 +473,7 @@ def _level0_factor(src: str, scale: int, per_level=None, args=None) -> tuple[int
 
 def _src_voxel_size(args):
     """The source's own level-0 voxel size, or ``None``. Metadata reads only."""
-    from em_volume_tools.source_metadata import read_source_metadata
+    from neu_vol.source_metadata import read_source_metadata
 
     spec, fmt = _src_spec(args)
     meta = read_source_metadata(spec) if fmt else None
@@ -517,7 +517,7 @@ def _mask_bboxes(args, per_level=None):
 
 def _pyramid_levels(shape, voxel, args):
     """``[(shape, voxel_size)]`` per level, for the schedule these arguments imply."""
-    from em_volume_tools.pyramid import downsample_schedule
+    from neu_vol.pyramid import downsample_schedule
 
     if args.single_level:
         return [(tuple(shape), tuple(voxel))]
@@ -541,7 +541,7 @@ def _warn_if_crop_unaligned(start, shape, voxel, args) -> None:
     the top. Aligning the origin avoids it; nothing else can, since the crop defines
     the grid.
     """
-    from em_volume_tools.pyramid import cumulative_factors, downsample_schedule
+    from neu_vol.pyramid import cumulative_factors, downsample_schedule
 
     if args.single_level or not voxel:
         return  # no pyramid, or no voxel size to derive the schedule's factors from
@@ -565,7 +565,7 @@ def _level0_chunking(d, src):
     on the array itself. They differ when the level is sharded — the write chunk is the
     shard — and a copy wants to carry both across.
     """
-    from em_volume_tools.backends.base import open_backend
+    from neu_vol.backends.base import open_backend
 
     lvl0 = d["levels"].get(0) or {}
     if lvl0.get("read_chunks") or lvl0.get("chunks"):
@@ -575,7 +575,7 @@ def _level0_chunking(d, src):
         be = open_backend(meta.get("data_spec") or {"backend": d["format"], "path": src})
     except Exception as e:
         # A backend that cannot be opened here can still be read by the workers — the
-        # cloudvolume one needs a package only the em-vol-cv environment carries. Fall
+        # cloudvolume one needs a package only the neu-vol-cv environment carries. Fall
         # back to the profile's default chunking rather than fail before starting.
         log.info("could not read the source's chunking (%s); using the profile default", e)
         return None, None
@@ -595,7 +595,7 @@ def _convert_targets(fmt, dst, profile_arg, chunk, shard):
     ``both`` writes two volumes from one read-side setup: precomputed for viewing, zarr
     for downstream compute. Suffixes keep them distinguishable at one ``--dst``.
     """
-    from em_volume_tools import StorageProfile
+    from neu_vol import StorageProfile
 
     targets: list[tuple[object, str]] = []
     if fmt in ("precomputed", "both"):
@@ -621,7 +621,7 @@ def _warn_if_masking_a_destination_that_exists(args, dst, masks) -> None:
     an earlier, unmasked run: the excluded region would survive in the new volume, and
     every level above it, with the run reporting success.
     """
-    from em_volume_tools.location import exists
+    from neu_vol.location import exists
 
     if not masks or getattr(args, "fresh", False):
         return
@@ -640,7 +640,7 @@ def _expand_dst(args, dst: str) -> str:
     Reported rather than done quietly: the resolved path is where the data lands and
     what the progress manifest is named after, so it is the thing to copy out of the log.
     """
-    from em_volume_tools.ops.naming import expand, has_placeholder
+    from neu_vol.ops.naming import expand, has_placeholder
 
     if not has_placeholder(dst):
         return dst
@@ -650,7 +650,7 @@ def _expand_dst(args, dst: str) -> str:
                          f"the source, and nothing at {args.src} looks like a volume")
     # Resolution has to match what the run will read, so go through the same spec
     # builder — with --dvid-locked that is a different node than the ref points at.
-    from em_volume_tools.source_metadata import read_source_metadata
+    from neu_vol.source_metadata import read_source_metadata
 
     meta = read_source_metadata(spec) or {}
     try:
@@ -663,7 +663,7 @@ def _expand_dst(args, dst: str) -> str:
 
 def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int:
     """The shared body of ``convert`` and ``copy``: block-map the copy per target."""
-    from em_volume_tools import convert
+    from neu_vol import convert
 
     # Before anything derives from it: the format-suffixed targets, the progress
     # manifest name and the resume check all take the destination as given, so a path
@@ -677,7 +677,7 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
             log.info("%s %s -> %s (%s)", args.command, args.src, target, kind)
             # Said before the run, not after: it is what you watch progress with, and the
             # digest in a remote destination's name is not something to reconstruct by eye.
-            from em_volume_tools.location import default_progress_path
+            from neu_vol.location import default_progress_path
 
             log.info("progress: %s", default_progress_path(target))
             summary = convert(
@@ -724,7 +724,7 @@ def cmd_copy(args) -> int:
     # `copy` also suggests the result is a duplicate of a thing that is, in the open-node
     # case, still changing. `convert` now inherits kind and voxel size from the source
     # anyway, so it does everything `copy` would have here and says what it does.
-    from em_volume_tools.dvid import is_url as _is_dvid_url
+    from neu_vol.dvid import is_url as _is_dvid_url
 
     if _is_dvid_url(args.src):
         raise SystemExit(
@@ -732,7 +732,7 @@ def cmd_copy(args) -> int:
             f"a server, not a storage format, so this is a conversion into precomputed "
             f"or zarr. Use `convert`, which reads the kind and voxel size from the "
             f"instance just as `copy` would:\n\n"
-            f"    em-vol convert --src {args.src} --dst {args.dst}\n\n"
+            f"    neu-vol convert --src {args.src} --dst {args.dst}\n\n"
             f"Add --dvid-locked for an immutable node, and --crop-bbox to take a box.")
 
     try:
@@ -745,7 +745,7 @@ def cmd_copy(args) -> int:
             f"size and image/segmentation type from the source, so it needs a volume "
             f"that records them: precomputed (`info`), an OME-NGFF zarr group, or a "
             f"DVID labelmap (dvid://server/uuid/instance). For an image stack, HDF5 or "
-            f"a bare array, use `em-vol convert` and state them.") \
+            f"a bare array, use `neu-vol convert` and state them.") \
             from None
     meta = d["meta"] or {}
 
@@ -839,7 +839,7 @@ def _downsample_plan(args):
     pyramid. Comparing against the shapes on disk is how that gets caught before
     anything is written.
     """
-    from em_volume_tools.pyramid import downsample_schedule
+    from neu_vol.pyramid import downsample_schedule
 
     d = _describe(args.volume)
     meta = d["meta"] or {}
@@ -853,7 +853,7 @@ def _downsample_plan(args):
     # --dry-run table cannot state a plan different from the one that runs.
     max_levels = args.max_levels
     if max_levels is None:
-        from em_volume_tools.ops.rebuild import resolve_max_levels
+        from neu_vol.ops.rebuild import resolve_max_levels
 
         max_levels, why = resolve_max_levels(d["level_voxel_sizes"])
         log.info("levels  at most %d (%s)", max_levels, why)
@@ -867,7 +867,7 @@ def _downsample_plan(args):
 
 
 def cmd_downsample(args) -> int:
-    from em_volume_tools import rebuild_pyramid
+    from neu_vol import rebuild_pyramid
 
     d, shapes, voxels, kind, n_sched = _downsample_plan(args)
     existing = d["levels"]
@@ -940,7 +940,7 @@ def cmd_downsample(args) -> int:
 # create (an empty volume) + write (one subvolume into it)
 # --------------------------------------------------------------------------- #
 def cmd_create(args) -> int:
-    from em_volume_tools.ops.create import create_volume, plan_volume
+    from neu_vol.ops.create import create_volume, plan_volume
 
     dst = args.dst.rstrip("/")
     kw = dict(like=args.like, shape=_triple(args.shape, "shape"), dtype=args.dtype,
@@ -983,7 +983,7 @@ def cmd_create(args) -> int:
             row += f"  {('x'.join(str(c) for c in lv['shard']) if lv['shard'] else '—'):>17}"
         print(row)
     print("--dry-run: nothing created" if args.dry_run else
-          f"created {plan['num_levels']} empty level(s); fill them with `em-vol write`")
+          f"created {plan['num_levels']} empty level(s); fill them with `neu-vol write`")
     return 0
 
 
@@ -1025,7 +1025,7 @@ def _print_write_table(results: list[dict]) -> None:
 
 
 def cmd_write(args) -> int:
-    from em_volume_tools.ops.write import write_subvolumes
+    from neu_vol.ops.write import write_subvolumes
 
     offsets = ([_triple(o, "offset") for o in args.offset] if args.offset else None)
     if offsets is not None and len(offsets) != len(args.src):
@@ -1186,7 +1186,7 @@ def _task_total(lv: dict, chunk_total: int, chunk: tuple, level: int) -> tuple[i
 
 
 # Statuses meaning the block will not be retried. "failed" is excluded on purpose:
-# em-blockrun's is_done tests key presence, so a resumed run retries failures, and
+# blockrun's is_done tests key presence, so a resumed run retries failures, and
 # counting them as done would overstate progress.
 _DONE_STATUSES = ("written", "empty", "skipped")
 
@@ -1215,7 +1215,7 @@ def _stored_chunks(volume: str, fmt: str, level: int, scale_key: str | None) -> 
     sharded), while precomputed keys every scale's chunks under its own scale key
     (``8_8_8/…``) beside one shared ``info``.
     """
-    from em_volume_tools.location import list_keys
+    from neu_vol.location import list_keys
 
     if fmt == "zarr3":
         keys = list_keys(volume, str(level))
@@ -1228,7 +1228,7 @@ def _stored_chunks(volume: str, fmt: str, level: int, scale_key: str | None) -> 
 
 def _precomputed_scale_keys(volume: str) -> dict[int, str]:
     """``{level: scale key}`` finest-first, matching how levels are numbered elsewhere."""
-    from em_volume_tools.location import read_json
+    from neu_vol.location import read_json
 
     info = read_json(volume.rstrip("/") + "/info") or {}
     ordered = sorted(info.get("scales", []), key=lambda s: tuple(s["resolution"]))
@@ -1264,8 +1264,8 @@ def cmd_progress(args) -> int:
     rather than broken, which is exactly why it survives review; see the S3 bootstrap
     note in CLAUDE.md.
     """
-    from em_volume_tools.location import default_progress_path
-    from em_volume_tools.source_metadata import PRECOMPUTED_GZ, detect_backend
+    from neu_vol.location import default_progress_path
+    from neu_vol.source_metadata import PRECOMPUTED_GZ, detect_backend
 
     volume = args.volume.rstrip("/")
     manifest_path = args.progress_path or default_progress_path(volume)
@@ -1354,7 +1354,7 @@ def cmd_progress(args) -> int:
               f"  SOURCE could not be read: a precomputed volume written by\n"
               f"  CloudVolume stores '.gz'-suffixed chunks that tensorstore requests\n"
               f"  without the suffix and reads as zeros. Check with:\n"
-              f"      em-vol info <src>   and   ls <src>/<scale-key> | head")
+              f"      neu-vol info <src>   and   ls <src>/<scale-key> | head")
         return 1
     return 0
 
@@ -1376,7 +1376,7 @@ def cmd_mask_by_value(args) -> int:
     For data already written. Correcting it at ingest is better — `write`, `to-hdf5` and
     `convert` all take --background — because that happens before the storage decision.
     """
-    from em_volume_tools.ops.maskvalue import apply_mask_values, plan_mask_values
+    from neu_vol.ops.maskvalue import apply_mask_values, plan_mask_values
 
     try:
         plan = plan_mask_values(args.volume, _int_list(args.values, "values"),
@@ -1409,7 +1409,7 @@ def cmd_mask_by_value(args) -> int:
              if result["blocks_unchanged"] else ""))
     if result["stale_levels"]:
         print(f"  stale       levels {result['stale_levels']} still hold the old values — "
-              f"run `em-vol downsample --start-level {plan['level']}`")
+              f"run `neu-vol downsample --start-level {plan['level']}`")
     print("--dry-run: nothing written" if args.dry_run else "done")
     return 0
 
@@ -1418,13 +1418,13 @@ def cmd_mask_by_value(args) -> int:
 # to-hdf5
 # --------------------------------------------------------------------------- #
 def cmd_to_hdf5(args) -> int:
-    """Pack a small volume into an HDF5 file that `em-vol write` can place.
+    """Pack a small volume into an HDF5 file that `neu-vol write` can place.
 
     The inverse of `write`: this makes the piece, that puts it somewhere. The frame and
     the position travel with the data, so nobody re-types an offset — and because the
     axis order is recorded, `write` no longer has to be told it.
     """
-    from em_volume_tools.ops.pack import pack_hdf5
+    from neu_vol.ops.pack import pack_hdf5
 
     axes = tuple(args.axes)
     if len(axes) != 3 or set(axes) != {"z", "y", "x"}:
@@ -1459,7 +1459,7 @@ def cmd_to_hdf5(args) -> int:
     print(f"  voxel size  {'x'.join(f'{v:g}' for v in plan['voxel_size'])} {plan['units']}")
     print("  voxel_offset " + "  ".join(f"{ax} {o}" for ax, o
                                         in zip(plan['axes'], plan['voxel_offset'])))
-    print(f"  axes        {''.join(plan['axes'])}  (recorded, so `em-vol write` need not "
+    print(f"  axes        {''.join(plan['axes'])}  (recorded, so `neu-vol write` need not "
           f"be told the order)")
     print(f"  chunk       {plan['chunk'] or 'up to 64 per axis'}"
           f"   compression {plan['compression'] or 'none'}")
@@ -1469,7 +1469,7 @@ def cmd_to_hdf5(args) -> int:
     if plan["replacing"]:
         print("  replacing   the existing dataset of that name")
     print("--dry-run: nothing written" if args.dry_run else
-          f"wrote {plan['blocks']} block(s); place it with `em-vol write <volume> --src "
+          f"wrote {plan['blocks']} block(s); place it with `neu-vol write <volume> --src "
           f"{plan['out']}" + (f" --dataset {plan['dataset']}"
                               if plan["other_datasets"] else "") + "`")
     return 0
@@ -1503,7 +1503,7 @@ def _cumulative_factor(per_level, level: int, volume: str) -> tuple[int, ...]:
 
 def _align_grid(args, d):
     """``(block in level-0 voxels, where it came from)`` for ``--to`` / ``--block``."""
-    from em_volume_tools.grid import lcm_grid
+    from neu_vol.grid import lcm_grid
 
     if args.block:
         return _triple(args.block, "block"), "--block"
@@ -1575,9 +1575,9 @@ def cmd_align_bbox(args) -> int:
 
     Read-only and instant: it reads a volume's metadata for the grid and nothing else.
     ``--quiet`` prints only the aligned box, which is what makes it composable —
-    ``--crop-bbox $(em-vol align-bbox ... -q)``.
+    ``--crop-bbox $(neu-vol align-bbox ... -q)``.
     """
-    from em_volume_tools.grid import align_box, clamp_box, misaligned_axes
+    from neu_vol.grid import align_box, clamp_box, misaligned_axes
 
     if not (args.volume or args.block):
         raise SystemExit("give --volume (to take the grid from it) or --block z,y,x")
@@ -1660,7 +1660,7 @@ def cmd_relabel(args) -> int:
     Runs in this process, no dask: the regions are renumbered in order because each
     range starts where the last ended, so there is nothing to parallelise.
     """
-    from em_volume_tools.ops.relabel import (apply_relabel, default_map_path,
+    from neu_vol.ops.relabel import (apply_relabel, default_map_path,
                                              plan_relabel)
 
     try:
@@ -1706,7 +1706,7 @@ def cmd_relabel(args) -> int:
     if result["stale_levels"]:
         print(f"\n  WARNING: level(s) {result['stale_levels']} still hold the OLD ids "
               f"and now disagree with level {plan['level']}.\n"
-              f"      em-vol downsample {plan['destination']} "
+              f"      neu-vol downsample {plan['destination']} "
               f"--start-level {plan['level']}")
 
     if args.dry_run:
@@ -1729,20 +1729,20 @@ def _maybe_cluster(args):
         return contextlib.nullcontext(None)
     # Imported here, not at module scope: it pulls in dask.distributed (~1 s), and the
     # read-only subcommands that never reach this line should not pay for it.
-    from em_blockrun import start_dask
+    from blockrun import start_dask
 
-    return start_dask(args.workers, _configs(args), label="em-vol")
+    return start_dask(args.workers, _configs(args), label="neu-vol")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The full ``em-vol`` parser, built but not run.
+    """The full ``neu-vol`` parser, built but not run.
 
     Separate from :func:`_parse_args` so the documentation can render it: the CLI
     reference is generated from *this* object by ``sphinx-argparse``, which is what
     stops the published usage from drifting away from ``--help``.
     """
     p = argparse.ArgumentParser(
-        prog="em-vol", description=__doc__,
+        prog="neu-vol", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1769,7 +1769,7 @@ def build_parser() -> argparse.ArgumentParser:
                        "neuroglancer-precomputed volume, whole or cropped to a box. "
                        "Resumable.\n\nTo copy a volume as it is — same format, "
                        "chunking, voxel size and image/segmentation type — use "
-                       "`em-vol copy`, which reads those from the source instead of "
+                       "`neu-vol copy`, which reads those from the source instead of "
                        "defaulting them.",
                        formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("--src-format", default=None,
@@ -1864,7 +1864,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Create an empty zarr v3 or neuroglancer-precomputed volume — "
                     "every level exists, no chunk data.\n\nUse it when several small "
                     "pieces (image stacks, HDF5 files) belong at known positions "
-                    "inside one frame: create the frame, then `em-vol write` each "
+                    "inside one frame: create the frame, then `neu-vol write` each "
                     "piece into it.\n\n--like copies "
                     "a reference volume's geometry (level shapes, per-level voxel "
                     "sizes and chunking, dtype, origin), so a voxel index means the "
@@ -1939,10 +1939,10 @@ def build_parser() -> argparse.ArgumentParser:
                     "of another volume — into an existing volume at a voxel offset.\n\n"
                     "SINGLE-SCALE on purpose: it writes --level and touches no other, "
                     "because how a patch should look when coarsened is a separate "
-                    "decision (averaging label ids invents ids). Run `em-vol "
+                    "decision (averaging label ids invents ids). Run `neu-vol "
                     "downsample` afterwards if the result needs a pyramid.\n\n"
                     "Runs in this process — no dask. For anything big enough to need "
-                    "a cluster, use `em-vol convert`.",
+                    "a cluster, use `neu-vol convert`.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume", help="the destination volume (path or s3://...)")
     q.add_argument("--src", required=True, action="append",
@@ -1976,7 +1976,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--offset-order", choices=("zyx", "xyz"), default=None,
                    help="axis order of the offset, whether typed or read from the "
                         "source. Default: whatever the source RECORDS (an `axes` "
-                        "attribute, as `em-vol to-hdf5` writes), else zyx. Worth "
+                        "attribute, as `neu-vol to-hdf5` writes), else zyx. Worth "
                         "checking on a stored offset from elsewhere: 'voxel_offset' is "
                         "precomputed's field name and precomputed means XYZ, while "
                         "everything in this package is zyx — reversed, the piece lands "
@@ -2034,15 +2034,15 @@ def build_parser() -> argparse.ArgumentParser:
                     "volume ends up with a chunk object everywhere data was written, and "
                     "'which chunks exist' stops answering 'where is the data'. That is the "
                     "question `bboxes-json`, `relabel`, `downsample --sparse` and "
-                    "em-seg-morpho's occupancy filter all ask.\n\n"
-                    "PREFER FIXING IT AT INGEST: `em-vol write`, `to-hdf5` and `convert` "
+                    "neu-morpho's occupancy filter all ask.\n\n"
+                    "PREFER FIXING IT AT INGEST: `neu-vol write`, `to-hdf5` and `convert` "
                     "all take --background, and there the correction happens before the "
                     "storage decision. This command is for data that has already landed.\n\n"
                     "Either destination restores the sparsity — writing zeros over a "
                     "stored chunk removes the object, on both formats — so --out is "
                     "preferred for the ordinary reason instead: a sparse copy is cheap, "
                     "and the original stays as the record of what was annotated.\n\n"
-                    "SINGLE-SCALE, like `write` and `relabel`: run `em-vol downsample "
+                    "SINGLE-SCALE, like `write` and `relabel`: run `neu-vol downsample "
                     "--start-level <level>` afterwards.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume", help="the volume to read (path or s3://...)")
@@ -2071,17 +2071,17 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_mask_by_value)
 
     # --- to-hdf5 ------------------------------------------------------------
-    from em_volume_tools.ops.pack import (DEFAULT_DATASET, DEFAULT_OFFSET_FIELD,
+    from neu_vol.ops.pack import (DEFAULT_DATASET, DEFAULT_OFFSET_FIELD,
                                           DEFAULT_VOXEL_SIZE_FIELD)
 
     q = sub.add_parser(
         "to-hdf5", help="pack a small volume into one HDF5 file, with its frame",
         description="Pack an image stack (or any readable source) into a single HDF5 "
                     "file, recording where it belongs and at what scale.\n\n"
-                    "The inverse of `em-vol write`: that places a piece into a large "
+                    "The inverse of `neu-vol write`: that places a piece into a large "
                     "volume, this produces the piece. An image stack off a microscope or "
                     "an annotation tool has no coordinates attached, so this attaches "
-                    "them — and then `em-vol write <volume> --src piece.h5` needs no "
+                    "them — and then `neu-vol write <volume> --src piece.h5` needs no "
                     "--offset at all.\n\n"
                     "What it records: `voxel_offset` (whole voxels, on the dataset — the "
                     "field `write` already looks for), and `voxel_size` / `offset` / "
@@ -2122,7 +2122,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--level", type=int, default=0,
                    help="which level of a multiscale --src to read (default: 0). The "
                         "level's own recorded voxel size becomes the default frame, and "
-                        "--crop-bbox is in that level's voxels, so `em-vol write --level "
+                        "--crop-bbox is in that level's voxels, so `neu-vol write --level "
                         "N` puts the piece back where it came from")
     q.add_argument("--crop-bbox", default=None, metavar="Z0,Y0,X0,Z1,Y1,X1",
                    help="pack only this box, in --level's voxels. Half-open, clipped to "
@@ -2139,7 +2139,7 @@ def build_parser() -> argparse.ArgumentParser:
                         f"whatever wrote its siblings")
     q.add_argument("--offset-field", default=DEFAULT_OFFSET_FIELD, metavar="NAME",
                    help=f"attribute to record the voxel offset under (default: "
-                        f"{DEFAULT_OFFSET_FIELD}, which is what `em-vol write` looks for; "
+                        f"{DEFAULT_OFFSET_FIELD}, which is what `neu-vol write` looks for; "
                         f"change both together or write will not find it)")
     q.add_argument("--units", default="nm",
                    help="unit for --voxel-size (default: nm)")
@@ -2168,7 +2168,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_to_hdf5)
 
     # --- align-bbox ---------------------------------------------------------
-    from em_volume_tools.grid import MODES
+    from neu_vol.grid import MODES
 
     q = sub.add_parser(
         "align-bbox", help="move a box onto a volume's block grid",
@@ -2224,7 +2224,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "reported back at scale N when it is exactly representable there")
     q.add_argument("-q", "--quiet", action="store_true",
                    help="print only the aligned box, one line per --bbox, so it can be "
-                        "substituted: --crop-bbox $(em-vol align-bbox ... -q)")
+                        "substituted: --crop-bbox $(neu-vol align-bbox ... -q)")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_align_bbox)
 
@@ -2238,11 +2238,11 @@ def build_parser() -> argparse.ArgumentParser:
                     "that becomes a single body with components scattered across the "
                     "volume. This walks the regions in order and gives each its own "
                     "range, so an id identifies one cell in one region.\n\n"
-                    "Regions come from stored-chunk occupancy (as `em-vol "
+                    "Regions come from stored-chunk occupancy (as `neu-vol "
                     "bboxes-json`), so they are disjoint and chunk-aligned: no write is "
                     "a partial-chunk update. Serial by construction — each range starts "
                     "where the last ended — so it runs in this process, no dask.\n\n"
-                    "SINGLE-SCALE, like `em-vol write`: run `em-vol downsample "
+                    "SINGLE-SCALE, like `neu-vol write`: run `neu-vol downsample "
                     "--start-level <level>` afterwards, then re-mesh.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume", help="the volume to read (path or s3://...)")
@@ -2302,7 +2302,7 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     args = _parse_args(argv)
-    from em_volume_tools.logs import quiet_store_logs
+    from neu_vol.logs import quiet_store_logs
 
     with quiet_store_logs(not getattr(args, "store_logs", False)):
         return args.func(args)

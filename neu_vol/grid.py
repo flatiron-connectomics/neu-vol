@@ -22,7 +22,7 @@ boundary must stay where it is, which is the off-by-one that makes ``outer`` gro
 correctly-sized box by a whole block.
 
 :class:`BBox` is the object face of the same arithmetic, for callers that pass boxes
-around rather than two sequences — notably em-viz, which unions the extents of many
+around rather than two sequences — notably neu-draw, which unions the extents of many
 drawables to frame a camera. It is additive: the functions above neither use it nor know
 about it, and their tuple signatures are unchanged.
 """

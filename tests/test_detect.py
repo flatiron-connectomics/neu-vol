@@ -2,11 +2,11 @@ import os
 
 import numpy as np
 
-from em_volume_tools import convert
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.source_metadata import detect_backend
-from em_volume_tools.profiles import precomputed_create_spec, zarr3_create_spec
+from neu_vol import convert
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.source_metadata import detect_backend
+from neu_vol.profiles import precomputed_create_spec, zarr3_create_spec
 
 
 def _zarr3(path, data):
@@ -84,7 +84,7 @@ def test_gzipped_chunks_are_detected_as_a_distinct_backend(tmp_path):
     A conversion of 1.9M blocks was lost to exactly this, so detection must not
     report plain `neuroglancer_precomputed` and let the run proceed.
     """
-    from em_volume_tools.source_metadata import PRECOMPUTED_GZ, detect_backend
+    from neu_vol.source_metadata import PRECOMPUTED_GZ, detect_backend
 
     root = _precomputed_info(tmp_path)
     (root / "8_8_8" / "0-64_0-64_0-64.gz").write_bytes(b"\x1f\x8b junk")
@@ -92,7 +92,7 @@ def test_gzipped_chunks_are_detected_as_a_distinct_backend(tmp_path):
 
 
 def test_normal_precomputed_is_unaffected(tmp_path):
-    from em_volume_tools.source_metadata import detect_backend
+    from neu_vol.source_metadata import detect_backend
 
     root = _precomputed_info(tmp_path)
     (root / "8_8_8" / "0-64_0-64_0-64").write_bytes(b"\x00" * 8)
@@ -101,7 +101,7 @@ def test_normal_precomputed_is_unaffected(tmp_path):
 
 def test_a_scale_with_no_chunks_yet_is_not_flagged(tmp_path):
     """An in-flight or empty volume has no chunks to judge; do not guess `.gz`."""
-    from em_volume_tools.source_metadata import detect_backend
+    from neu_vol.source_metadata import detect_backend
 
     assert detect_backend(str(_precomputed_info(tmp_path))) == "neuroglancer_precomputed"
 
@@ -110,8 +110,8 @@ def test_opening_a_gz_volume_without_cloudvolume_fails_with_guidance(tmp_path):
     """Fail fast and say what to do — not a silent zero-filled read."""
     import pytest
 
-    from em_volume_tools.backends.base import open_backend
-    from em_volume_tools.source_metadata import PRECOMPUTED_GZ
+    from neu_vol.backends.base import open_backend
+    from neu_vol.source_metadata import PRECOMPUTED_GZ
 
     root = _precomputed_info(tmp_path)
     (root / "8_8_8" / "0-64_0-64_0-64.gz").write_bytes(b"\x1f\x8b junk")
@@ -120,7 +120,7 @@ def test_opening_a_gz_volume_without_cloudvolume_fails_with_guidance(tmp_path):
         pytest.skip("cloud-volume is installed here; the missing-dep path cannot run")
     except ImportError:
         pass
-    with pytest.raises(ImportError, match="cloud-volume|em-vol-cv"):
+    with pytest.raises(ImportError, match="cloud-volume|neu-vol-cv"):
         open_backend({"backend": PRECOMPUTED_GZ, "path": str(root)})
 
 
@@ -132,7 +132,7 @@ def test_data_spec_keeps_the_detected_backend(tmp_path):
     the spec the workers actually read through — so every block went to tensorstore,
     requested unsuffixed keys, and came back as zeros with nothing raised.
     """
-    from em_volume_tools.source_metadata import PRECOMPUTED_GZ, read_source_metadata
+    from neu_vol.source_metadata import PRECOMPUTED_GZ, read_source_metadata
 
     root = _precomputed_info(tmp_path)
     (root / "8_8_8" / "0-64_0-64_0-64.gz").write_bytes(b"\x1f\x8b junk")
@@ -145,7 +145,7 @@ def test_data_spec_keeps_the_detected_backend(tmp_path):
 
 
 def test_plain_precomputed_data_spec_is_unchanged(tmp_path):
-    from em_volume_tools.source_metadata import read_source_metadata
+    from neu_vol.source_metadata import read_source_metadata
 
     root = _precomputed_info(tmp_path)
     (root / "8_8_8" / "0-64_0-64_0-64").write_bytes(b"\x00" * 8)
@@ -161,12 +161,12 @@ def test_cloudvolume_url_handles_every_spec_form(tmp_path):
     bucket and path — and every test that built a spec by hand passed anyway, because
     hand-built specs use `path`. Cover all three forms.
     """
-    from em_volume_tools.backends.cloudvolume import _url
+    from neu_vol.backends.cloudvolume import _url
 
     root = _precomputed_info(tmp_path)
     (root / "8_8_8" / "0-64_0-64_0-64.gz").write_bytes(b"\x1f\x8b junk")
 
-    from em_volume_tools.source_metadata import PRECOMPUTED_GZ, read_source_metadata
+    from neu_vol.source_metadata import PRECOMPUTED_GZ, read_source_metadata
 
     by_path = _url({"backend": PRECOMPUTED_GZ, "path": str(root)})
     assert by_path == f"precomputed://file://{root}"
@@ -181,7 +181,7 @@ def test_cloudvolume_url_handles_every_spec_form(tmp_path):
 def test_cloudvolume_url_rejects_an_unsupported_driver():
     import pytest
 
-    from em_volume_tools.backends.cloudvolume import _url
+    from neu_vol.backends.cloudvolume import _url
 
     with pytest.raises(ValueError, match="local paths and s3"):
         _url({"kvstore": {"driver": "gcs", "bucket": "b", "path": "p"}})

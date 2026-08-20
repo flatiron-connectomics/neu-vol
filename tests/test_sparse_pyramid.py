@@ -10,11 +10,11 @@ writes nothing whether it runs or not.
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, convert, rebuild_pyramid
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.ops._multiscale import NothingStored
-from em_volume_tools.profiles import StorageProfile, zarr3_create_spec
+from neu_vol import cli, convert, rebuild_pyramid
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.ops._multiscale import NothingStored
+from neu_vol.profiles import StorageProfile, zarr3_create_spec
 
 
 def _sparse_volume(tmp_path, name="v", *, chunk=(8, 8, 8), shape=(64, 64, 64)):
@@ -23,7 +23,7 @@ def _sparse_volume(tmp_path, name="v", *, chunk=(8, 8, 8), shape=(64, 64, 64)):
     Built by `create` + a direct write rather than `convert`, because that is how a
     ground-truth volume gets made: an empty frame with a few pieces written into it.
     """
-    from em_volume_tools import create_volume
+    from neu_vol import create_volume
 
     dst = str(tmp_path / f"{name}.zarr")
     create_volume(dst, shape=shape, voxel_size=(8, 8, 8), dtype="uint32",
@@ -43,7 +43,7 @@ def _levels(volume, n):
 
 
 def _stored_keys(volume, level):
-    from em_volume_tools.location import list_keys
+    from neu_vol.location import list_keys
 
     return sorted(list_keys(volume, str(level)))
 
@@ -83,7 +83,7 @@ def test_sparse_skips_nearly_every_task(tmp_path):
 def test_the_manifest_denominator_is_the_filtered_total(tmp_path):
     """Invariant 11: a reader can only trust `total`, so it must be what was dispatched.
 
-    Recording the whole grid here would make `em-vol progress` sit at a few percent
+    Recording the whole grid here would make `neu-vol progress` sit at a few percent
     forever on a run that had in fact finished.
     """
     import json
@@ -120,7 +120,7 @@ def test_a_seed_level_with_no_stored_chunks_is_refused(tmp_path):
     That is invariant 4's failure mode — a successful run that writes nothing — and it is
     exactly what a wrong --start-level or a not-yet-filled volume would produce.
     """
-    from em_volume_tools import create_volume
+    from neu_vol import create_volume
 
     empty = str(tmp_path / "empty.zarr")
     create_volume(empty, shape=(64, 64, 64), voxel_size=(8, 8, 8), dtype="uint32",
@@ -197,7 +197,7 @@ def test_rebuild_takes_its_level_count_from_the_volume(tmp_path, caplog):
     9-level volume it was repairing — leaving the top level serving whatever it held
     before, with every shape matching so the mismatch check saw nothing.
     """
-    from em_volume_tools import create_volume, describe
+    from neu_vol import create_volume, describe
 
     vol = str(tmp_path / "deep.zarr")
     create_volume(vol, shape=(64, 64, 64), voxel_size=(8, 8, 8), dtype="uint32",

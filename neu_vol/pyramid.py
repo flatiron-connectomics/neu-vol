@@ -54,7 +54,7 @@ def downsample_schedule(
     single-scale volume. It used to bound the list itself, which meant the flag named
     "max levels" permitted one more level than it said — ``--max-levels 8`` produced 9
     — and so read as a no-op at the default. Anything comparing a schedule against a
-    pyramid already on disk (``em-vol downsample``) needs the number that built it,
+    pyramid already on disk (``neu-vol downsample``) needs the number that built it,
     which is now one higher than the value that was passed then.
     """
     if factors is not None:

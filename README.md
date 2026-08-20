@@ -1,4 +1,4 @@
-# em-volume-tools
+# neu-vol
 
 Chunked I/O, conversion, and multiscale generation for large 3D EM volumes
 (images, probabilities/affinities, segmentations), orchestrated with dask —
@@ -9,18 +9,18 @@ locally on a workstation or on the Flatiron Rusty cluster via SLURM.
 
 ## Environment
 
-One conda environment covers this repo, its substrate (`em-blockrun`) and its
+One conda environment covers this repo, its substrate (`blockrun`) and its
 consumers, each installed editable. Runtime deps come from conda-forge, so
 `--no-deps` keeps pip from re-resolving them.
 
 ```bash
-conda activate em-lib
-pip install --no-deps -e ../em-blockrun -e .
+conda activate neu-env
+pip install --no-deps -e ../blockrun -e .
 python -m pytest -q
 ```
 
-`em-blockrun` must be a **sibling directory** — the layering depends on it. The
-combined environment spec lives one level up, at `em-libraries/environment.yml`.
+`blockrun` must be a **sibling directory** — the layering depends on it. The
+combined environment spec lives one level up, at `neu-suite/environment.yml`.
 
 Previously managed with pixi, with envs detached to ceph to dodge the GPFS home
 inode quota; see `docs/DESIGN.md` §8 for that history and why it changed.
@@ -30,7 +30,7 @@ inode quota; see `docs/DESIGN.md` §8 for that history and why it changed.
 Working first vertical slice: **image stack → multiscale OME-NGFF 0.5 zarr v3**.
 
 ```python
-from em_volume_tools import ingest_image_stack
+from neu_vol import ingest_image_stack
 
 ingest_image_stack(
     "/path/to/slices/*.tif",     # glob, directory, or a single multipage TIFF
@@ -49,7 +49,7 @@ precomputed `info`); explicit args override. Segmentations default to
 `compressed_segmentation` encoding on precomputed.
 
 ```python
-from em_volume_tools import convert
+from neu_vol import convert
 convert("in.zarr", "out.precomputed",           # voxel_size read from in.zarr's OME metadata
         profile="s3-neuroglancer", kind="segmentation")   # mode pyramid, compressed_segmentation
 ```
@@ -74,10 +74,10 @@ hole; a box that misses the volume raises rather than quietly copying everything
 that an all-fill block is **elided rather than written**, so a mask cannot erase a region
 the destination already holds from an earlier run.
 
-On the command line, `em-vol convert --crop-bbox z0,y0,x0,z1,y1,x1` and
+On the command line, `neu-vol convert --crop-bbox z0,y0,x0,z1,y1,x1` and
 `--mask-bbox` (repeatable) do this, with `--bbox-scale N` and `--bbox-order xyz` applying
 to every box the command takes, and
-**`em-vol copy` is the same command with the source's own parameters as the defaults** —
+**`neu-vol copy` is the same command with the source's own parameters as the defaults** —
 format, chunking, voxel size and image/segmentation type all read from the source, with
 anything it does not record an error rather than a guess. That last part is why it exists:
 `convert --kind` defaults to `image`, so copying a segmentation and forgetting the flag
@@ -90,7 +90,7 @@ converted wholesale. Create the (empty) frame — optionally copying a reference
 volume's geometry exactly — then place each piece into one level of it.
 
 ```python
-from em_volume_tools import create_volume, write_subvolume, write_subvolumes
+from neu_vol import create_volume, write_subvolume, write_subvolumes
 
 create_volume("annotations.precomputed", like="s3://.../image.zarr",  # same frame, so
               dtype="uint64", kind="segmentation")                    # a voxel index
@@ -111,7 +111,7 @@ stack (or any readable source) into one HDF5 dataset carrying `voxel_offset`, `v
 `offset`, `units` and `axes`, so the piece can be placed later with no arguments:
 
 ```python
-from em_volume_tools import pack_hdf5
+from neu_vol import pack_hdf5
 pack_hdf5("slices/", "piece.h5", voxel_size=(40, 8, 8), voxel_offset=(24, 128, 256))
 ```
 
@@ -165,28 +165,28 @@ All-fill (e.g. all-zero) chunks are **elided** (not written) and recorded as
 `empty`, so sparse segmentations stay small and resume never reprocesses them.
 `verify=True` instead checks storage authoritatively per block.
 
-## The `em-vol` command
+## The `neu-vol` command
 
-Installing the package provides **`em-vol`** (equivalently `python -m em_volume_tools`):
+Installing the package provides **`neu-vol`** (equivalently `python -m neu_vol`):
 
 ```bash
-em-vol info    <volume>                      # format, voxel sizes, chunking, levels
-em-vol convert --src ... --dst ...           # build a multiscale volume
-em-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
-em-vol progress <volume>                     # chunks written, per level
-em-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
-em-vol write   <volume> --src ... --offset   # put one subvolume into it
-em-vol to-hdf5 --src slices/ --out piece.h5  # pack a piece, frame and position included
-em-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
-em-vol relabel <volume> --out ...            # one id range per occupied region
-em-vol mask-by-value <volume> --values 1     # background that is not 0, made 0
+neu-vol info    <volume>                      # format, voxel sizes, chunking, levels
+neu-vol convert --src ... --dst ...           # build a multiscale volume
+neu-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
+neu-vol progress <volume>                     # chunks written, per level
+neu-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
+neu-vol write   <volume> --src ... --offset   # put one subvolume into it
+neu-vol to-hdf5 --src slices/ --out piece.h5  # pack a piece, frame and position included
+neu-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
+neu-vol relabel <volume> --out ...            # one id range per occupied region
+neu-vol mask-by-value <volume> --values 1     # background that is not 0, made 0
 ```
 
-Anything a **viewer** consumes lives in [em-ngl](../em-ngl): `em-ngl gen` for a link or a
-state, `em-ngl bboxes` for a layer of boxes over a sparse volume's data, `em-ngl annotate`
+Anything a **viewer** consumes lives in [neu-glance](../neu-glance): `neu-glance gen` for a link or a
+state, `neu-glance bboxes` for a layer of boxes over a sparse volume's data, `neu-glance annotate`
 for a layer of your own coordinates. This package supplies the occupancy analysis those
 build on (`ops.annotate.labeled_regions`) and otherwise knows nothing about neuroglancer.
-The three used to be `em-vol bboxes-json`, `annotate-json` and `ng-url-gen`; the rename was
+The three used to be `neu-vol bboxes-json`, `annotate-json` and `ng-url-gen`; the rename was
 a clean break with no aliases.
 
 `info`, `progress` and `align-bbox` read
@@ -200,12 +200,12 @@ volume.
 in the calling process, no dask. Both take `--dry-run`.
 
 ```bash
-em-vol create /abs/annotations.precomputed --like s3://.../image.precomputed \
+neu-vol create /abs/annotations.precomputed --like s3://.../image.precomputed \
     --dtype uint64 --kind segmentation            # empty; same frame as the image
-em-vol write /abs/annotations.precomputed --src piece.h5 --offset 1024,4096,4096
-em-vol write /abs/annotations.precomputed --src slices/ --offset 4096,16384,16384 \
+neu-vol write /abs/annotations.precomputed --src piece.h5 --offset 1024,4096,4096
+neu-vol write /abs/annotations.precomputed --src slices/ --offset 4096,16384,16384 \
     --level 2 --offset-level 0                    # coords read off level 0
-em-vol write /abs/annotations.precomputed \
+neu-vol write /abs/annotations.precomputed \
     --src a.h5 --src b.h5 --src c.h5              # each file's own voxel_offset
 ```
 
@@ -232,8 +232,8 @@ own but loses one of two updates if overlapping writes ever run at once.
 substitute into `--crop-bbox` or `--roi`:
 
 ```bash
-em-vol align-bbox --volume V --bbox 5600,4470,6790,5770,4740,7050 --to both
-em-vol copy --src V --dst D --crop-bbox $(em-vol align-bbox --volume V --bbox ... -q)
+neu-vol align-bbox --volume V --bbox 5600,4470,6790,5770,4740,7050 --to both
+neu-vol copy --src V --dst D --crop-bbox $(neu-vol align-bbox --volume V --bbox ... -q)
 ```
 
 **Which grid is the question**, and there are three: the **write unit** (the chunk, or the
@@ -248,7 +248,7 @@ aligns the origin and keeps the extent exactly for a fixed-size crop. `--block z
 needs no volume; `--scale N` takes the box in another level's voxels via the real per-level
 voxel sizes. Boxes are half-open, so a bound already on a boundary stays put, and a bound
 at the volume's own extent counts as aligned — that final block is partial in the volume
-too. `em-vol write` reports alignment through the same predicate, so the two agree.
+too. `neu-vol write` reports alignment through the same predicate, so the two agree.
 
 ### Finding the data in a sparse volume
 
@@ -261,11 +261,11 @@ regions written face to face merge into one, plus the empty corner between them)
 box is tightened to its nonzero voxels at a coarse level.
 
 `relabel`, `mask-by-value` and `downsample --sparse` all ask that same question. To *see*
-the answer, `em-ngl bboxes` turns it into a viewer layer:
+the answer, `neu-glance bboxes` turns it into a viewer layer:
 
 ```bash
-em-ngl bboxes s3://.../gt_v1 --label gt                     # layer JSON to stdout
-em-ngl bboxes s3://.../gt_v1 --format url --out link.txt    # or a whole link
+neu-glance bboxes s3://.../gt_v1 --label gt                     # layer JSON to stdout
+neu-glance bboxes s3://.../gt_v1 --format url --out link.txt    # or a whole link
 ```
 
 ### Ground truth annotated chunk by chunk
@@ -276,9 +276,9 @@ volume — correct for the label, useless as ground truth. `relabel` gives each 
 region its own range:
 
 ```bash
-em-vol relabel s3://.../gt_v1 --out s3://.../gt_v2 --dry-run   # reads, writes nothing
-em-vol relabel s3://.../gt_v1 --out s3://.../gt_v2             # then --start-level 0
-em-vol downsample s3://.../gt_v2 --start-level 0
+neu-vol relabel s3://.../gt_v1 --out s3://.../gt_v2 --dry-run   # reads, writes nothing
+neu-vol relabel s3://.../gt_v1 --out s3://.../gt_v2             # then --start-level 0
+neu-vol downsample s3://.../gt_v2 --start-level 0
 ```
 
 Regions are the same stored-chunk footprints `labeled_regions` reports, so they are pairwise
@@ -295,8 +295,8 @@ levels above are stale until `downsample` re-runs; it says so.
 
 ```bash
 # smoke test locally, then launch on SLURM surviving logout:
-em-vol convert --src ... --dst ... --serial --single-level
-nohup env PYTHONUNBUFFERED=1 em-vol convert --src ... --dst s3://... \
+neu-vol convert --src ... --dst ... --serial --single-level
+nohup env PYTHONUNBUFFERED=1 neu-vol convert --src ... --dst s3://... \
     --config dask-slurm-example --config ~/my-site.yaml --workers 48 > run.log 2>&1 &
 squeue -u "$USER"
 ```
@@ -308,7 +308,7 @@ log lags a long run in 8 KB blocks.
 
 `--config` takes a **bundled template name or a path**, and is **repeatable**,
 deep-merged left to right. The templates (`dask-local`, `dask-slurm-example`) ship
-with **em-blockrun**, next to `start_dask`, so all its consumers share one set.
+with **blockrun**, next to `start_dask`, so all its consumers share one set.
 An overlay carries only the keys that differ:
 
 ```yaml

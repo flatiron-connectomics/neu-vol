@@ -19,5 +19,5 @@ and it does not let anyone revoke a license already granted for a published vers
 
 - Run the test suite before opening a PR (`pytest -q`). CI runs it on every push and
   pull request, and it must be green to merge.
-- This package sits between `em-blockrun` and its consumers (`em-seg-morpho`), so a
+- This package sits between `blockrun` and its consumers (`neu-morpho`), so a
   change here can affect them; run their suites too if you have them checked out.

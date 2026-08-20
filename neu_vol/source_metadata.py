@@ -334,7 +334,7 @@ def _read_dvid(spec: Mapping[str, Any]) -> dict | None:
 
     # Resolution is reported; the fact that a node is OPEN is *warned about* by the op
     # that is going to export it, not here. This function is also on the path of
-    # read-only inspection (`em-vol info`, the CLI's crop peeks), where a warning about
+    # read-only inspection (`neu-vol info`, the CLI's crop peeks), where a warning about
     # reproducibility is noise — `info` prints the open/locked status in its own table.
     log = logging.getLogger(__name__)
     if node["uuid"] != str(spec.get("uuid")):

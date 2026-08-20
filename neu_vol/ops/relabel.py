@@ -9,7 +9,7 @@ ground truth. Measured on sample3's gt_v1: 3,637 label-instances over 12 regions
 This walks the occupied regions in order and renumbers each into a range of its own, so
 an id identifies one cell in one region. Two properties make it safe and simple:
 
-- **The regions come from stored-chunk occupancy** (:mod:`em_volume_tools.ops.annotate`),
+- **The regions come from stored-chunk occupancy** (:mod:`neu_vol.ops.annotate`),
   so they are pairwise disjoint by construction and every voxel belongs to at most one.
 - **It is serial by construction.** The next region's range starts where the last one
   ended, so there is nothing to coordinate and no way for two workers to race.
@@ -26,8 +26,8 @@ way back from a new id to the region and original label it came from, and once t
 is overwritten that is unrecoverable. It is written by default.
 
 Renumbering one level leaves the levels above it holding the old ids, so this is
-single-scale like :mod:`em_volume_tools.ops.write` and for the same reason. Run
-``em-vol downsample --start-level <level>`` afterwards.
+single-scale like :mod:`neu_vol.ops.write` and for the same reason. Run
+``neu-vol downsample --start-level <level>`` afterwards.
 """
 
 from __future__ import annotations

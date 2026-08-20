@@ -13,10 +13,10 @@ named object, and if it ever lists, it must list the scale with the fewest chunk
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
-from em_volume_tools.source_metadata import (PRECOMPUTED_GZ, _first_chunk_key,
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
+from neu_vol.source_metadata import (PRECOMPUTED_GZ, _first_chunk_key,
                                             detect_backend,
                                             precomputed_chunks_are_gzipped)
 
@@ -68,13 +68,13 @@ def test_a_plain_volume_is_detected_without_listing_anything(tmp_path, monkeypat
     question being asked, so it must not happen at all when the predicted key resolves.
     """
     dst = _precomputed(tmp_path)
-    from em_volume_tools import location
+    from neu_vol import location
 
     def refuse(*a, **k):
         raise AssertionError("detect_backend listed a prefix instead of probing a key")
 
     monkeypatch.setattr(location, "list_keys", refuse)
-    monkeypatch.setattr("em_volume_tools.source_metadata.list_keys", refuse,
+    monkeypatch.setattr("neu_vol.source_metadata.list_keys", refuse,
                         raising=False)
     assert detect_backend(dst) == "neuroglancer_precomputed"
 
@@ -98,7 +98,7 @@ def test_gz_suffixed_chunks_are_detected(tmp_path):
 def test_the_coarsest_scale_is_probed(tmp_path):
     """Any scale answers the question — gzipping is how the volume was written — so the
     one with the fewest chunks is the one to ask about, in case it has to list."""
-    from em_volume_tools.location import read_json
+    from neu_vol.location import read_json
 
     dst = _precomputed(tmp_path, "many")
     scales = read_json(dst, "info")["scales"]
@@ -116,7 +116,7 @@ def test_an_absent_origin_chunk_falls_back_to_a_listing(tmp_path):
     import os
 
     dst = _precomputed(tmp_path, "sparse")
-    from em_volume_tools.location import read_json
+    from neu_vol.location import read_json
     coarsest = max(read_json(dst, "info")["scales"],
                    key=lambda s: tuple(s["resolution"]))
     key = _first_chunk_key(coarsest)
@@ -135,7 +135,7 @@ def test_an_empty_scale_is_not_gzipped(tmp_path):
 
 
 # The companion to these — that building a viewer layer must not open every level — moved
-# with `volume_layer` to em-ngl, where it is pinned against that package's own caller.
+# with `volume_layer` to neu-glance, where it is pinned against that package's own caller.
 
 
 def test_limit_is_documented_as_not_bounding_the_request():
@@ -144,7 +144,7 @@ def test_limit_is_documented_as_not_bounding_the_request():
     Pinned as a test because the next person to reach for `limit` to make a listing
     cheap will read the docstring, not the tensorstore source.
     """
-    from em_volume_tools.location import list_keys
+    from neu_vol.location import list_keys
 
     doc = list_keys.__doc__
     assert "not the request" in doc.lower() or "does not bound" in doc.lower()

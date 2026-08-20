@@ -15,10 +15,10 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, convert
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import cli, convert
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
 
 def _zarr_source(path, data, chunk=(8, 8, 8)):
@@ -114,7 +114,7 @@ def test_extract_roi_still_pads_and_now_reads_the_sources_metadata(tmp_path, lab
     It also picks up what it never used to read — a source's voxel size — since it no
     longer resolves the source itself.
     """
-    from em_volume_tools import extract_roi
+    from neu_vol import extract_roi
 
     src = _precomputed_source(str(tmp_path / "src"), labels, voxel=(40, 8, 8))
     dst = str(tmp_path / "roi")
@@ -226,7 +226,7 @@ def test_crop_scale_uses_the_real_per_level_voxel_sizes(tmp_path):
             profile="local-neuroglancer", chunk=(8, 8, 8), factors=[(1, 2, 2)],
             max_levels=2, min_dim=4, delete_existing=True)
 
-    from em_volume_tools.source_metadata import read_level_voxel_sizes
+    from neu_vol.source_metadata import read_level_voxel_sizes
     assert read_level_voxel_sizes({"backend": "neuroglancer_precomputed", "path": src}) \
         == [(40.0, 8.0, 8.0), (40.0, 16.0, 16.0)]
     assert cli._level0_factor(src, 1) == (1, 2, 2)

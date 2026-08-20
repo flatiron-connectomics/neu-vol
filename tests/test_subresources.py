@@ -1,15 +1,15 @@
 """Linking a precomputed segmentation volume to its mesh / skeleton / property sidecars.
 
-Moved here from em-seg-morpho, which still re-exports it: it edits a *volume's* ``info``,
-and more than one consumer needs it. em-seg-morpho's own tests exercise it against a real
+Moved here from neu-morpho, which still re-exports it: it edits a *volume's* ``info``,
+and more than one consumer needs it. neu-morpho's own tests exercise it against a real
 generated volume; these cover the parts that are pure ``info`` bookkeeping, including the
 ``segment_properties`` ``@type`` check that had no coverage before.
 """
 
 import pytest
 
-from em_volume_tools.location import read_json, write_json
-from em_volume_tools.ops.subresources import SUBRESOURCE_TYPES, link_subresources
+from neu_vol.location import read_json, write_json
+from neu_vol.ops.subresources import SUBRESOURCE_TYPES, link_subresources
 
 
 def _volume(tmp_path, **subs):

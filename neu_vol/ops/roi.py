@@ -1,6 +1,6 @@
 """Extract / crop / pad a region of interest into a new multiscale volume.
 
-A thin wrapper over :func:`~em_volume_tools.convert`, which owns the crop (it wraps
+A thin wrapper over :func:`~neu_vol.convert`, which owns the crop (it wraps
 the source in the read-only crop view from ``backends/view.py`` and runs the shared
 materialize engine). What this adds is the crop-*and*-pad contract: ``start`` may be
 negative and ``stop`` may exceed the source extent, and the out-of-bounds margin is

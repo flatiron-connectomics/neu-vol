@@ -1,4 +1,4 @@
-"""The em-vol CLI: argument parsing, volume inspection, and the info/downsample plan.
+"""The neu-vol CLI: argument parsing, volume inspection, and the info/downsample plan.
 
 The inspection tests matter most. `info` and `downsample` both have to agree with what
 is actually on disk, and both used to be separate scripts that could drift.
@@ -10,10 +10,10 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.source_metadata import read_level_voxel_sizes
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import cli, convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.source_metadata import read_level_voxel_sizes
+from neu_vol.profiles import zarr3_create_spec
 
 
 def _pyramid(tmp_path, *, voxel=(8, 8, 8), shape=(16, 16, 16), kind="image"):
@@ -53,7 +53,7 @@ def test_a_local_precomputed_target_has_a_profile_to_use(tmp_path):
     failed with "unknown profile" — and it survived because every test that wanted
     precomputed passed 's3-neuroglancer' explicitly, local destination or not.
     """
-    from em_volume_tools.profiles import get_profile
+    from neu_vol.profiles import get_profile
 
     assert get_profile("local-neuroglancer").format == "neuroglancer_precomputed"
     src, dst = _pyramid(tmp_path), str(tmp_path / "pc_out")
@@ -410,7 +410,7 @@ def _done_total(row):
 
 def _precomputed(tmp_path, *, labels=True):
     """A real precomputed volume, built by `convert`."""
-    from em_volume_tools.profiles import StorageProfile
+    from neu_vol.profiles import StorageProfile
 
     shape = (32, 32, 32)
     data = np.zeros(shape, np.uint64)

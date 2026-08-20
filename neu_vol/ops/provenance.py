@@ -55,7 +55,7 @@ def build_record(*, src_spec: Mapping[str, Any], dst: str, **run: Any) -> dict[s
 
     return {
         "written": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "tool": "em-volume-tools",
+        "tool": "neu-vol",
         "destination": str(dst),
         "source": source_provenance(src_spec),
         "run": {k: v for k, v in run.items() if v is not None},

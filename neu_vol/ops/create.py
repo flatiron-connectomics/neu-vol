@@ -4,7 +4,7 @@
 This is the other shape of the problem: you have several small subvolumes — image
 stacks, HDF5 files — that belong at known positions inside one larger frame, and
 you want the frame to exist first so each piece can be written into it
-independently (see :mod:`em_volume_tools.ops.write`).
+independently (see :mod:`neu_vol.ops.write`).
 
 Creating a level costs one ``zarr.json``: a zarr array with no chunks written reads
 back as the fill value everywhere, so an empty pyramid is a few hundred bytes, not a
@@ -50,7 +50,7 @@ def _spatial(shape: Sequence[int], has_channels: bool) -> tuple[int, ...]:
 
 
 #: Level cap when the pyramid is computed and the caller named none. Matches
-#: :func:`~em_volume_tools.pyramid.downsample_schedule`'s own default, and like it counts
+#: :func:`~neu_vol.pyramid.downsample_schedule`'s own default, and like it counts
 #: level 0. Distinct from ``None``, which means "no cap" and is what keeps a mirrored
 #: reference whole.
 DEFAULT_MAX_LEVELS = 8
@@ -393,7 +393,7 @@ def create_volume(dst: str, *, overwrite: bool = False, validate: bool = True,
     if (before or exists(base_kv, marker)) and not overwrite:
         raise FileExistsError(
             f"{dst} already exists ({len(before)} level(s)); pass overwrite=True to "
-            f"replace it. To add data to it instead, use `em-vol write`.")
+            f"replace it. To add data to it instead, use `neu-vol write`.")
     stale = [i for i in before if i >= plan["num_levels"]]
     if stale and not precomputed:
         # Left in place rather than deleted: dropping a level means deleting a whole

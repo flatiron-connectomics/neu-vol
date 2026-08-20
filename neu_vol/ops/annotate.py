@@ -2,7 +2,7 @@
 
 **This is analysis, not presentation.** It answers "which regions of this volume hold
 anything" and returns boxes in level-0 voxels. Turning those into a neuroglancer layer is
-`em-ngl bboxes`, in a package that sits above this one — em-volume-tools knows nothing about
+`neu-glance bboxes`, in a package that sits above this one — neu-vol knows nothing about
 viewers. `ops.relabel`, `ops.maskvalue` and `ops._multiscale` (the ``--sparse`` path) are the
 other callers, and they want the boxes rather than a layer.
 
@@ -20,7 +20,7 @@ into it, so they cannot drift from the data. Three steps, cheapest first:
    than a uniform 256. Raise ``tighten_level`` for cheaper, ``0`` for exact.
 
 Coordinates are **zyx** throughout, as everywhere in this package. The flip to xyz belongs to
-whatever presents them, which is `em-ngl`.
+whatever presents them, which is `neu-glance`.
 """
 
 from __future__ import annotations

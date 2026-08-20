@@ -160,7 +160,7 @@ class RemapBackend:
     rests on: **an all-background block of 1s is not all-fill, so it gets stored.** The
     volume then has a chunk object everywhere data was written, whether or not it holds
     anything, and "which chunks exist" stops answering "where is the data" — which is what
-    `bboxes-json`, `relabel`, `--sparse` and em-seg-morpho's occupancy all ask it.
+    `bboxes-json`, `relabel`, `--sparse` and neu-morpho's occupancy all ask it.
 
     Doing it here, on the read side, is therefore not a convenience: it is the only place
     the correction happens *before* the storage decision. Applied after the fact, the dense

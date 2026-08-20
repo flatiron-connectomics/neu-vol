@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "em-volume-tools"
+name = "neu-vol"
 version = "0.1.0"
 description = "Chunked I/O, conversion, and multiscale generation for large 3D EM volumes, orchestrated with dask (local or Rusty/SLURM)."
 readme = "README.md"
@@ -23,22 +23,22 @@ dependencies = [
     "h5py",                # HDF5 chunk shards
     "tifffile",            # TIFF (multi-file + multipage) sources
     "imageio",             # PNG / misc 2D image sources
-    "em-blockrun",         # shared dask/SLURM chunked-map substrate
+    "blockrun",         # shared dask/SLURM chunked-map substrate
 ]
 # NOT declared, and cannot be:
 #   cloud-volume — reads .gz-chunked precomputed (backends/cloudvolume.py). It pins
-#     DracoPy<2 and would downgrade the DracoPy behind em-seg-morpho's mesh
-#     serialisation, so it lives in the separate `em-vol-cv` env.
+#     DracoPy<2 and would downgrade the DracoPy behind neu-morpho's mesh
+#     serialisation, so it lives in the separate `neu-vol-cv` env.
 #   neuclease    — reads DVID labelmaps (backends/dvid.py). Its own dependencies
 #     include libdvid-cpp, vigra and dvidutils, all conda-only on flyem-forge, and
 #     libdvid is load-bearing rather than incidental: it is what inflates DVID's
 #     compressed label blocks. A pip extra would simply fail to install. Get it with
-#     `mamba install -n em-lib -c flyem-forge -c conda-forge neuclease`.
+#     `mamba install -n neu-env -c flyem-forge -c conda-forge neuclease`.
 # Both backends import cleanly without their library and raise an explanatory
 # ImportError only when a volume actually needs one.
 
 [project.scripts]
-em-vol = "em_volume_tools.cli:main"
+neu-vol = "neu_vol.cli:main"
 
 [project.optional-dependencies]
 # pytest-xdist is opt-in and never in addopts: it pays off for THIS suite only, and
@@ -47,8 +47,8 @@ em-vol = "em_volume_tools.cli:main"
 dev = ["pytest", "pytest-xdist"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["em_volume_tools"]
-# No package data here: the dask config templates live in em-blockrun, next to
+packages = ["neu_vol"]
+# No package data here: the dask config templates live in blockrun, next to
 # start_dask, and are resolved by name through it. Site-specific configs stay out of
 # the repo entirely — the top-level configs/ is gitignored.
 

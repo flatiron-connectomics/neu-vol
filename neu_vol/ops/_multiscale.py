@@ -8,7 +8,7 @@ while precomputed's multiscale ``info`` is written incrementally at scale create
 See docs/DESIGN.md §6-7. A leading channel axis ``(c, z, y, x)`` is supported and
 never downsampled.
 
-Every per-block worker is wrapped in :func:`em_volume_tools.retry.with_retry`. At this
+Every per-block worker is wrapped in :func:`neu_vol.retry.with_retry`. At this
 scale transient object-store failures are not hypothetical — one bad connection or DNS
 lookup among tens of thousands of tasks would otherwise end a run that is succeeding.
 
@@ -31,7 +31,7 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
-from em_blockrun import Block, Manifest, block_map, iter_blocks
+from blockrun import Block, Manifest, block_map, iter_blocks
 
 from ..backends.base import Region, open_backend
 from ..backends.tensorstore import TensorStoreBackend
@@ -172,7 +172,7 @@ class NothingStored(RuntimeError):
 def _stored_cells_fn(dst: str, fmt: str):
     """``(level, cell_shape) -> {stored chunk cells}`` for this destination.
 
-    Deferred to :func:`em_volume_tools.ops.annotate.occupied_cells`, which already knows
+    Deferred to :func:`neu_vol.ops.annotate.occupied_cells`, which already knows
     how each format spells a chunk key — precomputed's ``x0-x1_y0-y1_z0-z1`` in xyz under
     a per-scale prefix, zarr v3's ``c/z/y/x``. It raises ``NoOccupancy`` on a **sharded**
     level, which is the right answer rather than a wrong one: a shard hides which of its
@@ -241,12 +241,12 @@ def _run_level(manifest, level, backend, worker_factory, *, resume, verify, clie
     The task total goes into the manifest **before** dispatch. It is the only place
     it is known — a task may span many destination chunks (see ``plan_task_shape``),
     so a reader counting the chunk grid gets a denominator up to 256x too large, and
-    `em-vol progress` did exactly that. Logging is likewise before *and* after: the
+    `neu-vol progress` did exactly that. Logging is likewise before *and* after: the
     single after-the-fact line this replaced arrived only once the level finished,
     reporting "0 already done" about work that had by then all been done.
 
     ``skip`` drops blocks before anything else, and therefore before the total is
-    recorded: the denominator has to be the work actually dispatched, or `em-vol
+    recorded: the denominator has to be the work actually dispatched, or `neu-vol
     progress` reports against a grid the run never intended to cover.
     """
     unit = tuple(int(c) for c in (task_shape or backend.chunks))

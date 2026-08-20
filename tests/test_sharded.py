@@ -9,7 +9,7 @@ import struct
 
 import pytest
 
-from em_volume_tools import sharded
+from neu_vol import sharded
 
 
 def _spec(**kw):

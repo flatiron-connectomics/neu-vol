@@ -1,11 +1,11 @@
 """Write one subvolume into an existing volume, at a voxel offset and one level.
 
-The companion to :mod:`em_volume_tools.ops.create`: the frame exists, and each piece
+The companion to :mod:`neu_vol.ops.create`: the frame exists, and each piece
 — an image stack, an HDF5 dataset, a region of another volume — gets placed into it
 independently. Deliberately **single-scale**: it writes the level you name and does
 not touch any other, because the pieces are usually annotations or corrections whose
 correct coarse representation is a separate decision (averaging a label map invents
-ids). Build the pyramid afterwards with ``em-vol downsample`` if you want one.
+ids). Build the pyramid afterwards with ``neu-vol downsample`` if you want one.
 
 No dask, no manifest. These are small pieces; the run is a loop in this process,
 which is also what makes it safe to reason about the one real hazard here —
@@ -55,7 +55,7 @@ def source_spec(src: str | Mapping[str, Any], src_format: str | None = None,
     making: the inputs are files a person is pointing at one at a time, and a wrong
     guess fails immediately and visibly on open rather than reading zeros.
 
-    TODO: this does not resolve ``dvid://`` URLs, so `em-vol write` and `em-vol to-hdf5`
+    TODO: this does not resolve ``dvid://`` URLs, so `neu-vol write` and `neu-vol to-hdf5`
     cannot take a DVID source — only `convert` can. `to-hdf5` is the one worth fixing:
     it already has ``--level`` and ``--crop-bbox``, so taking a box straight out of DVID
     into an HDF5 piece would close the extract-annotate-write-back loop without anyone
@@ -109,7 +109,7 @@ def resolve_offset(backend, offset, *, field: str, order: str | None, ndim: int)
     mirrored through the z=x diagonal and nothing downstream able to tell.
 
     ``order=None`` means "ask the file": a source may expose ``stored_axes()`` and say
-    which order it wrote, in which case reading it is not a guess at all. `em-vol to-hdf5`
+    which order it wrote, in which case reading it is not a guess at all. `neu-vol to-hdf5`
     records it; falling back to zyx when nothing does. An explicit ``order`` always wins,
     and the provenance string says which of the three happened, because this is the one
     decision here whose mistakes are invisible afterwards.
@@ -207,7 +207,7 @@ def _tiles(start: Sequence[int], stop: Sequence[int], unit: Sequence[int]) -> li
 def _misaligned_axes(start, stop, shape, chunk) -> list[int]:
     """Axes where the region's edges fall inside a destination chunk.
 
-    Delegates to :func:`em_volume_tools.grid.misaligned_axes`, which `em-vol align-bbox`
+    Delegates to :func:`neu_vol.grid.misaligned_axes`, which `neu-vol align-bbox`
     also uses — the volume-end exemption (an edge at the end of the volume is aligned by
     definition, since there is no neighbouring data in that partial chunk to
     read-modify-write against) has to be one rule, or the two commands will eventually
@@ -243,7 +243,7 @@ def plan_subvolume_write(
     fmt = detect_backend(volume)
     if fmt is None:
         raise FileNotFoundError(
-            f"no volume found at {volume} — create one first with `em-vol create`")
+            f"no volume found at {volume} — create one first with `neu-vol create`")
 
     levels = existing_levels(volume, fmt)
     if level not in levels:

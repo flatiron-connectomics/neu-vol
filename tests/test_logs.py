@@ -3,7 +3,7 @@
 import os
 import sys
 
-from em_volume_tools.logs import is_benign, quiet_store_logs
+from neu_vol.logs import is_benign, quiet_store_logs
 
 NOISE = [
     b"E0730 12:50:54.614346  161829 AuthCredentialsProvider:6146] static: Profile "

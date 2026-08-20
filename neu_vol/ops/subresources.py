@@ -7,8 +7,8 @@ per-segment properties; without them each is a separate source the viewer has no
 to associate with the labels.
 
 This lives here rather than in a consumer because it edits a *volume's* ``info``, which is
-this package's business, and because more than one consumer needs it: em-seg-morpho links
-``mesh``/``skeletons`` after its seg stage, em-annotation links ``segment_properties``.
+this package's business, and because more than one consumer needs it: neu-morpho links
+``mesh``/``skeletons`` after its seg stage, neu-mark links ``segment_properties``.
 """
 
 from __future__ import annotations

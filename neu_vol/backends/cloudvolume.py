@@ -8,13 +8,13 @@ nothing raises** — a 1.9 M-block conversion was lost to it before detection ex
 
 So this backend exists to read those volumes with the library that wrote them.
 ``source_metadata.detect_backend`` returns
-:data:`~em_volume_tools.source_metadata.PRECOMPUTED_GZ` for them, which routes here.
+:data:`~neu_vol.source_metadata.PRECOMPUTED_GZ` for them, which routes here.
 
 **cloud-volume is an optional dependency and deliberately not in the main env.** It
-pins ``DracoPy<2``, and installing it alongside em-seg-morpho would downgrade
+pins ``DracoPy<2``, and installing it alongside neu-morpho would downgrade
 DracoPy 2.0.0 -> 1.7.0 — the Draco codec behind ``vol2mesh``'s mesh serialisation.
-Use the separate ``em-vol-cv`` environment (see ``em-vol-cv-environment.yml``), which
-carries em-blockrun and em-volume-tools but never em-seg-morpho.
+Use the separate ``neu-vol-cv`` environment (see ``neu-vol-cv-environment.yml``), which
+carries blockrun and neu-vol but never neu-morpho.
 
 Read-only on purpose: nothing here should *write* the format that caused the problem.
 """
@@ -35,12 +35,12 @@ _MISSING = (
     "without raising. Reading it needs the `cloud-volume` package, which is not "
     "installed here.\n\n"
     "cloud-volume is kept out of the main environment on purpose: it pins DracoPy<2 "
-    "and would downgrade the DracoPy that em-seg-morpho's mesh stage depends on. "
+    "and would downgrade the DracoPy that neu-morpho's mesh stage depends on. "
     "Use the separate environment instead:\n"
-    "    mamba env create -f em-vol-cv-environment.yml\n"
-    "    conda activate em-vol-cv\n"
+    "    mamba env create -f neu-vol-cv-environment.yml\n"
+    "    conda activate neu-vol-cv\n"
     "    pip install cloud-volume\n"
-    "    pip install --no-deps -e ./em-blockrun -e ./em-volume-tools"
+    "    pip install --no-deps -e ./blockrun -e ./neu-vol"
 )
 
 

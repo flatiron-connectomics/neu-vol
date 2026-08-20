@@ -1,4 +1,4 @@
-# em-volume-tools — Design
+# neu-vol — Design
 
 A library for access, conversion, transformation, and storage of large 3D
 volumetric arrays (EM images, probabilities/affinities, segmentations), with
@@ -89,7 +89,7 @@ destination. Two consequences worth knowing:
 `is_local` / `local_path` are the escape hatch for things that genuinely need
 POSIX — sqlite, appended logs, `os.replace`. Callers use them to reject a remote
 location up front with a clear message instead of failing deep inside a write;
-em-seg-morpho's `--work-dir` is exactly this case.
+neu-morpho's `--work-dir` is exactly this case.
 
 ---
 
@@ -181,7 +181,7 @@ own resumable block-map reading a downsample-factor region from the level above.
 Because each level is derived from the one below it, a bad level poisons every
 level above it — and re-converting to fix the coarse end means recopying level 0.
 `rebuild_pyramid(dst, start_level=k)` (`ops/rebuild.py`, CLI at
-`em-vol downsample`) regenerates levels `k+1…` in place. Levels at or
+`neu-vol downsample`) regenerates levels `k+1…` in place. Levels at or
 below `k` are never opened for writing.
 
 - The schedule is recomputed **from level 0**, not from the seed. Its tail is the
@@ -257,7 +257,7 @@ brightness/normalization pipelines come later.
 editable (`pip install --no-deps -e .`). Superseded pixi; see the history below
 for what pixi was solving and which of those constraints still bind.
 
-- Env name `em-lib`, under `~/miniforge3/envs` (GPFS home → visible to Rusty
+- Env name `neu-env`, under `~/miniforge3/envs` (GPFS home → visible to Rusty
   workers; see the shared-visibility constraint below).
 - Python is pinned to **3.12**, and this is not a preference: `vol2mesh` and
   `dvidutils` are built for py312 only on flyem-forge, with no py313 build.
@@ -267,7 +267,7 @@ for what pixi was solving and which of those constraints still bind.
 - Runtime deps come from conda-forge, so editable installs use `--no-deps`;
   otherwise pip re-resolves conda-provided binaries (tensorstore, h5py) from
   PyPI and invites an ABI mismatch.
-- Combined spec: `em-libraries/environment.yml` + `pypi_requirements.txt`.
+- Combined spec: `neu-suite/environment.yml` + `pypi_requirements.txt`.
   conda cannot jointly solve multiple env files (`conda env create` takes a
   single `-f`), and layering them via `conda env update` gives sequential solves
   where `flyem-forge` priority lands last — hence one combined file.
@@ -280,7 +280,7 @@ can't see it; GPFS `/mnt/home` and ceph both work.
 `/path/to/scratch/pixi-envs` specifically to dodge the GPFS home
 **inode** quota. A conda env in `~/miniforge3/envs` puts that inode load back on
 home. If the quota becomes tight, relocate with `conda create -p
-/mnt/ceph/users/<user>/conda-envs/em-lib` rather than reaching back for pixi —
+/mnt/ceph/users/<user>/conda-envs/neu-env` rather than reaching back for pixi —
 ceph does the same double duty (inode relief *and* worker visibility, no
 conda-pack / rsync).
 
@@ -294,14 +294,14 @@ lockfile. Cache deliberately stayed on local `/home` (pixi's default
 ## 9. Proposed module layout
 
 The dask/SLURM orchestration substrate lives in a **separate shared package,
-`em-blockrun`** (`../em-blockrun`, an editable sibling install): `start_dask`,
+`blockrun`** (`../blockrun`, an editable sibling install): `start_dask`,
 `block_map`, `Manifest`, `iter_blocks`/`Block`, `idempotent`, and the dask config
 templates. It has no EM/volume deps and is reused by other projects (e.g. the
-planned meshing package). `em_volume_tools` re-exports the common names for
+planned meshing package). `neu_vol` re-exports the common names for
 convenience.
 
 ```
-em_volume_tools/                # volume/EM-specific
+neu_vol/                # volume/EM-specific
 ├── volume.py        # Volume handle
 ├── meta.py          # VoxelMeta + coordinate/axis conversion
 ├── location.py      # local/s3/gs/kvstore normalization + subpath join
@@ -333,23 +333,23 @@ em_volume_tools/                # volume/EM-specific
 │   ├── rebuild.py   # rebuild_pyramid: levels above a trusted one, in place
 │   ├── relabel.py   # one disjoint id range per occupied region
 │   └── annotate.py  # WHERE a sparse volume's data is: occupied chunks -> maximal
-│                    #   boxes. Analysis, not presentation — em-ngl turns these into
+│                    #   boxes. Analysis, not presentation — neu-glance turns these into
 │                    #   a viewer layer; relabel/maskvalue/--sparse want the boxes
-└── cli.py           # the `em-vol` command (below)
+└── cli.py           # the `neu-vol` command (below)
 
-../em-blockrun/em_blockrun/      # shared dask/SLURM substrate (no EM deps)
+../blockrun/blockrun/      # shared dask/SLURM substrate (no EM deps)
 ├── dask_runner.py   # start_dask (LocalCluster / SLURMCluster from one config)
 ├── engine.py        # block_map (client.map + as_completed), iter_blocks, Block, idempotent
 ├── manifest.py      # Manifest (single-writer resume/intent log)
 └── configs/         # dask config templates (local / slurm-gen / slurm-any)
 
-em_volume_tools/cli.py          # the `em-vol` command:
+neu_vol/cli.py          # the `neu-vol` command:
                                 #   info / convert / copy / downsample / progress /
                                 #   create / write / to-hdf5 / align-bbox / relabel /
                                 #   mask-by-value
 
-../em-ngl/em_ngl/               # everything a VIEWER consumes (a separate package):
-                                #   em-ngl gen / annotate / bboxes / parse / shaders
+../neu-glance/neu_glance/               # everything a VIEWER consumes (a separate package):
+                                #   neu-glance gen / annotate / bboxes / parse / shaders
 ```
 
 **There are three block grids, and they answer different questions** — `grid.py` does the
@@ -479,7 +479,7 @@ hard to *look at*: twelve labeled boxes in an 11260×9000×13750 frame are needl
 **This is analysis, and its callers are mostly not viewers.** `relabel` needs the regions
 to give each one a disjoint id range, `mask-by-value` to know what to read, and
 `downsample --sparse` to skip tasks whose input has no stored chunk. Turning the boxes into
-something clickable is `em-ngl bboxes`, in a package above this one — which is why the
+something clickable is `neu-glance bboxes`, in a package above this one — which is why the
 JSON half of this module moved out and only the analysis stayed.
 
 **Occupancy comes from chunk presence, not from voxels.** TensorStore never persists a
@@ -522,7 +522,7 @@ path in the package.
 
 The reasoning about *presenting* these boxes — why the annotations must be local rather than
 a precomputed source, and why the layer declares its own `outputDimensions` — moved to
-em-ngl with the code. It is in that package's README and `em_ngl/layers.py`.
+neu-glance with the code. It is in that package's README and `neu_glance/layers.py`.
 
 
 ## 12. `relabel`: one id range per occupied region
@@ -573,14 +573,14 @@ the exact collision the operation exists to remove.
 
 ## 13. Why the viewer side is a separate package
 
-Everything that produces something a *viewer* consumes now lives in **em-ngl**: states,
+Everything that produces something a *viewer* consumes now lives in **neu-glance**: states,
 links, annotation layers, shaders. This package writes volumes and does not know
 neuroglancer exists.
 
 The split was not about file size. It was forced by a layering smell that appeared as soon
 as the viewer side grew: `ops/ngurl.py` had acquired a shader that reads `prop_conf_pre`,
 plus the `body_pre`/`body_post` relationship semantics of a synapse source — concepts owned
-by em-annotation, which sits *above* em-volume-tools. No import violated the layering, but
+by neu-mark, which sits *above* neu-vol. No import violated the layering, but
 the knowledge was in the wrong repository, and every further viewer feature would have
 dragged more of a higher layer's vocabulary downward. A package above both consumers is
 where that belongs.
@@ -591,7 +591,7 @@ sharing a file, divided by a section banner: occupancy analysis (which `relabel`
 nothing here needs). The analysis stayed, the emission left, and `ops/ngurl.py` — a leaf
 nothing but the CLI imported — moved whole.
 
-`em-vol bboxes-json`, `annotate-json` and `ng-url-gen` became `em-ngl bboxes`, `annotate`
-and `gen`. A clean break with no aliases, as with the earlier `em-seg-morpho` →
-`em-morpho run` rename: an old invocation fails loudly rather than quietly doing something
+`neu-vol bboxes-json`, `annotate-json` and `ng-url-gen` became `neu-glance bboxes`, `annotate`
+and `gen`. A clean break with no aliases, as with the earlier `neu-morpho` →
+`neu-morpho run` rename: an old invocation fails loudly rather than quietly doing something
 slightly different.

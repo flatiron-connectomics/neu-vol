@@ -3,7 +3,7 @@
 The inverse of ``ops/write.py``: that places a piece into a large volume, this produces
 the piece. An image stack straight off a microscope or an annotation tool is a directory
 of PNGs with no coordinates attached; packing it records **where it belongs and at what
-scale**, so `em-vol write` can later place it without anyone re-typing an offset.
+scale**, so `neu-vol write` can later place it without anyone re-typing an offset.
 
 An HDF5 source that **already describes itself** is repacked without losing what it says:
 `voxel_offset`, `voxel_size` and any recorded `axes` are read back (as attributes or as
@@ -22,7 +22,7 @@ What gets recorded, and why those names:
 * ``voxel_offset`` — integer voxels, on the dataset. This is the field
   ``ops/write.resolve_offset`` already looks for, and the name is precomputed's.
 * ``voxel_size`` / ``offset`` / ``units`` / ``axes`` — the frame, in this package's own
-  vocabulary (:class:`~em_volume_tools.meta.VoxelMeta`), on the root *and* the dataset so
+  vocabulary (:class:`~neu_vol.meta.VoxelMeta`), on the root *and* the dataset so
   that either the file or the array alone is self-describing. ``offset`` here is the
   physical position in ``units``; ``voxel_offset`` is the same place counted in voxels,
   and both are written because the two consumers ask different questions.
@@ -30,7 +30,7 @@ What gets recorded, and why those names:
   previously **unknowable from the file** — precomputed means xyz, this package means zyx,
   and a wrong guess mirrors the piece through the z=x diagonal with nothing downstream
   able to tell. A file written here says which it is, and
-  :meth:`~em_volume_tools.backends.hdf5.HDF5Backend.stored_axes` is how the read side
+  :meth:`~neu_vol.backends.hdf5.HDF5Backend.stored_axes` is how the read side
   finds out.
 
 Reads are blocked, so a "small" volume that turns out not to be still packs: the whole
@@ -46,7 +46,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from em_blockrun import iter_blocks
+from blockrun import iter_blocks
 
 from ..backends.base import open_backend
 from ..source_metadata import PRECOMPUTED_GZ
@@ -87,7 +87,7 @@ def resolve_source(src: str | dict, src_format: str | None = None, level: int = 
     Two kinds of source, and they need different handling:
 
     * a **multiscale volume** — resolved through
-      :func:`~em_volume_tools.source_metadata.level_spec`, which is the only thing that
+      :func:`~neu_vol.source_metadata.level_spec`, which is the only thing that
       addresses a level correctly for both formats (zarr v3 puts each level in its own
       subdirectory, precomputed selects with ``scale_index``). Going straight at the path
       is what made a zarr *group* fail to open at all: a group is not an array. Its
@@ -363,7 +363,7 @@ def pack_hdf5(
     # has to name one. Cheap to say now, confusing to discover later.
     if others:
         logger.warning("%s will hold %d volumetric datasets (%s); readers must name one "
-                       "— `em-vol write --dataset %s`, or HDF5Backend's `dataset` key",
+                       "— `neu-vol write --dataset %s`, or HDF5Backend's `dataset` key",
                        out, len(others) + 1, ", ".join(others + [name]), name)
 
     chunk_full = tuple(chunk) if chunk else tuple(min(64, s) for s in shape)

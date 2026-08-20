@@ -215,7 +215,7 @@ def default_progress_path(dst: str | Mapping[str, Any]) -> str:
     — driver, bucket, path — rather than the kvstore dict, so a field added there later
     cannot rename the manifest a run is in the middle of appending to. The trailing slash is
     normalised away for the same reason: ``s3://b/k`` and ``s3://b/k/`` are one destination
-    and must resolve to one manifest, or a resumed run would start over and `em-vol
+    and must resolve to one manifest, or a resumed run would start over and `neu-vol
     progress` would report on nothing.
 
     Local destinations keep their old name: a path beside the volume is already unique, and

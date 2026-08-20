@@ -11,9 +11,9 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import create_volume, write_subvolume, write_subvolumes
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.ops.write import _tiles, plan_subvolume_write, source_spec
+from neu_vol import create_volume, write_subvolume, write_subvolumes
+from neu_vol.backends.base import open_backend
+from neu_vol.ops.write import _tiles, plan_subvolume_write, source_spec
 
 
 def _volume(tmp_path, *, shape=(64, 64, 64), dtype="uint64", chunk=(16, 16, 16),
@@ -449,7 +449,7 @@ STORAGE = ["plain", "sharded", "precomputed_raw", "compressed_seg"]
 @pytest.mark.parametrize("storage", STORAGE)
 def test_a_partial_chunk_write_keeps_the_data_already_in_that_chunk(tmp_path, storage):
     """Write into the middle of populated chunks; only the covered voxels may change."""
-    from em_volume_tools.backends.base import clear_backend_cache
+    from neu_vol.backends.base import clear_backend_cache
 
     vol, spec = _single_level(tmp_path, storage, "keep")
     base = np.random.default_rng(8).integers(1, 200, (32, 32, 32), dtype=np.uint64)
@@ -473,7 +473,7 @@ def test_a_second_piece_sharing_a_chunk_does_not_erase_the_first(tmp_path, stora
     axis. Sequential, which is the supported way — running them at once is the hazard
     `misaligned_axes` exists to warn about.
     """
-    from em_volume_tools.backends.base import clear_backend_cache
+    from neu_vol.backends.base import clear_backend_cache
 
     vol, spec = _single_level(tmp_path, storage, "share")
     for at, val in (((5, 5, 5), 111), ((11, 11, 11), 222)):
@@ -532,7 +532,7 @@ def test_a_level_that_does_not_exist_lists_the_ones_that_do(tmp_path):
 
 def test_writing_to_somewhere_that_is_not_a_volume_says_to_create_one(tmp_path):
     piece = np.ones((4, 4, 4), np.uint64)
-    with pytest.raises(FileNotFoundError, match="em-vol create"):
+    with pytest.raises(FileNotFoundError, match="neu-vol create"):
         write_subvolume(str(tmp_path / "nothing"), _h5(tmp_path, piece), (0, 0, 0))
 
 
@@ -597,9 +597,9 @@ def test_a_region_of_another_volume_can_be_the_source(tmp_path):
 def test_a_precomputed_destination_works_the_same_way(tmp_path):
     """`create` only makes zarr, but `write` places pieces into either format —
     precomputed addresses a level by scale_index rather than by subdirectory."""
-    from em_volume_tools import convert
-    from em_volume_tools.profiles import StorageProfile, zarr3_create_spec
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
+    from neu_vol import convert
+    from neu_vol.profiles import StorageProfile, zarr3_create_spec
+    from neu_vol.backends.tensorstore import TensorStoreBackend
 
     src = str(tmp_path / "pc.src.zarr")
     be = TensorStoreBackend.create(

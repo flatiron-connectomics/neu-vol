@@ -2,7 +2,7 @@
 
 import pytest
 
-from em_volume_tools.retry import is_transient, with_retry
+from neu_vol.retry import is_transient, with_retry
 
 # Verbatim from the run that died mid-copy: a TLS reset on the destination.
 REAL_TRANSIENT = (
@@ -85,7 +85,7 @@ def test_raises_the_last_error_when_attempts_run_out():
 
 def test_backoff_grows_and_is_bounded(monkeypatch):
     waits = []
-    monkeypatch.setattr("em_volume_tools.retry.time.sleep", waits.append)
+    monkeypatch.setattr("neu_vol.retry.time.sleep", waits.append)
 
     def always_flaky():
         raise ValueError(REAL_TRANSIENT)
@@ -103,7 +103,7 @@ def test_backoff_grows_and_is_bounded(monkeypatch):
 # --------------------------------------------------------------------------- #
 def _flaky_open(monkeypatch, error, fail_times):
     """Make the next ``fail_times`` open_backend calls raise ``error``."""
-    from em_volume_tools.ops import _multiscale
+    from neu_vol.ops import _multiscale
 
     real = _multiscale.open_backend
     state = {"left": fail_times, "calls": 0}
@@ -122,9 +122,9 @@ def _flaky_open(monkeypatch, error, fail_times):
 def _one_block_volume(tmp_path, name):
     """A source and a destination array, and the single block that spans them."""
     import numpy as np
-    from em_blockrun import iter_blocks
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-    from em_volume_tools.profiles import zarr3_create_spec
+    from blockrun import iter_blocks
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
 
     shape = (8, 8, 8)
     src = TensorStoreBackend.create(
@@ -150,8 +150,8 @@ def test_a_block_survives_a_transient_failure(tmp_path, monkeypatch, worker):
     copy, and a DNS lookup two seconds into a downsample.
     """
     import numpy as np
-    from em_volume_tools.backends.base import open_backend
-    from em_volume_tools.ops._multiscale import _copy_block, _downsample_block
+    from neu_vol.backends.base import open_backend
+    from neu_vol.ops._multiscale import _copy_block, _downsample_block
 
     monkeypatch.setattr("time.sleep", lambda *_: None)      # no real backoff
     src_spec, dst_spec, block = _one_block_volume(tmp_path, worker)
@@ -171,7 +171,7 @@ def test_a_block_survives_a_transient_failure(tmp_path, monkeypatch, worker):
 def test_a_block_does_not_retry_a_permanent_failure(tmp_path, monkeypatch):
     """A 403 must fail on the first attempt — retrying it burns the backoff budget on
     every task of a misconfigured run before failing anyway."""
-    from em_volume_tools.ops._multiscale import _copy_block
+    from neu_vol.ops._multiscale import _copy_block
 
     monkeypatch.setattr("time.sleep", lambda *_: None)
     src_spec, dst_spec, block = _one_block_volume(tmp_path, "perm")
@@ -185,9 +185,9 @@ def test_a_block_does_not_retry_a_permanent_failure(tmp_path, monkeypatch):
 def test_backends_are_cached_per_spec(tmp_path):
     import numpy as np
 
-    from em_volume_tools.backends import base
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-    from em_volume_tools.profiles import zarr3_create_spec
+    from neu_vol.backends import base
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
 
     path = str(tmp_path / "vol.zarr")
     TensorStoreBackend.create(
@@ -216,9 +216,9 @@ def test_backends_are_cached_per_spec(tmp_path):
 
 def test_recreating_a_volume_invalidates_the_cache(tmp_path):
     """A cached handle must not keep serving a destroyed volume's metadata."""
-    from em_volume_tools.backends import base
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-    from em_volume_tools.profiles import zarr3_create_spec
+    from neu_vol.backends import base
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
 
     path = str(tmp_path / "vol.zarr")
     spec16 = zarr3_create_spec("local", path, (16, 16, 16), "uint64",

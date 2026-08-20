@@ -1,4 +1,4 @@
-"""`em-vol to-hdf5`: pack a small volume into an HDF5 file `em-vol write` can place.
+"""`neu-vol to-hdf5`: pack a small volume into an HDF5 file `neu-vol write` can place.
 
 The test that matters is the **round trip** — pack a stack, then write it into a volume
 with no `--offset` and no `--offset-order` — because that is the whole claim: the frame and
@@ -10,9 +10,9 @@ z=x diagonal with nothing downstream able to tell.
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, create_volume, pack_hdf5
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.ops.pack import DEFAULT_DATASET
+from neu_vol import cli, create_volume, pack_hdf5
+from neu_vol.backends.base import open_backend
+from neu_vol.ops.pack import DEFAULT_DATASET
 
 
 def _stack(tmp_path, name="stack", *, shape=(4, 6, 8), start=1):
@@ -63,7 +63,7 @@ def test_the_default_dataset_is_what_the_reader_looks_for(tmp_path):
     out = str(tmp_path / "p.h5")
     pack_hdf5(src, out, voxel_size=(8, 8, 8), src_format="image_stack")
 
-    from em_volume_tools.backends.hdf5 import sole_dataset
+    from neu_vol.backends.hdf5 import sole_dataset
 
     assert sole_dataset(out) == DEFAULT_DATASET
     be = open_backend({"backend": "hdf5", "path": out})       # no `dataset` key
@@ -166,7 +166,7 @@ def test_the_packed_piece_writes_back_with_no_offset_and_no_order(tmp_path):
     No --offset, and no --offset-order either: the recorded `axes` answers the question
     that previously had to be asked.
     """
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     src, data = _stack(tmp_path)
     piece = str(tmp_path / "piece.h5")
@@ -194,7 +194,7 @@ def test_an_xyz_file_is_read_as_xyz_without_being_told(tmp_path):
     before, the numbers were indistinguishable from zyx and a wrong guess put the piece
     somewhere else entirely.
     """
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     src, data = _stack(tmp_path, shape=(4, 4, 4))
     piece = str(tmp_path / "xyz.h5")
@@ -212,7 +212,7 @@ def test_an_xyz_file_is_read_as_xyz_without_being_told(tmp_path):
 
 
 def test_an_explicit_order_still_wins_over_the_file(tmp_path):
-    from em_volume_tools.ops.write import resolve_offset
+    from neu_vol.ops.write import resolve_offset
 
     src, _ = _stack(tmp_path, shape=(4, 4, 4))
     piece = str(tmp_path / "o.h5")
@@ -231,9 +231,9 @@ def test_an_explicit_order_still_wins_over_the_file(tmp_path):
 @pytest.fixture
 def pyramid(tmp_path):
     """A 3-level anisotropic zarr group, so a level's voxel size is not 2**level."""
-    from em_volume_tools import convert
-    from em_volume_tools.backends.tensorstore import TensorStoreBackend
-    from em_volume_tools.profiles import zarr3_create_spec
+    from neu_vol import convert
+    from neu_vol.backends.tensorstore import TensorStoreBackend
+    from neu_vol.profiles import zarr3_create_spec
 
     data = np.arange(32 * 32 * 32, dtype=np.uint16).reshape(32, 32, 32)
     src = str(tmp_path / "p.src.zarr")
@@ -294,7 +294,7 @@ def test_an_explicit_offset_overrides_the_crop_origin(tmp_path, pyramid):
 
 def test_a_box_at_a_level_round_trips_into_that_level(tmp_path, pyramid):
     """Extract a region at level 1, write it back at level 1, unchanged."""
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     vol, _ = pyramid
     piece = str(tmp_path / "rt.h5")
@@ -419,7 +419,7 @@ def test_an_explicit_offset_still_overrides_what_the_file_says(tmp_path):
 
 def test_a_repacked_file_round_trips_into_a_volume(tmp_path):
     """The point of repacking: the canonical file places itself, order recorded and all."""
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     src, data = _legacy_file(tmp_path)
     piece = str(tmp_path / "canonical.h5")
@@ -456,7 +456,7 @@ def test_the_offset_field_can_be_renamed(tmp_path):
     assert list(dattrs["corner"]) == [1, 2, 3] and "voxel_offset" not in dattrs
 
     # `write` looks for voxel_offset, so it has to be told the new name
-    from em_volume_tools.ops.write import resolve_offset
+    from neu_vol.ops.write import resolve_offset
 
     be = open_backend({"backend": "hdf5", "path": out})
     assert be.stored_offset("voxel_offset") is None
@@ -477,7 +477,7 @@ def test_write_warns_when_the_pieces_scale_is_not_the_levels(tmp_path, pyramid, 
 
     Nothing else in `write` can see it: the shapes, dtype and bounds are all fine.
     """
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     vol, _ = pyramid
     piece = str(tmp_path / "lvl1.h5")

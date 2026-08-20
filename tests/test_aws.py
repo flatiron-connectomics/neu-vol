@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from em_volume_tools.aws import ensure_aws_credentials
+from neu_vol.aws import ensure_aws_credentials
 
 
 @pytest.fixture

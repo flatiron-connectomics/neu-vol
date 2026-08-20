@@ -3,17 +3,17 @@
 The box cover carries the weight: a wrong box is a claim that there is data somewhere there
 isn't, or — worse — hides a region by merging it into a neighbour.
 
-Turning these boxes into a viewer layer is `em-ngl bboxes` and is tested there.
+Turning these boxes into a viewer layer is `neu-glance bboxes` and is tested there.
 """
 
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.ops.annotate import (NoOccupancy, _precomputed_cell, _zarr_cell,
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.ops.annotate import (NoOccupancy, _precomputed_cell, _zarr_cell,
                                           labeled_regions, maximal_boxes)
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol.profiles import zarr3_create_spec
 
 # The real geometry from sample3's gt_v1: two 3x3x3-chunk blocks whose footprints meet
 # at one z boundary but are offset in y, so their union is not a box. Connected
@@ -97,7 +97,7 @@ def test_a_sharded_level_says_so_rather_than_reporting_nothing(monkeypatch, tmp_
     Silently returning zero regions would read as "this volume is empty", which is the
     one wrong answer worth guarding against.
     """
-    from em_volume_tools.ops import annotate
+    from neu_vol.ops import annotate
 
     monkeypatch.setattr(annotate, "list_keys", lambda *a, **k: ["0.shard", "1.shard"])
     with pytest.raises(NoOccupancy, match="SHARDED"):

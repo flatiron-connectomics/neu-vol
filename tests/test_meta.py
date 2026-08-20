@@ -1,6 +1,6 @@
 import pytest
 
-from em_volume_tools import VoxelMeta
+from neu_vol import VoxelMeta
 
 
 def test_defaults_and_validation():

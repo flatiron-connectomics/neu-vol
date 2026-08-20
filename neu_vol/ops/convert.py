@@ -46,10 +46,10 @@ def _resolve_crop(
     that matters.
 
     ``clip`` trims the box to the source extent — the default, because the alternative
-    is inventing voxels: :class:`~em_volume_tools.backends.view.CropBackend` happily
+    is inventing voxels: :class:`~neu_vol.backends.view.CropBackend` happily
     reads outside the volume and fills with ``pad_value``, which for a copy would
     publish fabricated data at the margin with nothing to show it was fabricated.
-    ``clip=False`` is the crop-*and*-pad contract of :func:`~em_volume_tools.extract_roi`.
+    ``clip=False`` is the crop-*and*-pad contract of :func:`~neu_vol.extract_roi`.
     """
     spatial = tuple(int(s) for s in (src_shape[1:] if has_channels else src_shape))
     start = (0,) * n_spatial if start is None else tuple(int(v) for v in start)

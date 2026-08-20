@@ -1,4 +1,4 @@
-"""Aligning a box to a block grid: the arithmetic, and `em-vol align-bbox` over it.
+"""Aligning a box to a block grid: the arithmetic, and `neu-vol align-bbox` over it.
 
 Two things here are easy to get wrong and silent when wrong. A **half-open** box whose
 `hi` already sits on a boundary must stay put — ceiling it anyway grows every correctly
@@ -10,9 +10,9 @@ because the object a partial write rewrites is the shard.
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, convert, grid
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import cli, convert, grid
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
 
 
 # --------------------------------------------------------------------------- #
@@ -95,8 +95,8 @@ def test_an_edge_at_the_volume_end_is_aligned_by_definition():
 
 
 def test_write_reports_alignment_through_the_shared_predicate():
-    """`em-vol write` and `align-bbox` must not drift apart on the same box."""
-    from em_volume_tools.ops.write import _misaligned_axes
+    """`neu-vol write` and `align-bbox` must not drift apart on the same box."""
+    from neu_vol.ops.write import _misaligned_axes
 
     shape, chunk = (100, 128, 256), (128, 128, 128)
     for start, stop in [((0, 0, 0), (100, 128, 128)),
@@ -135,7 +135,7 @@ def aniso(tmp_path):
 @pytest.fixture
 def sharded(tmp_path):
     """A sharded level: write unit 32^3, inner read chunk 8^3."""
-    from em_volume_tools import StorageProfile
+    from neu_vol import StorageProfile
 
     src = _source(str(tmp_path / "s_src.zarr"))
     dst = str(tmp_path / "sharded.zarr")

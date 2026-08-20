@@ -4,9 +4,9 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import ingest_image_stack
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.pyramid import mean_downsample
+from neu_vol import ingest_image_stack
+from neu_vol.backends.base import open_backend
+from neu_vol.pyramid import mean_downsample
 
 
 def _write_multipage_tiff(path, vol):
@@ -109,7 +109,7 @@ def test_ingest_roundtrips_through_ngff_zarr_reader(tmp_path, volume):
 def test_ingest_validates_ome_metadata(tmp_path, volume):
     # validation runs by default; corrupting the schema would raise. Here we just
     # confirm the produced attrs validate.
-    from em_volume_tools.ngff import validate_attrs
+    from neu_vol.ngff import validate_attrs
 
     src = str(tmp_path / "s.tif")
     _write_multipage_tiff(src, volume)

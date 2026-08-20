@@ -9,9 +9,9 @@ against a real instance; see NOTES-TODO for the measurements and the end-to-end 
 import numpy as np
 import pytest
 
-from em_volume_tools import dvid as canonical_dvid
-from em_volume_tools import source_metadata as sm
-from em_volume_tools.backends import dvid
+from neu_vol import dvid as canonical_dvid
+from neu_vol import source_metadata as sm
+from neu_vol.backends import dvid
 
 URL = "dvid://dvid.example.org/93fdbc:main/labels"
 
@@ -128,7 +128,7 @@ def stub_info(monkeypatch):
     round trip per test, and cached a real uuid that then leaked into tests expecting a
     fake one. Tests here must not touch a server at all.
 
-    Patched on `em_volume_tools.dvid`, the module that *defines* them. `backends.dvid`
+    Patched on `neu_vol.dvid`, the module that *defines* them. `backends.dvid`
     re-exports the same names, but a re-export is a separate binding: patching it would
     leave `source_metadata` — which imports from the canonical module — calling the real
     thing. Both call sites reach these through the canonical module attribute so that one
@@ -220,7 +220,7 @@ def test_a_scale_above_maxdownreslevel_is_refused(stub_info):
 def test_supervoxels_on_a_non_dvid_source_raises_rather_than_being_ignored(tmp_path):
     """Silently dropping it would copy agglomerated bodies while the caller believed
     they had asked for supervoxels, and nothing downstream could tell."""
-    from em_volume_tools import convert
+    from neu_vol import convert
 
     with pytest.raises(ValueError, match="DVID sources only"):
         convert({"backend": "zarr3", "path": str(tmp_path / "x")},
@@ -228,7 +228,7 @@ def test_supervoxels_on_a_non_dvid_source_raises_rather_than_being_ignored(tmp_p
 
 
 def test_the_backend_is_registered_under_its_tag():
-    from em_volume_tools.backends.base import _OPENERS
+    from neu_vol.backends.base import _OPENERS
 
     assert dvid.TAG in _OPENERS
 
@@ -299,7 +299,7 @@ def test_the_resolved_uuid_reaches_the_workers_not_the_ref(fake_dag, stub_info):
 
 
 def test_prefer_locked_on_a_non_dvid_source_raises(tmp_path):
-    from em_volume_tools import convert
+    from neu_vol import convert
 
     with pytest.raises(ValueError, match="DVID sources only"):
         convert({"backend": "zarr3", "path": str(tmp_path / "x")},
@@ -328,7 +328,7 @@ def fake_repo(monkeypatch):
 def test_provenance_names_the_resolved_node_and_what_was_asked_for(fake_dag, fake_repo):
     """Both matter: the uuid is what was read, the ref is how it was chosen. 'the newest
     locked node on main' and 'this node' are different claims even when they agree today."""
-    from em_volume_tools.ops import provenance as prov
+    from neu_vol.ops import provenance as prov
 
     spec = {**sm.location_spec(URL, "dvid"), "uuid": "846e3a",
             "requested_ref": "93fdbc:main", "ancestors_walked": 1}
@@ -346,7 +346,7 @@ def test_provenance_names_the_resolved_node_and_what_was_asked_for(fake_dag, fak
 def test_provenance_survives_a_server_that_will_not_answer(fake_dag, monkeypatch):
     """A completed conversion must not be failed by a missing extra field."""
     import neuclease.dvid as nd
-    from em_volume_tools.ops import provenance as prov
+    from neu_vol.ops import provenance as prov
 
     def boom(*a, **k):
         raise RuntimeError("nope")
@@ -360,14 +360,14 @@ def test_provenance_survives_a_server_that_will_not_answer(fake_dag, monkeypatch
 
 
 def test_provenance_falls_back_to_describing_any_other_spec():
-    from em_volume_tools.ops import provenance as prov
+    from neu_vol.ops import provenance as prov
 
     rec = prov.build_record(src_spec={"backend": "zarr3", "path": "/v"}, dst="/out")
     assert rec["source"] == {"source": "zarr3", "path": "/v"}
 
 
 def test_copy_refuses_a_dvid_source_and_points_at_convert():
-    from em_volume_tools import cli
+    from neu_vol import cli
 
     args = cli._parse_args(["copy", "--src", URL, "--dst", "/out"])
     with pytest.raises(SystemExit) as e:
@@ -376,7 +376,7 @@ def test_copy_refuses_a_dvid_source_and_points_at_convert():
 
 
 # --------------------------------------------------------------------------- #
-# what `em-vol info` reports
+# what `neu-vol info` reports
 # --------------------------------------------------------------------------- #
 def test_node_summary_gives_both_candidate_versions(fake_dag):
     """`info` shows both because they are different answers to "which version would I
@@ -405,7 +405,7 @@ def test_node_summary_reports_rather_than_raises_when_no_locked_node_is_reachabl
 def test_info_prints_both_uuids_in_full(fake_dag, stub_info, capsys):
     """Printed in full because building a destination name from one is the usual reason
     to run this."""
-    from em_volume_tools import cli
+    from neu_vol import cli
 
     cli.cmd_info(cli._parse_args(["info", URL]))
     out = capsys.readouterr().out
@@ -416,7 +416,7 @@ def test_info_prints_both_uuids_in_full(fake_dag, stub_info, capsys):
 def test_info_summarises_a_provenance_file_and_can_print_it_whole(tmp_path, capsys):
     import json
 
-    from em_volume_tools import cli
+    from neu_vol import cli
 
     vol = tmp_path / "v"
     vol.mkdir()
@@ -435,7 +435,7 @@ def test_info_summarises_a_provenance_file_and_can_print_it_whole(tmp_path, caps
 
 
 def test_info_says_nothing_about_provenance_when_there_is_none(tmp_path, capsys):
-    from em_volume_tools import cli
+    from neu_vol import cli
 
     cli._print_provenance(str(tmp_path), False)
     assert capsys.readouterr().out == ""
@@ -452,13 +452,13 @@ def dvid_src(fake_dag):
 
 
 def test_uuid_defaults_to_eight_characters(dvid_src):
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     assert expand("/d/seg_{uuid}", dvid_src) == "/d/seg_846e3a"   # stub uuid is short
 
 
 def test_uuid_length_and_full_are_selectable(fake_dag):
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     src = {**sm.location_spec(URL, "dvid"), "uuid": "d38898ac94c8400baeb15103bab7f850"}
     assert expand("{uuid}", src) == "d38898ac"
@@ -467,13 +467,13 @@ def test_uuid_length_and_full_are_selectable(fake_dag):
 
 
 def test_branch_and_instance_are_available(dvid_src):
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     assert expand("/d/{instance}_{branch}", dvid_src) == "/d/labels_main"
 
 
 def test_a_destination_without_placeholders_is_untouched():
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     # Also must not resolve anything — an ordinary destination costs no request.
     assert expand("/plain/path", {"backend": "zarr3"}) == "/plain/path"
@@ -481,21 +481,21 @@ def test_a_destination_without_placeholders_is_untouched():
 
 def test_expansion_is_idempotent(dvid_src):
     """The CLI expands before deriving targets; `convert` may expand again."""
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     once = expand("/d/seg_{uuid}", dvid_src)
     assert expand(once, dvid_src) == once
 
 
 def test_a_placeholder_on_a_source_that_has_none_raises():
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     with pytest.raises(ValueError, match="supplies none"):
         expand("/d/seg_{uuid}", {"backend": "zarr3", "path": "/v"})
 
 
 def test_an_unknown_placeholder_lists_the_real_ones(dvid_src):
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     with pytest.raises(ValueError, match=r"\{uuid\}"):
         expand("/d/{nonesuch}", dvid_src)
@@ -503,7 +503,7 @@ def test_an_unknown_placeholder_lists_the_real_ones(dvid_src):
 
 @pytest.mark.parametrize("bad", ["{uuid:0}", "{uuid:xyz}", "{uuid:-2}"])
 def test_a_bad_length_spec_raises(dvid_src, bad):
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     with pytest.raises(ValueError, match="positive number"):
         expand(bad, dvid_src)
@@ -511,7 +511,7 @@ def test_a_bad_length_spec_raises(dvid_src, bad):
 
 def test_values_are_sanitised_for_paths_and_object_keys(fake_dag):
     """A ref can carry '~'; an object-store key is happier without it."""
-    from em_volume_tools.ops.naming import expand
+    from neu_vol.ops.naming import expand
 
     src = {**sm.location_spec(URL, "dvid"), "uuid": "846e3a",
            "requested_ref": "93fdbc:main~1"}
@@ -521,7 +521,7 @@ def test_values_are_sanitised_for_paths_and_object_keys(fake_dag):
 def test_convert_kind_defaults_to_none_so_the_source_can_decide():
     """`--kind` used to default to 'image' for `convert`, which downgraded a source that
     recorded 'segmentation' and averaged its label ids."""
-    from em_volume_tools import cli
+    from neu_vol import cli
 
     assert cli._parse_args(["convert", "--src", "a", "--dst", "b"]).kind is None
 
@@ -542,7 +542,7 @@ def test_stubbing_the_canonical_module_covers_every_call_site(monkeypatch):
     """The regression guard for the addressing split.
 
     `source_metadata` and the backend both reach these through
-    `em_volume_tools.dvid.<name>`, so one patch governs both. When the backend held its
+    `neu_vol.dvid.<name>`, so one patch governs both. When the backend held its
     own copies, patching it left `source_metadata` calling the real function — the suite
     passed only because a live DVID server happened to answer, which is the failure this
     test exists to make impossible.

@@ -152,7 +152,7 @@ def open_kvstore(location: str | Mapping[str, Any], metadata: Mapping[str, Any],
                  *parts: str):
     """A sharded kvstore rooted at ``location``/``parts``.
 
-    ``location`` is anything :mod:`em_volume_tools.location` understands, so a local path and
+    ``location`` is anything :mod:`neu_vol.location` understands, so a local path and
     ``s3://`` behave the same. The trailing slash matters to the driver, so it is added here
     rather than left to the caller.
     """

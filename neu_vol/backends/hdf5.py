@@ -185,7 +185,7 @@ class HDF5Backend:
         This is what makes :meth:`stored_offset`'s numbers unambiguous. Without it the
         order genuinely cannot be known — ``voxel_offset`` is precomputed's field name and
         means xyz there, while everything in this package is zyx — so ``ops/write`` has to
-        ask. A file written by ``em-vol to-hdf5`` says which, and then nobody has to.
+        ask. A file written by ``neu-vol to-hdf5`` says which, and then nobody has to.
 
         Searched on the dataset first and the root group second, as :meth:`stored_offset`
         does.

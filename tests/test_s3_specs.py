@@ -1,7 +1,7 @@
 """S3 destination plumbing (no network): specs carry s3 kvstores, subpaths join."""
 
-from em_volume_tools.location import join, to_kvstore
-from em_volume_tools.profiles import precomputed_create_spec, zarr3_create_spec
+from neu_vol.location import join, to_kvstore
+from neu_vol.profiles import precomputed_create_spec, zarr3_create_spec
 
 
 def test_zarr3_create_spec_s3_kvstore_and_level_join():

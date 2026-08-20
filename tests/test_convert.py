@@ -4,11 +4,11 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import zarr3_create_spec
-from em_volume_tools.pyramid import mean_downsample, mode_downsample
+from neu_vol import convert
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import zarr3_create_spec
+from neu_vol.pyramid import mean_downsample, mode_downsample
 
 
 def _make_zarr(path, data, *, has_channels=False, num_channels=1, chunk=(8, 8, 8)):
@@ -83,7 +83,7 @@ def test_convert_infers_channels_from_ndim(tmp_path):
 # Task shape: reconcile source and destination chunking (level 0 only)
 # --------------------------------------------------------------------------- #
 def test_plan_task_shape_covers_whole_source_and_destination_chunks():
-    from em_volume_tools.ops._multiscale import plan_task_shape
+    from neu_vol.ops._multiscale import plan_task_shape
 
     # The specimen5 case: a CloudVolume source chunked 128x2048x2048 into 128^3.
     t = plan_task_shape((128, 2048, 2048), (128, 128, 128), (15401, 13544, 16648))
@@ -96,7 +96,7 @@ def test_plan_task_shape_respects_a_memory_ceiling():
     """A PNG slice cannot be partially decoded, so the LCM is the whole plane —
     28.8 GB for a 128-slab, which no worker can hold. It must be tiled down while
     staying a destination-chunk multiple."""
-    from em_volume_tools.ops._multiscale import plan_task_shape
+    from neu_vol.ops._multiscale import plan_task_shape
 
     t = plan_task_shape((1, 13544, 16648), (128, 128, 128), (15401, 13544, 16648),
                         itemsize=1, max_bytes=4 * 1024 ** 3)
@@ -107,13 +107,13 @@ def test_plan_task_shape_respects_a_memory_ceiling():
 
 
 def test_plan_task_shape_is_a_no_op_when_chunkings_agree():
-    from em_volume_tools.ops._multiscale import plan_task_shape
+    from neu_vol.ops._multiscale import plan_task_shape
 
     assert plan_task_shape((64, 64, 64), (64, 64, 64), (512, 512, 512)) == (64, 64, 64)
 
 
 def test_plan_task_shape_falls_back_when_the_source_has_no_chunking():
-    from em_volume_tools.ops._multiscale import plan_task_shape
+    from neu_vol.ops._multiscale import plan_task_shape
 
     assert plan_task_shape(None, (32, 32, 32), (256, 256, 256)) == (32, 32, 32)
 

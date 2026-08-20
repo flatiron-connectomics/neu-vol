@@ -7,7 +7,7 @@ that node was. The labelmap-specific parts (geometry, the array view) live in
 ``backends/dvid.py``, which imports from here.
 
 That split exists because consumers above this package need the version machinery
-without wanting an array. ``em-annotation`` pulls synapse elements and body annotations
+without wanting an array. ``neu-mark`` pulls synapse elements and body annotations
 out of DVID; it needs :func:`parse_url`, :func:`resolve_node`, :func:`node_summary` and
 :func:`node_provenance` exactly as ``convert`` does, and reaching into a *backend* module
 for them would be reaching past the thing it wanted.
@@ -33,7 +33,7 @@ MISSING = (
     "`dvidutils`, which are conda-only on flyem-forge — and libdvid is load-bearing "
     "rather than incidental, since it is what inflates DVID's compressed label "
     "blocks. Install it into the environment instead:\n"
-    "    mamba install -n em-lib -c flyem-forge -c conda-forge neuclease"
+    "    mamba install -n neu-env -c flyem-forge -c conda-forge neuclease"
 )
 
 
@@ -180,7 +180,7 @@ _NODE_FIELDS = ("Branch", "Note", "VersionID", "Created", "Updated")
 def node_summary(spec: Mapping[str, Any]) -> dict:
     """Both candidate nodes for a ref: what it points at now, and the newest locked one.
 
-    ``em-vol info`` shows both because they are different answers to "which version
+    ``neu-vol info`` shows both because they are different answers to "which version
     would I get", and the choice between them is the choice between a reproducible
     export and a convenient one. Returns ``{"head": node, "locked": node | None,
     "locked_error": str | None}``; ``locked`` is the same object as ``head`` when the
@@ -211,7 +211,7 @@ def node_provenance(spec: Mapping[str, Any], node: Mapping[str, Any]) -> dict:
     endpoints are both per-*body*. What characterises a snapshot instead is the node's
     own DAG metadata, which is all this records. Callers add whatever else describes
     their own read — the labelmap backend appends ``maxlabel`` and ``supervoxels``,
-    ``em-annotation`` appends element counts.
+    ``neu-mark`` appends element counts.
     """
     server, ref, instance = address(spec)
     out = {

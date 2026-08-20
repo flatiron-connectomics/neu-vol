@@ -2,10 +2,10 @@
 
 import numpy as np
 
-from em_volume_tools import extract_roi
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.profiles import precomputed_create_spec
+from neu_vol import extract_roi
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.profiles import precomputed_create_spec
 
 
 def _make_precomputed(path, vol):

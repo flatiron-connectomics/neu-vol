@@ -1,7 +1,7 @@
 import pytest
 
-from em_volume_tools import open_backend
-from em_volume_tools.backends.base import _OPENERS
+from neu_vol import open_backend
+from neu_vol.backends.base import _OPENERS
 
 
 def test_all_backends_registered():

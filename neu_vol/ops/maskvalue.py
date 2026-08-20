@@ -8,10 +8,10 @@ here is concerned. Two consequences, and the second is the one that costs:
 2. **An all-background block of 1s is not all-fill, so it is stored.** The volume ends up
    with a chunk object everywhere data was written, whether or not it holds anything, and
    "which chunk objects exist" stops answering "where is the data". That question is what
-   `bboxes-json`, `relabel`, `downsample --sparse` and em-seg-morpho's occupancy filter all
+   `bboxes-json`, `relabel`, `downsample --sparse` and neu-morpho's occupancy filter all
    ask, so they all quietly start saying "everywhere".
 
-Which is why the better fix is at ingest — `em-vol write`/`to-hdf5`/`convert` take
+Which is why the better fix is at ingest — `neu-vol write`/`to-hdf5`/`convert` take
 ``--background``, and correcting it there happens *before* the storage decision. This op is
 for data that has already landed.
 
@@ -22,13 +22,13 @@ fixes the storage as well as the values. (The `--mask-bbox` warning on `convert`
 about a different situation: there the block worker returns ``"empty"`` and **never issues
 the write**, so nothing removes what was already at that key.)
 
-``--out`` is still the preferred destination, for :mod:`em_volume_tools.ops.relabel`'s
+``--out`` is still the preferred destination, for :mod:`neu_vol.ops.relabel`'s
 reason rather than a storage one: a sparse copy is cheap and the original stays as the
 record of what was actually annotated.
 
 Only the level given is touched, so the levels above it keep the old values. Single-scale
 like ``write`` and ``relabel``, and for the same reason: run
-``em-vol downsample --start-level <level>`` afterwards.
+``neu-vol downsample --start-level <level>`` afterwards.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from em_blockrun import iter_blocks
+from blockrun import iter_blocks
 
 from ..backends.base import open_backend
 from ..source_metadata import detect_backend, existing_levels, level_spec
@@ -174,7 +174,7 @@ def apply_mask_values(plan: dict, *, dry_run: bool = False, overwrite: bool = Fa
                        "a second background, this merged two labels.",
                        already, to, replaced, to)
     if plan["stale_levels"]:
-        logger.warning("levels %s still hold the old values; run `em-vol downsample "
+        logger.warning("levels %s still hold the old values; run `neu-vol downsample "
                        "--start-level %d`", plan["stale_levels"], level)
     return result
 

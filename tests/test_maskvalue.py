@@ -5,17 +5,17 @@ The assertion that matters is not that the values change — that part is easy �
 all-background block of 1s is not all-fill, so it gets *stored*: the volume then has a chunk
 object everywhere data was written and "which chunks exist" stops answering "where is the
 data". That question is what `bboxes-json`, `relabel`, `downsample --sparse` and
-em-seg-morpho's occupancy all ask, so the tests below check stored keys, not just voxels.
+neu-morpho's occupancy all ask, so the tests below check stored keys, not just voxels.
 """
 
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, convert, create_volume, mask_values, pack_hdf5
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.location import list_keys
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import cli, convert, create_volume, mask_values, pack_hdf5
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.location import list_keys
+from neu_vol.profiles import zarr3_create_spec
 
 
 def _source(path, data, chunk=(8, 8, 8)):
@@ -84,7 +84,7 @@ def test_several_background_values_can_be_given(tmp_path):
 
 def test_write_applies_it_to_the_piece_being_placed(tmp_path, background_one):
     """The path the user's data actually takes: a segmented piece into a GT volume."""
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     piece = str(tmp_path / "piece.h5")
     pack_hdf5(_source(str(tmp_path / "p.zarr"), background_one), piece,
@@ -115,7 +115,7 @@ def test_the_remap_view_keeps_the_sources_recorded_metadata(tmp_path, background
     Swallowing it would silently turn "the offset came from the file" back into "no offset
     given" — and `write` would then demand one.
     """
-    from em_volume_tools import write_subvolume
+    from neu_vol import write_subvolume
 
     piece = str(tmp_path / "keeps.h5")
     pack_hdf5(_source(str(tmp_path / "k.zarr"), background_one), piece,

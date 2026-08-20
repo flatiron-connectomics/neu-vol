@@ -1,4 +1,4 @@
-"""em-volume-tools: chunked I/O, conversion, and multiscale generation for
+"""neu-vol: chunked I/O, conversion, and multiscale generation for
 large 3D EM volumes, orchestrated with dask (local workstation or Rusty/SLURM).
 
 See docs/DESIGN.md for the architecture and docs/dask-slurm-rusty.md for the
@@ -11,9 +11,9 @@ from .meta import VoxelMeta
 from .volume import Volume
 # The half-open box, shared so consumers do not each grow their own notion of one.
 from .grid import BBox
-# Orchestration substrate now lives in the shared em-blockrun package; re-export
+# Orchestration substrate now lives in the shared blockrun package; re-export
 # the common names here for convenience / backward compatibility.
-from em_blockrun import Block, iter_blocks, block_map, idempotent
+from blockrun import Block, iter_blocks, block_map, idempotent
 from .backends.base import (ArrayBackend, clear_backend_cache, open_backend,
                             register_backend)
 from .retry import is_transient, with_retry
@@ -71,12 +71,12 @@ __all__ = [
 ]
 
 
-# Re-exported lazily, for the reason em_blockrun defers it: resolving `start_dask` at
+# Re-exported lazily, for the reason blockrun defers it: resolving `start_dask` at
 # import time pulls in `dask.distributed`, which is ~1 s and which no read-only op needs.
-# `from em_volume_tools import start_dask` still works; it just resolves on first use.
+# `from neu_vol import start_dask` still works; it just resolves on first use.
 def __getattr__(name: str):
     if name == "start_dask":
-        from em_blockrun import start_dask
+        from blockrun import start_dask
 
         return start_dask
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

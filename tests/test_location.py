@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from em_volume_tools.location import default_progress_path, join, spec_kvstore, to_kvstore
+from neu_vol.location import default_progress_path, join, spec_kvstore, to_kvstore
 
 
 def test_to_kvstore_local_path():
@@ -62,10 +62,10 @@ def test_remote_manifests_do_not_collide_on_the_last_path_component():
 
 
 def test_one_destination_is_one_manifest_however_it_is_spelled():
-    """Resume and `em-vol progress` both re-derive this name, so it has to be stable.
+    """Resume and `neu-vol progress` both re-derive this name, so it has to be stable.
 
     A trailing slash resolving to a second manifest would make a resumed run start over
-    and `em-vol progress` report on an empty file.
+    and `neu-vol progress` report on an empty file.
     """
     plain = default_progress_path("s3://b/data/seg")
     assert default_progress_path("s3://b/data/seg/") == plain
@@ -76,7 +76,7 @@ def test_one_destination_is_one_manifest_however_it_is_spelled():
 # Byte / JSON I/O — one code path for local files and object stores
 # --------------------------------------------------------------------------- #
 def test_is_local_and_local_path():
-    from em_volume_tools.location import is_local, local_path
+    from neu_vol.location import is_local, local_path
 
     assert is_local("/mnt/x/vol") and is_local({"driver": "file", "path": "/x"})
     assert not is_local("s3://b/p") and not is_local("gs://b/p")
@@ -89,7 +89,7 @@ def test_write_read_bytes_creates_parent_dirs(tmp_path):
     """The file driver makes directories on write, so callers need no makedirs."""
     import os
 
-    from em_volume_tools.location import exists, read_bytes, write_bytes
+    from neu_vol.location import exists, read_bytes, write_bytes
 
     base = str(tmp_path / "vol")
     write_bytes(base, b"\x00\x01", "mesh", "deep", "42")
@@ -100,7 +100,7 @@ def test_write_read_bytes_creates_parent_dirs(tmp_path):
 
 def test_missing_object_reads_as_none_not_an_error(tmp_path):
     """Existence checks must not need a separate stat, nor raise."""
-    from em_volume_tools.location import exists, read_bytes, read_json
+    from neu_vol.location import exists, read_bytes, read_json
 
     base = str(tmp_path / "vol")
     assert read_bytes(base, "nope") is None
@@ -109,7 +109,7 @@ def test_missing_object_reads_as_none_not_an_error(tmp_path):
 
 
 def test_json_round_trip_and_overwrite(tmp_path):
-    from em_volume_tools.location import read_json, write_json
+    from neu_vol.location import read_json, write_json
 
     base = str(tmp_path / "vol")
     write_json(base, {"type": "segmentation", "scales": [1]}, "info")
@@ -120,7 +120,7 @@ def test_json_round_trip_and_overwrite(tmp_path):
 
 def test_full_path_with_no_parts(tmp_path):
     """A location may already name the object itself."""
-    from em_volume_tools.location import read_json, write_json
+    from neu_vol.location import read_json, write_json
 
     p = str(tmp_path / "vol" / "info")
     write_json(p, {"a": 1})
@@ -135,7 +135,7 @@ def test_opening_an_s3_store_bootstraps_credentials(tmp_path, monkeypatch):
     bootstrap fails *only* on workers that happened not to open an S3 store
     earlier in the run — invisible locally and intermittent on dask.
     """
-    from em_volume_tools import location as L
+    from neu_vol import location as L
 
     creds = tmp_path / "credentials"
     creds.write_text("[default]\naws_access_key_id = AKIATEST\n"
@@ -150,7 +150,7 @@ def test_opening_an_s3_store_bootstraps_credentials(tmp_path, monkeypatch):
 
 def test_local_stores_need_no_credentials(tmp_path, monkeypatch):
     """The bootstrap must not fire for the file driver."""
-    from em_volume_tools import location as L
+    from neu_vol import location as L
 
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     L.write_bytes(str(tmp_path / "vol"), b"x", "info")
@@ -167,7 +167,7 @@ def test_stores_are_reused_per_prefix(tmp_path, monkeypatch):
     """
     import tensorstore as ts
 
-    from em_volume_tools import location as L
+    from neu_vol import location as L
 
     monkeypatch.setattr(L, "_STORES", {})
     opens = []
@@ -193,7 +193,7 @@ def test_both_store_opening_paths_share_one_bootstrap():
     """The backend and the byte helpers must not drift apart again."""
     import inspect
 
-    from em_volume_tools.backends import tensorstore as ts_backend
+    from neu_vol.backends import tensorstore as ts_backend
 
     src = inspect.getsource(ts_backend._kvstore_from_spec)
     assert "ensure_credentials" in src, \
@@ -202,7 +202,7 @@ def test_both_store_opening_paths_share_one_bootstrap():
 
 def test_remote_locations_split_into_prefix_and_key():
     """s3 keys must not be concatenated onto the prefix (no network needed)."""
-    from em_volume_tools.location import _kv
+    from neu_vol.location import _kv
 
     store, key = _kv("s3://bucket/sample3/segmentation", "mesh", "info")
     assert key == "info"

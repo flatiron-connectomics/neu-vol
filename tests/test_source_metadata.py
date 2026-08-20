@@ -3,10 +3,10 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.source_metadata import read_source_metadata
-from em_volume_tools.profiles import zarr3_create_spec
+from neu_vol import convert
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.source_metadata import read_source_metadata
+from neu_vol.profiles import zarr3_create_spec
 
 
 def _make_bare_zarr(path, data, chunk=(8, 8, 8)):

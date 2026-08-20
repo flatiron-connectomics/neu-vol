@@ -40,7 +40,7 @@ def resolve_max_levels(recorded: Sequence[Any] | None) -> tuple[int, str]:
     level was simply left serving whatever it held before.
 
     **A volume recording one level or none is the opposite case**: there is no pyramid to
-    match, and `em-vol write` and `em-vol relabel` both end by telling you to run
+    match, and `neu-vol write` and `neu-vol relabel` both end by telling you to run
     `downsample` to *build* one. Deriving 1 there would turn that documented step into a
     silent no-op, so it falls back to the conversion default instead.
     """

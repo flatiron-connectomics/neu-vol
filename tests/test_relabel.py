@@ -11,13 +11,13 @@ import json
 import numpy as np
 import pytest
 
-from em_volume_tools import cli, convert
-from em_volume_tools.backends.base import open_backend
-from em_volume_tools.backends.tensorstore import TensorStoreBackend
-from em_volume_tools.ops.relabel import (_apply_map, apply_relabel, default_map_path,
+from neu_vol import cli, convert
+from neu_vol.backends.base import open_backend
+from neu_vol.backends.tensorstore import TensorStoreBackend
+from neu_vol.ops.relabel import (_apply_map, apply_relabel, default_map_path,
                                          plan_relabel, relabel)
-from em_volume_tools.profiles import zarr3_create_spec
-from em_volume_tools.source_metadata import level_spec
+from neu_vol.profiles import zarr3_create_spec
+from neu_vol.source_metadata import level_spec
 
 
 def _volume(tmp_path, name, seg, *, profile="local-neuroglancer", chunk=(8, 8, 8)):
@@ -218,7 +218,7 @@ def test_out_creates_the_volume_in_the_same_frame(tmp_path):
     out = str(tmp_path / "out")
     relabel(src, out=out, map_path=str(tmp_path / "m.json"))
 
-    from em_volume_tools.source_metadata import describe
+    from neu_vol.source_metadata import describe
     a, b = describe(src), describe(out)
     assert a["shape"] == b["shape"] and a["dtype"] == b["dtype"]
     assert a["format"] == b["format"]
@@ -231,7 +231,7 @@ def test_untouched_regions_of_the_new_volume_stay_empty(tmp_path):
     src = _volume(tmp_path, "v", _colliding())
     out = str(tmp_path / "out")
     relabel(src, out=out, map_path=str(tmp_path / "m.json"))
-    from em_volume_tools.cli import _stored_chunks
+    from neu_vol.cli import _stored_chunks
     assert _stored_chunks(out, "neuroglancer_precomputed", 0, "8_8_8") == \
         _stored_chunks(src, "neuroglancer_precomputed", 0, "8_8_8")
 
@@ -260,7 +260,7 @@ def test_dry_run_writes_nothing_but_still_reports_the_ranges(tmp_path):
     result = relabel(src, out=out, dry_run=True, map_path=str(tmp_path / "m.json"))
     assert result["dry_run"] and result["n_labels_out"] == 5
     assert result["regions"][1]["new_id_range"] == [3, 5]
-    from em_volume_tools.source_metadata import detect_backend
+    from neu_vol.source_metadata import detect_backend
     assert detect_backend(out) is None, "dry run created the destination"
     assert not (tmp_path / "m.json").exists(), "dry run wrote the mapping file"
 
@@ -277,7 +277,7 @@ def test_a_volume_with_no_collisions_is_left_semantically_alone(tmp_path):
 
 
 def test_a_volume_with_nothing_stored_is_refused(tmp_path):
-    from em_volume_tools.ops.create import create_volume
+    from neu_vol.ops.create import create_volume
 
     dst = str(tmp_path / "empty")
     create_volume(dst, format="precomputed", shape=(32, 32, 32), dtype="uint64",

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from em_volume_tools.pyramid import (
+from neu_vol.pyramid import (
     auto_factor,
     cumulative_factors,
     downsample_schedule,

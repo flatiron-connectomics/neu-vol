@@ -3,8 +3,8 @@ import os
 import numpy as np
 import pytest
 
-from em_volume_tools import convert
-from em_volume_tools.backends.base import open_backend
+from neu_vol import convert
+from neu_vol.backends.base import open_backend
 
 
 def test_hdf5_source_convert_to_zarr(tmp_path):
