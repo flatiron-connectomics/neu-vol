@@ -24,6 +24,10 @@ from .ops import (convert, create_volume, extract_roi, ingest_image_stack,
                   mask_values, pack_hdf5, plan_subvolume_write, plan_volume,
                   rebuild_pyramid, write_subvolume, write_subvolumes)
 from .source_metadata import describe, existing_levels, level_spec
+# Per-level shape, voxel size and origin, read from the source's own metadata. Came
+# from neu-morpho, which had meant neu-draw importing a meshing package to learn a
+# volume's voxel size.
+from .scales import describe_scales, read_scales, scale_spec
 # Location handling + byte/JSON I/O that works the same for local paths and
 # object stores, so consumers never branch on the destination.
 from .location import (exists, is_local, local_path, read_bytes, read_json,
@@ -59,6 +63,9 @@ __all__ = [
     "pack_hdf5",
     "mask_values",
     "describe",
+    "describe_scales",
+    "read_scales",
+    "scale_spec",
     "existing_levels",
     "level_spec",
     "to_kvstore",

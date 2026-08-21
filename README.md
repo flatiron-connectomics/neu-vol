@@ -132,11 +132,39 @@ hundred bytes either way. The writes are **single-scale by design**: how a patch
 should look when coarsened is a separate decision (averaging label ids invents ids),
 so run `downsample` afterwards if the result needs a pyramid.
 
+### What each pyramid level is
+
+`read_scales(src)` returns a `neu_lib.ScaleInfo` per level, finest first, read from the
+source's own metadata — precomputed's `info` or an OME group's `zarr.json`:
+
+```python
+from neu_vol import read_scales, scale_spec, describe_scales
+
+levels = read_scales("s3://bucket/seg.precomputed")
+levels[2].voxel_size          # (32.0, 32.0, 32.0) — this level's OWN resolution
+levels[2].shape               # voxels, zyx
+levels[2].frame.to_nm([0, 0, 0])   # where its voxel (0,0,0) sits, offset included
+print(describe_scales(src))   # the pyramid as a table
+```
+
+**Never derive a factor from `2 ** level`.** Real pyramids are anisotropic — halving x
+and y while leaving z alone is ordinary — so `factor_from` computes it from the real
+voxel sizes. Each level also carries its **origin**, from precomputed's `voxel_offset`
+(that level's voxels, so the nm origin is the product) or OME's `translation` (already
+physical). A cropped volume has a non-zero one, and reconstructing a transform from just
+the voxel size silently places its data as though it started at nm zero.
+
+`scale_spec(src, n)` builds the read spec for one level. **Always use it rather than
+writing a spec by hand**: the key is `scale_index`, an unrecognised key is *silently
+ignored*, and `{"scale": 2}` therefore opens at full resolution while reporting the
+scale-0 shape — so coordinates meant for scale 2 read the wrong place and come back
+empty rather than raising.
+
 Implemented: `VoxelMeta`, `Volume`, block-map engine, `start_dask`, TensorStore
 zarr v3 (sharded/unsharded) **and** precomputed (canonical-axis view + multiscale
 `info`), image-stack / HDF5 / crop-view sources, type-aware pyramids, storage
-profiles, OME-NGFF 0.5 metadata, and the `ingest` / `convert` / `extract_roi` /
-`create_volume` / `write_subvolume` ops.
+profiles, OME-NGFF 0.5 metadata, per-level scale metadata, and the `ingest` /
+`convert` / `extract_roi` / `create_volume` / `write_subvolume` ops.
 Outputs verified via ngff-zarr's reader (zarr) and TensorStore round-trip
 (precomputed); the distributed path is exercised over a real `LocalCluster`.
 
