@@ -213,7 +213,7 @@ def _misaligned_axes(start, stop, shape, chunk) -> list[int]:
     read-modify-write against) has to be one rule, or the two commands will eventually
     disagree about the same box.
     """
-    from ..grid import misaligned_axes
+    from neu_lib.grid import misaligned_axes
 
     return misaligned_axes(start, stop, chunk, extent=shape)
 

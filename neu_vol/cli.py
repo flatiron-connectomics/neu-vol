@@ -1503,7 +1503,7 @@ def _cumulative_factor(per_level, level: int, volume: str) -> tuple[int, ...]:
 
 def _align_grid(args, d):
     """``(block in level-0 voxels, where it came from)`` for ``--to`` / ``--block``."""
-    from neu_vol.grid import lcm_grid
+    from neu_lib.grid import lcm_grid
 
     if args.block:
         return _triple(args.block, "block"), "--block"
@@ -1577,7 +1577,7 @@ def cmd_align_bbox(args) -> int:
     ``--quiet`` prints only the aligned box, which is what makes it composable —
     ``--crop-bbox $(neu-vol align-bbox ... -q)``.
     """
-    from neu_vol.grid import align_box, clamp_box, misaligned_axes
+    from neu_lib.grid import align_box, clamp_box, misaligned_axes
 
     if not (args.volume or args.block):
         raise SystemExit("give --volume (to take the grid from it) or --block z,y,x")
@@ -2168,7 +2168,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.set_defaults(func=cmd_to_hdf5)
 
     # --- align-bbox ---------------------------------------------------------
-    from neu_vol.grid import MODES
+    from neu_lib.grid import MODES
 
     q = sub.add_parser(
         "align-bbox", help="move a box onto a volume's block grid",

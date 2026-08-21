@@ -15,6 +15,7 @@ authors = [{ name = "Erik Schomburg", email = "eschomburg@flatironinstitute.org"
 # `pip install --no-deps -e .` to keep pip from re-resolving them.
 dependencies = [
     "numpy>=2",
+    "neu-lib",             # BBox + grid arithmetic. numpy-only, so it adds nothing.
     "tensorstore>=0.1.70", # zarr v3 array data + neuroglancer-precomputed
     "ngff-zarr>=0.39",     # OME-Zarr / OME-NGFF 0.5 multiscale group metadata
     "wasmtime<48",         # UPSTREAM WORKAROUND, remove when itkwasm catches up:

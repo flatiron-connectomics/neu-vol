@@ -9,8 +9,10 @@ __version__ = "0.1.0"
 
 from .meta import VoxelMeta
 from .volume import Volume
-# The half-open box, shared so consumers do not each grow their own notion of one.
-from .grid import BBox
+# NOTE: `BBox` and the grid arithmetic moved to the shared `neu_lib` package and are
+# deliberately NOT re-exported here. Import them from where they live — a second
+# binding for the same name is the patch-point hazard the dvid modules already
+# document, and naming `neu_lib` is what keeps the layering legible in a diff.
 # Orchestration substrate now lives in the shared blockrun package; re-export
 # the common names here for convenience / backward compatibility.
 from blockrun import Block, iter_blocks, block_map, idempotent
@@ -30,7 +32,6 @@ from .location import (exists, is_local, local_path, read_bytes, read_json,
 __all__ = [
     "__version__",
     "VoxelMeta",
-    "BBox",
     "Volume",
     "Block",
     "iter_blocks",
