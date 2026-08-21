@@ -19,7 +19,8 @@ python -m pytest -q
 ```
 
 `blockrun` must be a **sibling directory** — the layering depends on it. The
-combined environment spec lives one level up, at `neu-suite/environment.yml`.
+[neu-suite](https://github.com/flatiron-connectomics/neu-suite) README describes how to
+build the shared environment.
 
 The environment must live somewhere the cluster's workers can also read: an env on
 a node's local disk is invisible to them, and the failure looks like a missing
