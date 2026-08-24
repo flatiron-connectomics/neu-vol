@@ -20,6 +20,15 @@ untouched. Two rules keep it from hiding real problems:
 
 This is for **entry points** (scripts, drivers). Library code must not touch
 process-wide stderr.
+
+:func:`quiet_reads` is the same filter packaged for the *other* kind of entry point —
+a library function that a notebook calls directly, where there is no ``main()`` to wrap.
+It is still opt-in (the consumer's own function chooses to use it), so the rule above
+holds; what it removes is each consumer reimplementing the depth counter that makes
+nesting and threading safe. neu-draw arrived at that pattern first and its reasoning is
+worth repeating: expecting a user to run an incantation before their output is legible is
+the worse trade, because forgetting it after a kernel restart looks exactly like the
+filter being broken.
 """
 
 from __future__ import annotations
@@ -47,6 +56,13 @@ BENIGN_PATTERNS = (
     "Failed to complete connection acquisition",
     "Client connection failed with error",
     "timed out, shutting down.",
+    # The GCS equivalent, emitted on every anonymous read of a public bucket: the
+    # provider chain reports that no gcloud application-default credentials exist
+    # before falling through to anonymous access, which then succeeds. Matching the
+    # source file catches its siblings too, and is safe because a *real* GCS auth
+    # failure says PERMISSION_DENIED or UNAUTHENTICATED, which NEVER_DROP keeps.
+    "google_auth_provider.cc",
+    "Could not find the credentials file in the standard gcloud location",
 )
 
 # Printed no matter what. A message that mentions any of these is diagnostic even
@@ -109,3 +125,51 @@ def quiet_store_logs(enabled: bool = True):
         os.dup2(saved, 2)          # restore before draining, so nothing is lost
         thread.join(timeout=5.0)
         os.close(saved)
+
+
+# --------------------------------------------------------------------------- #
+# the notebook-facing wrapper
+# --------------------------------------------------------------------------- #
+#: Set False to see raw store logging, including the benign lines. Consulted at call
+#: time, so flipping it in a live session takes effect on the next read.
+reads_quiet = True
+
+_scoped = None
+_depth = 0
+_depth_lock = threading.RLock()
+
+
+@contextlib.contextmanager
+def quiet_reads():
+    """Filter benign store logging for one read, safe to nest and to call from threads.
+
+    For a library function that a notebook calls directly — there is no ``main()`` to
+    wrap, and from the notebook's point of view that function *is* the entry point. Wrap
+    the store-touching call in it:
+
+        with quiet_reads():
+            info = location.read_json(source, "info")
+
+    A no-op when :data:`reads_quiet` is false or when an outer read is already
+    filtering. The depth counter matters: only the thread that got there first ever
+    swaps fd 2, because two threads racing ``dup2`` on the same descriptor is a way to
+    lose output rather than merely filter it.
+    """
+    global _depth, _scoped
+    if not reads_quiet:
+        yield
+        return
+    with _depth_lock:
+        first = _depth == 0
+        if first:
+            _scoped = quiet_store_logs(True)
+            _scoped.__enter__()
+        _depth += 1
+    try:
+        yield
+    finally:
+        with _depth_lock:
+            _depth -= 1
+            if _depth == 0 and _scoped is not None:
+                manager, _scoped = _scoped, None
+                manager.__exit__(None, None, None)
