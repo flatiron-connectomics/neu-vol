@@ -140,6 +140,25 @@ def read_bytes(location: str | Mapping[str, Any], *parts: str) -> bytes | None:
     return bytes(result.value) if result.state == "value" else None
 
 
+def read_range(location: str | Mapping[str, Any], start: int, end: int,
+               *parts: str) -> bytes | None:
+    """Read the half-open byte range ``[start, end)`` of one object.
+
+    ``None`` if the object does not exist. A range reaching past the end of the object
+    is **not** an error — the store returns what is there, so a short result means the
+    object is smaller than asked for, not that the read failed. Callers that need the
+    full range must check the length themselves.
+
+    Goes through the same cached, credential-bootstrapped opener as :func:`read_bytes`;
+    on an object store this becomes an HTTP Range request rather than a full fetch,
+    which is the entire point — a shard file is tens of MB and the wanted entry is
+    typically a few hundred bytes.
+    """
+    store, key = _kv(location, *parts)
+    result = store.read(key, byte_range=slice(int(start), int(end))).result()
+    return bytes(result.value) if result.state == "value" else None
+
+
 def write_bytes(location: str | Mapping[str, Any], data: bytes, *parts: str) -> None:
     """Write one object, creating parent directories for the file driver."""
     store, key = _kv(location, *parts)

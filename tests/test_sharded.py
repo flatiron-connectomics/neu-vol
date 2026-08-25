@@ -1,8 +1,14 @@
-"""The sharded uint64 index, which tensorstore implements and this package only wraps.
+"""The sharded uint64 index, which tensorstore implements and this package mostly wraps.
 
-What is worth testing is therefore not the format but the wrapper's contract: the key byte
+For writing there is therefore no format to test, only the wrapper's contract: the key byte
 order, that the metadata handed to the kvstore is the same object that goes into an `info`,
 and that a whole batch lands in one transaction rather than rewriting a shard per key.
+
+`ShardReader` is the exception — it reimplements the addressing so a caller can learn the
+byte OFFSET of an entry, which the driver will not tell you and the sharded mesh format needs.
+That does have a format to test, and it is tested two ways: the hash and shard placement
+against known answers taken from an independent implementation (cloud-volume), and the values
+against `read_one`, i.e. against tensorstore reading the same files.
 """
 
 import struct
@@ -264,3 +270,182 @@ def test_a_cell_written_at_its_morton_key_reads_back_by_position(tmp_path):
     for x, y, z in ((0, 0, 0), (3, 1, 3), (2, 0, 1)):
         code = sharded.compressed_morton_code([x, y, z], grid)
         assert sharded.read_one(dst, spec, code) == f"{x}-{y}-{z}".encode()
+
+
+# --------------------------------------------------------------------------- #
+# ShardReader: addressing
+# --------------------------------------------------------------------------- #
+
+#: (sharding params, [(key, shard filename stem, minishard number)]).
+#: Taken from cloud-volume's ShardingSpecification.compute_shard_location, which is an
+#: independent implementation of the same spec. Pinning against it rather than against
+#: ourselves is the point: a wrong hash still produces a self-consistent reader that
+#: simply never finds anything, and "not found" is indistinguishable from "absent".
+SHARD_VECTORS = [
+    (dict(preshift_bits=6, minishard_bits=8, shard_bits=10),
+     [(0, "0ae", 65), (1, "0ae", 65), (24740, "30e", 43), (255, "3e4", 209),
+      (4096, "119", 255), (123456789, "06c", 143), (2**63, "0af", 35),
+      (2**64 - 1, "230", 252)]),
+    (dict(preshift_bits=0, minishard_bits=0, shard_bits=0),
+     [(0, "0", 0), (24740, "0", 0), (2**64 - 1, "0", 0)]),
+    (dict(preshift_bits=9, minishard_bits=6, shard_bits=11),
+     [(0, "2b9", 1), (24740, "053", 12), (255, "2b9", 1), (4096, "627", 1),
+      (123456789, "4c1", 17), (2**63, "1cb", 10), (2**64 - 1, "04d", 34)]),
+    (dict(preshift_bits=0, minishard_bits=3, shard_bits=5),
+     [(0, "08", 1), (1, "13", 2), (24740, "10", 4), (4096, "07", 5),
+      (123456789, "04", 7), (2**63, "15", 0), (2**64 - 1, "03", 2)]),
+]
+
+
+@pytest.mark.parametrize("params,cases", SHARD_VECTORS)
+def test_shard_placement_matches_an_independent_implementation(params, cases):
+    spec = sharded.sharding_spec(**params)
+    for chunk_id, shard, minishard in cases:
+        assert sharded.shard_location(chunk_id, spec) == (f"{shard}.shard", minishard), \
+            f"key {chunk_id} placed wrong for {params}"
+
+
+def test_preshift_bits_send_neighbouring_keys_to_one_shard():
+    """That is what preshift is FOR — consecutive ids share a shard so a range of them
+    costs one file. With 6 bits, 0..63 must land together and 64 must not be forced to."""
+    spec = sharded.sharding_spec(shard_bits=10, minishard_bits=8, preshift_bits=6)
+    first = {sharded.shard_location(i, spec) for i in range(64)}
+    assert len(first) == 1
+    assert sharded.shard_location(64, spec) != sharded.shard_location(0, spec)
+
+
+def test_the_identity_hash_is_not_the_murmur_one():
+    """Both are legal and they place keys differently, so a spec's `hash` must be read
+    rather than assumed."""
+    ident = sharded.sharding_spec(shard_bits=5, minishard_bits=3, hash="identity")
+    murmur = sharded.sharding_spec(shard_bits=5, minishard_bits=3)
+    # 24740 = 0b110000010100100: low 3 bits are the minishard, next 5 the shard.
+    assert sharded.shard_location(24740, ident) == ("14.shard", 4)
+    assert sharded.shard_location(24740, murmur) != sharded.shard_location(24740, ident)
+
+
+def test_an_unknown_hash_is_refused_rather_than_silently_treated_as_identity():
+    spec = dict(sharded.sharding_spec(shard_bits=2, minishard_bits=1))
+    spec["hash"] = "sha256"
+    with pytest.raises(ValueError, match="unknown sharded hash"):
+        sharded.shard_location(1, spec)
+
+
+def test_the_murmur_digest_is_the_x86_variant():
+    """x86_128 and x64_128 are different functions. Known answers for the empty input and
+    for a short string, from the reference implementation."""
+    assert sharded.murmurhash3_x86_128_low64(b"") == 0
+    assert sharded.murmurhash3_x86_128_low64(b"", seed=1) != 0
+    # Stable across calls and sensitive to every input byte.
+    digests = {sharded.murmurhash3_x86_128_low64(bytes([b]) + b"\0" * 7) for b in range(32)}
+    assert len(digests) == 32
+    assert all(0 <= d < 2**64 for d in digests)
+
+
+# --------------------------------------------------------------------------- #
+# ShardReader: values
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("encoding", ["gzip", "raw"])
+def test_shard_reader_agrees_with_tensorstore(tmp_path, encoding):
+    """The whole reason two implementations are allowed to coexist here.
+
+    `read_one` goes through tensorstore's driver, `ShardReader` through our own hash and
+    index parsing. They must return the same bytes for the same key or one of them is
+    wrong, and a reader that is wrong reads back as missing data rather than as an error.
+    """
+    spec = sharded.sharding_spec(shard_bits=3, minishard_bits=2, preshift_bits=0,
+                                 data_encoding=encoding, minishard_index_encoding=encoding)
+    entries = [(i * 37 + 5, f"payload-{i}-{'x' * i}".encode()) for i in range(150)]
+    sharded.write_all(str(tmp_path / "idx"), spec, entries)
+
+    reader = sharded.ShardReader(str(tmp_path / "idx"), spec)
+    for chunk_id, payload in entries:
+        assert reader.read(chunk_id) == payload
+        assert sharded.read_one(str(tmp_path / "idx"), spec, chunk_id) == payload
+
+
+def test_shard_reader_reports_a_missing_key_as_none(tmp_path):
+    spec = sharded.sharding_spec(shard_bits=2, minishard_bits=1)
+    sharded.write_all(str(tmp_path / "idx"), spec, [(1, b"a"), (2, b"b")])
+    reader = sharded.ShardReader(str(tmp_path / "idx"), spec)
+    assert reader.read(999) is None
+    assert reader.locate(999) is None
+
+
+def test_shard_reader_on_an_index_that_does_not_exist_is_none_not_an_error(tmp_path):
+    """A volume may simply hold no sharded subresource. That is a normal answer."""
+    spec = sharded.sharding_spec(shard_bits=2, minishard_bits=1)
+    reader = sharded.ShardReader(str(tmp_path / "nothing-here"), spec)
+    assert reader.locate(1) is None
+    assert reader.read(1) is None
+
+
+def test_locate_gives_the_byte_range_the_value_actually_occupies(tmp_path):
+    """`locate` is the only thing tensorstore cannot do, so its offsets are what the mesh
+    reader trusts to find fragment data sitting outside the index entirely."""
+    spec = sharded.sharding_spec(shard_bits=1, minishard_bits=1, data_encoding="raw",
+                                 minishard_index_encoding="raw")
+    entries = [(i, bytes([i]) * (10 + i)) for i in range(1, 20)]
+    sharded.write_all(str(tmp_path / "idx"), spec, entries)
+
+    reader = sharded.ShardReader(str(tmp_path / "idx"), spec)
+    for chunk_id, payload in entries:
+        shard, offset, size = reader.locate(chunk_id)
+        assert size == len(payload), "raw encoding stores the value verbatim"
+        assert reader.read_range(shard, offset, offset + size) == payload
+
+
+def test_the_indexes_are_read_once_per_shard_not_once_per_key(tmp_path, monkeypatch):
+    """A batch of bodies out of one shard must not re-fetch its index per body — that is
+    the difference between two requests and two thousand against an object store."""
+    from neu_vol import location
+
+    spec = sharded.sharding_spec(shard_bits=0, minishard_bits=0)
+    entries = [(i, f"v{i}".encode()) for i in range(50)]
+    sharded.write_all(str(tmp_path / "idx"), spec, entries)
+
+    calls = []
+    real = location.read_range
+    monkeypatch.setattr(location, "read_range",
+                        lambda *a, **k: (calls.append(a[3:]), real(*a, **k))[1])
+
+    reader = sharded.ShardReader(str(tmp_path / "idx"), spec)
+    for chunk_id, payload in entries:
+        assert reader.read(chunk_id) == payload
+    # 50 value reads, plus exactly one shard index and one minishard index.
+    assert len(calls) == 52
+
+
+def test_clear_leaves_a_sibling_info_alone(tmp_path):
+    """An index does not always own its directory. A sharded mesh or skeleton sits beside
+    the `info` that declares it, and `clear` deleting that produced the nastiest possible
+    result: every shard present and correct, nothing pointing at them, every body reading
+    back as absent. Only `.shard` objects are ours to remove."""
+    from neu_vol import location
+
+    spec = sharded.sharding_spec(shard_bits=1, minishard_bits=1)
+    dst = str(tmp_path / "skeleton")
+    location.write_bytes(dst, b'{"@type": "neuroglancer_skeletons"}', "info")
+    sharded.write_all(dst, spec, [(7, b"a-skeleton")])
+
+    assert location.read_bytes(dst, "info") is not None, "info was deleted by the rewrite"
+    assert sharded.read_one(dst, spec, 7) == b"a-skeleton"
+
+    # And a rewrite must still replace the shards rather than merging into them.
+    sharded.write_all(dst, spec, [(8, b"another")])
+    assert sharded.read_one(dst, spec, 7) is None
+    assert location.read_bytes(dst, "info") is not None
+
+
+def test_clear_reports_only_the_shards_it_removed(tmp_path):
+    from neu_vol import location
+
+    spec = sharded.sharding_spec(shard_bits=2, minishard_bits=0)
+    dst = str(tmp_path / "idx")
+    sharded.write_all(dst, spec, [(i, b"v") for i in range(64)])
+    location.write_bytes(dst, b"{}", "info")
+
+    n_shards = len([p for p in (tmp_path / "idx").iterdir() if p.name.endswith(".shard")])
+    assert sharded.clear(dst) == n_shards
+    assert location.read_bytes(dst, "info") == b"{}"

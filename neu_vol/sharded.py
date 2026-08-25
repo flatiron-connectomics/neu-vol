@@ -6,11 +6,21 @@ annotation, and the reference male-CNS synapse dataset has ~312M of them — 1,0
 ~31 MB instead of 312 million objects. The same arithmetic bites a volume, where file count
 is volume/chunk³ and ceph enforces inode quotas as well as capacity.
 
-**None of the format is implemented here, deliberately.** tensorstore already ships a
-``neuroglancer_uint64_sharded`` kvstore driver that reads *and writes* it, so this module is
-a thin wrapper that opens one. That avoids reimplementing murmurhash3_x86_128, minishard
-tables, the shard-index layout and the two gzip layers — every one of which produces a
-spec-legal file that a viewer silently rejects when it is subtly wrong.
+**Writing does not implement any of the format, deliberately.** tensorstore already ships a
+``neuroglancer_uint64_sharded`` kvstore driver that reads *and writes* it, so :func:`write_all`
+and :func:`read_one` are thin wrappers that open one. That avoids reimplementing
+murmurhash3_x86_128, minishard tables, the shard-index layout and the two gzip layers — every
+one of which produces a spec-legal file that a viewer silently rejects when it is subtly wrong.
+
+**:class:`ShardReader` is the one exception, and it is narrow.** The driver addresses entries
+by KEY, and that is all it can do — which is not enough for the sharded multi-resolution mesh
+format, where the mesh fragment data is *not an indexed entry at all*. It sits immediately
+before the object's manifest in the same shard file and is addressed by byte offsets relative
+to it, so reading a mesh requires knowing where in the shard the manifest landed. There is no
+tensorstore API for that, so the addressing — hash, shard index, minishard table — is
+reimplemented here. Nothing about *writing* is, and :func:`read_one` deliberately stays on the
+driver: ``test_shard_reader_agrees_with_tensorstore`` asserts the two paths return the same
+bytes for the same key, which is what keeps this from being a second unverified implementation.
 
 Verified against the published reference rather than only against ourselves: opening
 ``gs://flyem-male-cns/v1.0/male-cns-v1.0-synapses-precomputed/by_id/`` with its own sharding
@@ -170,17 +180,27 @@ def open_kvstore(location: str | Mapping[str, Any], metadata: Mapping[str, Any],
 
 
 def clear(location: str | Mapping[str, Any], *parts: str) -> int:
-    """Delete the shard objects of an index. Returns how many were removed.
+    """Delete the ``.shard`` objects of an index. Returns how many were removed.
 
     Named for what it is rather than folded into a flag, because a partly written index is a
     real state: this is not atomic, so an interrupted rewrite leaves fewer shards than either
     version had. That is still better than the alternative it exists to prevent — see
     :func:`write_all`.
+
+    **Only ``.shard`` objects are removed, and that restriction is load-bearing.** This used
+    to delete every key under the prefix, which is harmless where an index owns its own
+    directory — as every annotation index does — and destructive where it does not. A sharded
+    mesh or skeleton lives in the *same* directory as the ``info`` that describes it, so a
+    rewrite there took the ``info`` with it and left a subresource that reads as absent: the
+    shards are all present and correct, nothing declares them, and every body comes back
+    ``None``. The shard filename is fixed by the spec, so filtering on it is exact.
     """
     from .location import _kv, list_keys
 
     removed = 0
     for name in list_keys(location, *parts):
+        if not name.endswith(".shard"):
+            continue
         store, resolved = _kv(location, *parts, name)
         store.write(resolved, None).result()
         removed += 1
@@ -228,3 +248,243 @@ def read_one(location: str | Mapping[str, Any], metadata: Mapping[str, Any],
     kv = open_kvstore(location, metadata, *parts)
     result = kv.read(key(chunk_id)).result()
     return bytes(result.value) if result.state == "value" else None
+
+
+# --------------------------------------------------------------------------- #
+# reading by byte offset
+# --------------------------------------------------------------------------- #
+
+_M32 = 0xFFFFFFFF
+
+
+def _rotl32(x: int, r: int) -> int:
+    return ((x << r) | (x >> (32 - r))) & _M32
+
+
+def _fmix32(h: int) -> int:
+    h ^= h >> 16
+    h = (h * 0x85EBCA6B) & _M32
+    h ^= h >> 13
+    h = (h * 0xC2B2AE35) & _M32
+    h ^= h >> 16
+    return h
+
+
+def murmurhash3_x86_128_low64(data: bytes, seed: int = 0) -> int:
+    """The low 64 bits of MurmurHash3 x86_128 — the hash the sharded format specifies.
+
+    Pure Python, which is fine: it is called once per key looked up, never per byte of
+    data. The alternative was a compiled dependency (``mmh3``) in a package whose install
+    story is already delicate, for one hash of one 8-byte value.
+
+    Note **x86**_128, not x64_128: the two are different functions producing different
+    digests, and picking the wrong one sends every read to a shard that does not hold the
+    key — which reads back as "this object does not exist" rather than as an error.
+    """
+    c1, c2, c3, c4 = 0x239B961B, 0xAB0E9789, 0x38B34AE5, 0xA1E38B93
+    h1 = h2 = h3 = h4 = seed & _M32
+    length = len(data)
+    nblocks = length // 16
+
+    for i in range(nblocks):
+        k1, k2, k3, k4 = struct.unpack_from("<IIII", data, i * 16)
+        k1 = (_rotl32((k1 * c1) & _M32, 15) * c2) & _M32
+        h1 ^= k1
+        h1 = ((_rotl32(h1, 19) + h2) * 5 + 0x561CCD1B) & _M32
+        k2 = (_rotl32((k2 * c2) & _M32, 16) * c3) & _M32
+        h2 ^= k2
+        h2 = ((_rotl32(h2, 17) + h3) * 5 + 0x0BCAA747) & _M32
+        k3 = (_rotl32((k3 * c3) & _M32, 17) * c4) & _M32
+        h3 ^= k3
+        h3 = ((_rotl32(h3, 15) + h4) * 5 + 0x96CD1C35) & _M32
+        k4 = (_rotl32((k4 * c4) & _M32, 18) * c1) & _M32
+        h4 ^= k4
+        h4 = ((_rotl32(h4, 13) + h1) * 5 + 0x32AC3B17) & _M32
+
+    tail = data[nblocks * 16:]
+    n = len(tail)
+    k1 = k2 = k3 = k4 = 0
+    if n >= 15:
+        k4 ^= tail[14] << 16
+    if n >= 14:
+        k4 ^= tail[13] << 8
+    if n >= 13:
+        k4 ^= tail[12]
+        h4 ^= (_rotl32((k4 * c4) & _M32, 18) * c1) & _M32
+    if n >= 12:
+        k3 ^= tail[11] << 24
+    if n >= 11:
+        k3 ^= tail[10] << 16
+    if n >= 10:
+        k3 ^= tail[9] << 8
+    if n >= 9:
+        k3 ^= tail[8]
+        h3 ^= (_rotl32((k3 * c3) & _M32, 17) * c4) & _M32
+    if n >= 8:
+        k2 ^= tail[7] << 24
+    if n >= 7:
+        k2 ^= tail[6] << 16
+    if n >= 6:
+        k2 ^= tail[5] << 8
+    if n >= 5:
+        k2 ^= tail[4]
+        h2 ^= (_rotl32((k2 * c2) & _M32, 16) * c3) & _M32
+    if n >= 4:
+        k1 ^= tail[3] << 24
+    if n >= 3:
+        k1 ^= tail[2] << 16
+    if n >= 2:
+        k1 ^= tail[1] << 8
+    if n >= 1:
+        k1 ^= tail[0]
+        h1 ^= (_rotl32((k1 * c1) & _M32, 15) * c2) & _M32
+
+    h1 ^= length
+    h2 ^= length
+    h3 ^= length
+    h4 ^= length
+    h1 = (h1 + h2 + h3 + h4) & _M32
+    h2 = (h2 + h1) & _M32
+    h3 = (h3 + h1) & _M32
+    h4 = (h4 + h1) & _M32
+    h1, h2, h3, h4 = _fmix32(h1), _fmix32(h2), _fmix32(h3), _fmix32(h4)
+    h1 = (h1 + h2 + h3 + h4) & _M32
+    h2 = (h2 + h1) & _M32
+    return h1 | (h2 << 32)
+
+
+def shard_location(chunk_id: int, metadata: Mapping[str, Any]) -> tuple[str, int]:
+    """``(shard filename, minishard number)`` for a key, per the sharding spec.
+
+    The filename is lowercase hex zero-padded to ``ceil(shard_bits / 4)`` digits plus
+    ``.shard``; ``shard_bits=0`` therefore gives ``0.shard``, the single-shard case.
+    """
+    preshift = int(metadata.get("preshift_bits", 0))
+    minishard_bits = int(metadata["minishard_bits"])
+    shard_bits = int(metadata["shard_bits"])
+
+    hashed = int(chunk_id) >> preshift
+    how = metadata.get("hash", "identity")
+    if how == DEFAULT_HASH:
+        hashed = murmurhash3_x86_128_low64(struct.pack("<Q", hashed & 0xFFFFFFFFFFFFFFFF))
+    elif how != "identity":
+        raise ValueError(f"unknown sharded hash {how!r}; expected 'identity' or "
+                         f"{DEFAULT_HASH!r}")
+
+    minishard = hashed & ((1 << minishard_bits) - 1)
+    shard = (hashed >> minishard_bits) & ((1 << shard_bits) - 1)
+    width = -(-shard_bits // 4) or 1
+    return f"{shard:0{width}x}.shard", minishard
+
+
+class ShardReader:
+    """Locates and reads entries of a sharded index, by key *and* by byte offset.
+
+    Exists for the one thing tensorstore's driver cannot do — say **where** in its shard
+    an entry lives. The sharded multi-resolution mesh format needs that, because a body's
+    mesh fragment data is not an indexed entry: it sits immediately before the manifest
+    and is addressed relative to it. :func:`read_one` remains the right call for anything
+    that only wants a value.
+
+    The shard index (one small read per shard) and each minishard index are cached on the
+    instance, so fetching many bodies costs one pair of index reads per shard touched
+    rather than per body. Reuse one reader across a batch; it holds no store handles of
+    its own beyond what :mod:`neu_vol.location` already caches per process.
+    """
+
+    def __init__(self, location: str | Mapping[str, Any], metadata: Mapping[str, Any],
+                 *parts: str):
+        self.location = location
+        self.metadata = dict(metadata)
+        self.parts = tuple(parts)
+        self._index_length = (1 << int(self.metadata["minishard_bits"])) * 16
+        self._shard_index: dict[str, Any] = {}
+        self._minishard_index: dict[tuple[str, int], Any] = {}
+
+    def read_range(self, shard: str, start: int, end: int) -> bytes | None:
+        """Raw bytes ``[start, end)`` of one shard file, undecoded."""
+        from .location import read_range
+
+        if end <= start:
+            return b""
+        return read_range(self.location, start, end, *self.parts, shard)
+
+    def _shard_table(self, shard: str):
+        if shard not in self._shard_index:
+            import numpy as np
+
+            raw = self.read_range(shard, 0, self._index_length)
+            if raw is None or len(raw) < self._index_length:
+                # A shard file that does not exist holds no keys. Short is equally
+                # fatal and equally not an error to the caller: either way there is
+                # nothing to look up here.
+                self._shard_index[shard] = None
+            else:
+                self._shard_index[shard] = np.frombuffer(raw, dtype="<u8").reshape(-1, 2)
+        return self._shard_index[shard]
+
+    def _minishard_table(self, shard: str, minishard: int):
+        if (shard, minishard) in self._minishard_index:
+            return self._minishard_index[(shard, minishard)]
+
+        import gzip
+
+        import numpy as np
+
+        table = self._shard_table(shard)
+        result = None
+        if table is not None and minishard < len(table):
+            # Offsets in both index levels are relative to the END of the shard index.
+            start = int(table[minishard][0]) + self._index_length
+            end = int(table[minishard][1]) + self._index_length
+            if end > start:
+                raw = self.read_range(shard, start, end)
+                if raw:
+                    if self.metadata.get("minishard_index_encoding", "raw") == "gzip":
+                        raw = gzip.decompress(raw)
+                    flat = np.frombuffer(raw, dtype="<u8")
+                    n = flat.size // 3
+                    # Three parallel arrays, each delta-encoded against a different
+                    # baseline: ids against the previous id, starts against the previous
+                    # END (hence the sizes term), sizes stored outright.
+                    ids = np.cumsum(flat[0:n])
+                    sizes = flat[2 * n:3 * n]
+                    starts = np.cumsum(flat[n:2 * n])
+                    starts[1:] += np.cumsum(sizes[:-1])
+                    starts += self._index_length
+                    result = np.stack([ids, starts, sizes], axis=1)
+        self._minishard_index[(shard, minishard)] = result
+        return result
+
+    def locate(self, chunk_id: int) -> tuple[str, int, int] | None:
+        """``(shard, offset, size)`` of the STORED entry, or ``None`` if the key is absent.
+
+        ``size`` is the encoded length on disk, so with ``data_encoding='gzip'`` it is the
+        compressed size — which is exactly what the mesh format's arithmetic wants, since
+        the fragment data abuts the stored bytes rather than the decoded ones.
+        """
+        import numpy as np
+
+        shard, minishard = shard_location(chunk_id, self.metadata)
+        table = self._minishard_table(shard, minishard)
+        if table is None:
+            return None
+        rows = np.nonzero(table[:, 0] == np.uint64(int(chunk_id)))[0]
+        if not len(rows):
+            return None
+        return shard, int(table[rows[0], 1]), int(table[rows[0], 2])
+
+    def read(self, chunk_id: int) -> bytes | None:
+        """One entry by id, decoded per ``data_encoding``; ``None`` if absent."""
+        import gzip
+
+        found = self.locate(chunk_id)
+        if found is None:
+            return None
+        shard, offset, size = found
+        raw = self.read_range(shard, offset, offset + size)
+        if raw is None:
+            return None
+        if self.metadata.get("data_encoding", "raw") == "gzip":
+            raw = gzip.decompress(raw)
+        return raw
