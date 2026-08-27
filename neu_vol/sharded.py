@@ -277,7 +277,7 @@ def murmurhash3_x86_128_low64(data: bytes, seed: int = 0) -> int:
     data. The alternative was a compiled dependency (``mmh3``) in a package whose install
     story is already delicate, for one hash of one 8-byte value.
 
-    Note **x86**_128, not x64_128: the two are different functions producing different
+    Note ``x86_128``, **not** ``x64_128``: the two are different functions producing different
     digests, and picking the wrong one sends every read to a shard that does not hold the
     key — which reads back as "this object does not exist" rather than as an error.
     """
