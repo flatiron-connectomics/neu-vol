@@ -73,12 +73,38 @@ def test_convert_reads_metadata_from_precomputed_source(tmp_path):
     assert scale == [8.0, 8.0, 8.0]
 
 
-def test_read_source_metadata_none_for_bare_and_hdf5(tmp_path):
+def test_read_source_metadata_none_for_a_bare_array(tmp_path):
     vol = np.zeros((4, 4, 4), np.uint8)
     bare = str(tmp_path / "bare.zarr")
     _make_bare_zarr(bare, vol)
     assert read_source_metadata({"backend": "zarr3", "path": bare}) is None
-    assert read_source_metadata({"backend": "hdf5", "path": "/x", "dataset": "d"}) is None
+
+
+def test_an_hdf5_with_no_frame_attributes_records_nothing(tmp_path):
+    """`voxel_size` is the gate: without it there is no frame to return.
+
+    An offset in voxels is not physical on its own and `units` would describe numbers
+    that are not there, so the dict is withheld rather than half-filled — which is what
+    keeps `convert`'s "voxel_size is required" the honest answer for a plain HDF5 file.
+    """
+    h5py = pytest.importorskip("h5py")
+    path = str(tmp_path / "plain.h5")
+    with h5py.File(path, "w") as f:
+        f.create_dataset("data", data=np.zeros((4, 4, 4), np.uint8))
+    assert read_source_metadata({"backend": "hdf5", "path": path,
+                                 "dataset": "/data"}) is None
+
+
+def test_a_missing_hdf5_file_raises_rather_than_reporting_no_metadata(tmp_path):
+    """"This file records no frame" and "this file is not there" are different answers.
+
+    They used to be the same one: the HDF5 branch did not exist, so every HDF5 spec
+    returned None — including one naming a path that does not exist.
+    """
+    pytest.importorskip("h5py")
+    with pytest.raises(FileNotFoundError):
+        read_source_metadata({"backend": "hdf5", "path": str(tmp_path / "nope.h5"),
+                              "dataset": "/data"})
 
 
 def test_convert_without_voxel_size_and_no_metadata_raises(tmp_path):

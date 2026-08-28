@@ -43,11 +43,19 @@ ingest_image_stack(
 )
 ```
 
-`convert()` does the same from any source backend (zarr v3, precomputed, HDF5)
-to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel. It reads
-`voxel_size`/`offset`/`units` from the source when present (OME-NGFF groups,
-precomputed `info`); explicit args override. Segmentations default to
-`compressed_segmentation` encoding on precomputed.
+`convert()` does the same from any source backend (zarr v3, precomputed, DVID, HDF5,
+image stack) to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel. It
+reads `voxel_size`/`offset`/`units` from the source when present (OME-NGFF groups,
+precomputed `info`, a DVID instance, an HDF5 file that records its own frame); explicit
+args override. Segmentations default to `compressed_segmentation` encoding on
+precomputed.
+
+The source format is detected, so `--src-format` is only for overriding it. Volumes are
+recognised by their metadata document (`info`, `zarr.json`, `.zarray`/`.zgroup`) and DVID
+by its URL scheme; **an HDF5 file and a stack of 2D slices are recognised by name**,
+since neither has a marker object — an `.h5`/`.hdf5` file, a glob, a multipage TIFF, or a
+directory that actually contains `.tif`/`.png` slices. A marker always wins, so a stray
+image beside an `info` changes nothing.
 
 ```python
 from neu_vol import convert
@@ -116,9 +124,27 @@ from neu_vol import pack_hdf5
 pack_hdf5("slices/", "piece.h5", voxel_size=(40, 8, 8), voxel_offset=(24, 128, 256))
 ```
 
-The dataset defaults to `/data`, which is what the reader assumes when it is not told. An
-existing file is added to if its recorded frame matches — several pieces of one volume in
-one file, each with its own `voxel_offset` — and refused if it does not.
+The dataset defaults to `/data`, which is what the reader assumes when it is not told —
+though a reader given only a path now *resolves* the name instead, and only falls back on
+the default when nothing else says. An existing file is added to if its recorded frame
+matches — several pieces of one volume in one file, each with its own `voxel_offset` — and
+refused if it does not. `neu-vol info <file.h5>` lists what such a file ended up holding.
+
+`open_hdf5()` is the read side — one dataset of a file, ready to read regions from, with
+no spec to write out:
+
+```python
+from neu_vol import open_hdf5
+be = open_hdf5("piece.h5")                     # one dataset: found
+be = open_hdf5("gt_v1_eval.h5", "/z07901")     # a container: name it
+be.read_region((slice(0, 64), slice(0, 64), slice(0, 64)))
+```
+
+The name is required when the file holds several arrays, since choosing one of thirteen
+crops on your behalf would be wrong twelve times out of thirteen; the error lists them.
+`open_backend` stays spec-only on purpose — it is the primitive a per-block dask task
+reopens on a worker, so its reader is named rather than inferred. To find out what
+something *is*, use `describe`.
 
 `write_subvolumes` plans **every** source — offsets, bounds, dtype — before writing
 any of them, so a mistyped offset in the last file is caught while the volume is still
@@ -200,6 +226,7 @@ Installing the package provides **`neu-vol`** (equivalently `python -m neu_vol`)
 
 ```bash
 neu-vol info    <volume>                      # format, voxel sizes, chunking, levels
+                                              #   (also an HDF5 file or a slice stack)
 neu-vol convert --src ... --dst ...           # build a multiscale volume
 neu-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
 neu-vol progress <volume>                     # chunks written, per level
@@ -254,6 +281,44 @@ schedule, so the two volumes cannot drift a voxel apart partway up the pyramid.
 `write` reports whether the region is aligned to the destination's chunk grid: an
 unaligned edge means those chunks are read-modify-written, which is correct on its
 own but loses one of two updates if overlapping writes ever run at once.
+
+### Inspecting anything readable, not just a volume
+
+`neu-vol info` works on every format the package can read — a zarr or precomputed
+volume, a `dvid://` instance, an HDF5 file, or a directory/glob of 2D slices:
+
+```bash
+neu-vol info piece.h5                        # shape, dtype, and the frame it records
+neu-vol info slices/                          # a stack: shape and dtype; no scale to read
+neu-vol info gt_v1_eval.h5                    # SEVERAL datasets: lists them all
+neu-vol info gt_v1_eval.h5 --dataset /z07901  # ...then the full report on one
+```
+
+The last two are the case worth knowing. An HDF5 file is a **container**, and here it is
+usually a bag of crops rather than one volume — several annotated chunks in one file, each
+keeping its own `voxel_offset` so `write` can place it back. A path names the container,
+not an array, so `info` lists every 3D+ dataset with its shape, chunking and offset, and
+`--dataset` selects one. With exactly one dataset it is found and nothing has to be said.
+
+`describe()` is the library form of all of this and returns the same picture — for a
+container, `datasets` listing every array with its own frame and `shape`/`meta` left
+`None`, since thirteen differently-shaped crops have no single answer. It is a **dict
+that shows itself**: `print(describe(f))` gives the table above, a bare `describe(f)` in
+a notebook cell renders it, and `describe(f).frame()` is a DataFrame — one row per
+dataset for a container, one per level for a volume, holding the numbers rather than the
+formatted strings. Subscripting is unchanged, and pandas is only needed for `.frame()`.
+
+Everything else that resolves an array (`create --like`, `align-bbox`, `convert`,
+`to-hdf5 --src`) needs exactly one, and each takes the dataset name where it can. If a
+file records no frame, `info` says which attribute names it looked for — `voxel_size`,
+`voxel_offset`, `offset`, `units`, `axes` — because "records no scale" and "spells it
+differently" look identical otherwise, and those names are parameters
+(`--voxel-size-field` / `--offset-field`) for exactly that reason.
+
+The ops that **rewrite a volume in place** — `downsample`, `relabel`, `mask-by-value`,
+`write`, `progress` — refuse a container and say so: one array in one container has no
+pyramid to rebuild, and no chunk objects whose presence answers "where is the data".
+Convert it into a volume first, or use `write` to place it *into* one.
 
 ### Putting a box on the grid
 

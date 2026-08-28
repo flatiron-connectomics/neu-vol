@@ -28,7 +28,6 @@ from __future__ import annotations
 import itertools
 import logging
 import math
-import os
 import time
 from typing import Any, Mapping, Sequence
 
@@ -36,60 +35,49 @@ import numpy as np
 
 from ..backends.base import Region, open_backend
 from ..source_metadata import (detect_backend, existing_levels, level_spec,
-                               read_level_voxel_sizes)
+                               location_spec, read_level_voxel_sizes,
+                               require_chunked_volume)
 from ._multiscale import DEFAULT_TASK_BYTES, _elapsed, plan_task_shape
 
 logger = logging.getLogger(__name__)
-
-_HDF5_EXTS = (".h5", ".hdf5", ".hdf", ".he5")
-_IMAGE_EXTS = (".tif", ".tiff", ".png")
 
 
 def source_spec(src: str | Mapping[str, Any], src_format: str | None = None,
                 dataset: str | None = None) -> dict[str, Any]:
     """A backend spec for ``src``, detecting the format when it is not given.
 
-    ``detect_backend`` only knows formats with a marker file (``info``,
-    ``zarr.json``), which is the right conservatism for ``convert`` — an HDF5 file
-    or a directory of PNGs is a *guess* from the name. Here the guess is worth
-    making: the inputs are files a person is pointing at one at a time, and a wrong
-    guess fails immediately and visibly on open rather than reading zeros.
+    Thin over ``source_metadata``'s two resolvers — :func:`~neu_vol.source_metadata.
+    detect_backend` for what the source is and :func:`~neu_vol.source_metadata.
+    location_spec` for the form its backend expects. It used to carry its own
+    name-based guessing for HDF5 files and image stacks, because detection knew only
+    the marker formats; detection knows both now, so the duplicate is gone and the two
+    cannot disagree about the same path.
+
+    What survives here is the *reason* the duplicate existed: this is where the
+    ``dataset`` of an HDF5 container and an explicit ``src_format`` are threaded
+    through, and where "I could not tell what this is" is phrased for someone pointing
+    at a single file.
 
     TODO: this does not resolve ``dvid://`` URLs, so `neu-vol write` and `neu-vol to-hdf5`
     cannot take a DVID source — only `convert` can. `to-hdf5` is the one worth fixing:
     it already has ``--level`` and ``--crop-bbox``, so taking a box straight out of DVID
     into an HDF5 piece would close the extract-annotate-write-back loop without anyone
     typing coordinates twice, and a DVID source only makes sense *with* a bbox anyway —
-    the whole instance is far too large for one file. The work is to route through
-    ``source_metadata.location_spec`` (which owns the three spec forms) while keeping
-    this function's more liberal guessing for the file cases, and to decide where the
-    DVID node options (``--dvid-locked`` / ``--dvid-supervoxels``) live on those
+    the whole instance is far too large for one file. Now that ``location_spec`` is the
+    only builder here, the work is to let a ``dvid://`` URL through and to decide where
+    the DVID node options (``--dvid-locked`` / ``--dvid-supervoxels``) live on those
     commands. Note the name clash: ``source_metadata.location_spec`` is the general
-    resolver; this ``source_spec`` is `write`'s own, more liberal one.
+    resolver; this ``source_spec`` is `write`'s own entry point to it.
     """
     if isinstance(src, Mapping):
         return dict(src)
     src = str(src)
-    if src_format == "hdf5" or (src_format is None and src.lower().endswith(_HDF5_EXTS)):
-        if dataset is None:
-            from ..backends.hdf5 import sole_dataset
-            dataset = sole_dataset(src)
-        return {"backend": "hdf5", "path": src, "dataset": dataset}
-    if src_format:
-        spec: dict[str, Any] = ({"backend": src_format, "source": src}
-                                if src_format == "image_stack"
-                                else {"backend": src_format, "path": src})
-        return spec
-    fmt = detect_backend(src)
-    if fmt is not None:
-        return {"backend": fmt, "path": src}
-    from glob import has_magic
-
-    if has_magic(src) or os.path.isdir(src) or src.lower().endswith(_IMAGE_EXTS):
-        return {"backend": "image_stack", "source": src}
-    raise ValueError(
-        f"could not tell what {src!r} is; pass src_format= "
-        f"(image_stack, hdf5, zarr3, neuroglancer_precomputed, ...)")
+    fmt = src_format or detect_backend(src)
+    if fmt is None:
+        raise ValueError(
+            f"could not tell what {src!r} is; pass src_format= "
+            f"(image_stack, hdf5, zarr3, neuroglancer_precomputed, ...)")
+    return location_spec(src, fmt, dataset=dataset)
 
 
 def resolve_offset(backend, offset, *, field: str, order: str | None, ndim: int):
@@ -244,6 +232,12 @@ def plan_subvolume_write(
     if fmt is None:
         raise FileNotFoundError(
             f"no volume found at {volume} — create one first with `neu-vol create`")
+    # The DESTINATION has to be a volume. Detection reaches HDF5 files and image stacks,
+    # and both are read-only here — `HDF5Backend.write_region` raises NotImplementedError
+    # and the stack backend refuses outright — so without this the piece is read, the
+    # geometry checked, and the failure arrives from the writer with nothing about which
+    # of the two arguments was wrong.
+    require_chunked_volume(fmt, volume, "neu-vol write")
 
     levels = existing_levels(volume, fmt)
     if level not in levels:

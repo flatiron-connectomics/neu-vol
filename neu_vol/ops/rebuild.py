@@ -21,7 +21,8 @@ import logging
 from typing import Any, Sequence
 
 from ..backends.base import open_backend
-from ..source_metadata import detect_backend, read_source_metadata
+from ..source_metadata import (detect_backend, read_source_metadata,
+                               require_chunked_volume)
 from ..location import default_progress_path
 from ..profiles import PROFILES
 from ._multiscale import materialize_multiscale
@@ -106,7 +107,12 @@ def rebuild_pyramid(
     fmt = detect_backend(dst)
     if fmt is None:
         raise ValueError(
-            f"could not detect a volume at {dst!r} (no info/zarr.json/.zarray)")
+            f"could not detect a volume at {dst!r} (no info / zarr.json / .zarray)")
+    # A pyramid is the thing being rebuilt, so a format that cannot have one is not a
+    # volume with a problem — it is the wrong argument. Said here rather than left to the
+    # schedule, which would otherwise plan levels for a single array and then fail on the
+    # first write.
+    require_chunked_volume(fmt, dst, "neu-vol downsample")
     spec = {"backend": fmt, "path": dst}
     meta = read_source_metadata(spec)
     if not meta and voxel_size is None:

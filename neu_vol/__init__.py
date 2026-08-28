@@ -18,6 +18,12 @@ from .volume import Volume
 from blockrun import Block, iter_blocks, block_map, idempotent
 from .backends.base import (ArrayBackend, clear_backend_cache, open_backend,
                             register_backend)
+# The one format-specific opener, and the reason it earns a top-level name: an HDF5 file
+# is a container, so "open this path" is ambiguous in a way it is not for a volume, and
+# `open_backend` deliberately stays spec-only (see `open_hdf5`'s own docstring). Costs
+# nothing at import: `backends/__init__` already imports this module, and h5py is loaded
+# lazily inside it.
+from .backends.hdf5 import open_hdf5
 from .retry import is_transient, with_retry
 from .profiles import StorageProfile, PROFILES, get_profile
 from .ops import (convert, create_volume, extract_roi, ingest_image_stack,
@@ -61,6 +67,7 @@ __all__ = [
     "write_subvolumes",
     "plan_subvolume_write",
     "pack_hdf5",
+    "open_hdf5",
     "mask_values",
     "describe",
     "describe_scales",

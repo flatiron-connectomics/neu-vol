@@ -1,9 +1,11 @@
 """Read coordinate metadata + the level-0 data location from a source volume.
 
 ``convert`` uses this so you don't have to re-specify ``voxel_size``/``offset``
-when the source already carries them (OME-NGFF zarr groups, precomputed ``info``).
-Any field the caller passes explicitly overrides what's read here. Sources
-without reliable metadata (image stacks, bare arrays, HDF5) return ``None``.
+when the source already carries them (OME-NGFF zarr groups, precomputed ``info``,
+and an HDF5 file that records its own frame — which is what ``neu-vol to-hdf5``
+writes). Any field the caller passes explicitly overrides what's read here. Sources
+that record nothing (image stacks, bare arrays, an HDF5 file with no frame attributes)
+return ``None``.
 
 Returned dict keys: ``data_spec`` (the array/scale spec to actually read),
 ``voxel_size``/``offset`` (canonical z,y,x), ``units``, ``spatial_axes``,
@@ -20,9 +22,12 @@ narrow question when the narrow answer will do.
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .location import join, spec_kvstore, to_kvstore
+
+if TYPE_CHECKING:                       # the class is imported inside `describe`, where
+    from .report import Description     # it is used, so the module stays import-light
 
 
 #: Precomputed written by CloudVolume, whose chunk keys carry a ``.gz`` suffix.
@@ -90,6 +95,15 @@ def precomputed_chunks_are_gzipped(location: str | Mapping[str, Any],
 #: directory holding both markers reads as precomputed.
 FORMAT_MARKERS = {"neuroglancer_precomputed": "info", "zarr3": "zarr.json"}
 
+#: Formats that are ONE array in ONE container: no pyramid, and no chunk keyspace to
+#: enumerate. Detection reaches them (see :func:`detect_file_backend`) so they can be
+#: *inspected* and *read*, but every op that rewrites a volume in place —
+#: ``downsample``, ``relabel``, ``mask-by-value``, ``write``, ``progress`` — needs the
+#: other kind and says so through :func:`require_chunked_volume`. Without that guard
+#: they fail deep inside an occupancy listing that finds no chunk keys, which reads as
+#: "this volume is empty" rather than "this is not that kind of volume".
+SINGLE_LEVEL_FORMATS = frozenset({"hdf5", "image_stack"})
+
 
 def other_format_markers(location: str | Mapping[str, Any], fmt: str) -> list[str]:
     """Markers of volume formats *other* than ``fmt`` already present at ``location``.
@@ -102,8 +116,11 @@ def other_format_markers(location: str | Mapping[str, Any], fmt: str) -> list[st
     """
     # A DVID instance has no keyspace to shadow: the question this answers — "is there
     # a second volume of another format underneath this one" — cannot arise, and asking
-    # it would mean reading `dvid://...` as a local path.
-    if fmt == "dvid":
+    # it would mean reading `dvid://...` as a local path. Nor does a single container:
+    # an HDF5 file is a file, and probing `piece.h5/info` is two reads that can only
+    # miss. An image stack's directory *could* hold a marker, but then detection would
+    # have returned that format instead, so there is nothing left to shadow.
+    if fmt == "dvid" or fmt in SINGLE_LEVEL_FORMATS:
         return []
     kv = to_kvstore(location)
     if "path" in kv and not str(kv["path"]).endswith("/"):
@@ -112,6 +129,72 @@ def other_format_markers(location: str | Mapping[str, Any], fmt: str) -> list[st
         else fmt
     return [marker for f, marker in FORMAT_MARKERS.items()
             if f != fmt and _read_key(kv, marker) is not None]
+
+
+def detect_file_backend(location: str | Mapping[str, Any]) -> str | None:
+    """``hdf5`` or ``image_stack`` for a local file, glob or directory of slices.
+
+    These two have **no marker object**, so they cannot be detected the way the store
+    formats are: HDF5's signature is inside the file, and a stack of PNGs is a directory
+    with nothing in it that says so. What is left is the name plus one ``stat`` — which
+    is why this runs *last*, after every marker probe has missed, and why it is
+    deliberately narrow:
+
+    * a **glob** is an image stack and nothing else — no other format is ever addressed
+      with one;
+    * a **file** is judged by extension, and only the two known sets count. An unknown
+      extension returns ``None`` rather than being guessed at;
+    * a **directory** must actually contain a slice. "Any directory is an image stack"
+      is what ``ops/write.py`` used to assume, and it turns every typo into a stack whose
+      reader then reports "no image files matched" — so the listing is the evidence, and
+      an empty or unrelated directory is still ``None``.
+
+    **Local paths only.** Neither reader has an object-store driver — h5py has none at
+    all, and the stack reader globs the filesystem — so detecting either on ``s3://``
+    would name a backend that cannot open it. The probes are also ``os.stat`` calls,
+    which is why the locality test comes first rather than being a detail of the readers.
+    """
+    import os
+    from glob import has_magic
+
+    from .backends.hdf5 import HDF5_EXTENSIONS
+    from .backends.imagestack import IMAGE_EXTENSIONS
+    from .location import is_local, local_path
+
+    if not is_local(location):
+        return None
+    path = local_path(location).rstrip("/")
+    if not path:
+        return None
+    if has_magic(path):
+        return "image_stack"
+    if os.path.isfile(path):
+        low = path.lower()
+        if low.endswith(HDF5_EXTENSIONS):
+            return "hdf5"
+        if low.endswith(IMAGE_EXTENSIONS):
+            return "image_stack"      # a single multipage TIFF is a stack
+        return None
+    if not os.path.isdir(path):
+        return None
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return None
+    found = {os.path.splitext(n)[1].lower() for n in names} & set(IMAGE_EXTENSIONS)
+    if not found:
+        return None
+    if len(found) > 1:
+        # The reader takes every slice extension it knows and sorts them together, so a
+        # mixed directory interleaves two stacks into one volume. It is a legal thing to
+        # ask for and almost never what anyone means, and nothing later can see it.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "%s holds slices of more than one type (%s); they will be read as ONE stack, "
+            "sorted together. If they are two stacks, point at a glob of one of them",
+            path, ", ".join(sorted(found)))
+    return "image_stack"
 
 
 def detect_backend(location: str | Mapping[str, Any]) -> str | None:
@@ -123,6 +206,12 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
 
     Precomputed whose chunks are ``.gz``-suffixed reports :data:`PRECOMPUTED_GZ`
     instead, so callers fail loudly rather than reading zeros.
+
+    **A marker always wins.** The two container formats — ``hdf5`` and ``image_stack``
+    — have no marker to probe for and are recognised from the name by
+    :func:`detect_file_backend`, which runs only after every marker probe has missed. So
+    a directory holding both an ``info`` and a stray TIFF is still precomputed, and the
+    order cannot be reversed by adding a file.
     """
     # DVID is decided by scheme, BEFORE `to_kvstore`, because it is not a store at all:
     # `to_kvstore` would read `dvid://server/uuid/instance` as a *local file path*,
@@ -156,7 +245,10 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
         return "zarr3"
     if _read_key(kv, ".zarray") is not None or _read_key(kv, ".zgroup") is not None:
         return "zarr2"
-    return None
+    # `location`, not `kv`: the trailing slash added above makes an ordinary file path
+    # fail every `os.path.isfile` test, and a spec's own kvstore has already been
+    # normalised past the form the filesystem answers about.
+    return detect_file_backend(location)
 
 
 def _kvstore_of(spec: Mapping[str, Any], *, trailing_slash: bool = True) -> dict[str, Any]:
@@ -180,23 +272,35 @@ def _read_key(kvstore: Mapping[str, Any], key: str) -> bytes | None:
     return read_bytes(dict(kvstore), key)
 
 
-def location_spec(location: str, fmt: str) -> dict[str, Any]:
+def location_spec(location: str, fmt: str, *,
+                  dataset: str | None = None) -> dict[str, Any]:
     """The backend spec addressing ``location``, in the form ``fmt`` expects.
 
-    Three forms, because not every source is a store: most take ``path``, an image
-    stack takes ``source`` (a directory or glob), and DVID takes
+    Four forms, because not every source is a store: most take ``path``, an image
+    stack takes ``source`` (a directory or glob), HDF5 takes ``path`` plus the
+    ``dataset`` inside the container, and DVID takes
     ``server``/``uuid``/``instance``. Everything that turns a user-supplied location
     into a spec goes through here, so a new non-store backend is one branch rather
     than a search for every place that wrote ``{"backend": fmt, "path": ...}``.
+
+    ``dataset`` names the array inside an HDF5 file and is resolved by
+    :func:`~neu_vol.backends.hdf5.sole_dataset` when it is not given — which answers
+    only when the file holds exactly one candidate and otherwise raises listing them.
+    That is deliberate: a container is ambiguous in a way a path is not, and guessing
+    which array someone meant is worse than asking. Ignored for every other format.
     """
     if fmt == "dvid":
         from .dvid import parse_url
 
         return {"backend": fmt, **parse_url(location)}
-    # The image-stack backend is never auto-detected — a directory of PNGs looks like
-    # any other directory — so it only arrives here when asked for by name.
     if fmt == "image_stack":
         return {"backend": fmt, "source": location}
+    if fmt == "hdf5":
+        if dataset is None:
+            from .backends.hdf5 import sole_dataset
+
+            dataset = sole_dataset(location)
+        return {"backend": fmt, "path": location, "dataset": dataset}
     return {"backend": fmt, "path": location}
 
 
@@ -212,6 +316,11 @@ def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
     # image/segmentation distinction that decides mean vs mode downsampling.
     if backend in ("neuroglancer_precomputed", PRECOMPUTED_GZ):
         return _read_precomputed(spec)
+    if backend == "hdf5":
+        return _read_hdf5(spec)
+    # An image stack records no physical scale at all — an image file has pixels and
+    # nothing else — so there is genuinely nothing to read, and `convert` asking for
+    # --voxel-size is the correct outcome rather than a shortcoming.
     return None
 
 
@@ -247,6 +356,14 @@ def read_level_voxel_sizes(spec: Mapping[str, Any]) -> list[tuple[float, ...]] |
         scales = json.loads(raw)["scales"]
         ordered = sorted(scales, key=lambda s: tuple(s["resolution"]))
         return [tuple(float(v) for v in s["resolution"][::-1]) for s in ordered]
+    if backend == "hdf5":
+        # One level, and it is the file's own. Returned as a list of one so a caller
+        # asking "what does level N measure" gets the same shape of answer for every
+        # format — and so `--bbox-scale 2` against an HDF5 piece reports "the source
+        # records only 1 level(s)" rather than "records none", which is a different
+        # and misleading complaint.
+        meta = _read_hdf5(spec)
+        return [tuple(meta["voxel_size"])] if meta else None
     if backend == "zarr3":
         raw = _read_key(_kvstore_of(spec), "zarr.json")
         if raw is None:
@@ -294,6 +411,87 @@ def _read_zarr_ome(spec: Mapping[str, Any]) -> dict | None:
         # The multiscales "type" is the downsampling method; we write `kind` there,
         # but another writer may put something else, so only trust our own values.
         "kind": ms.get("type") if ms.get("type") in ("image", "segmentation") else None,
+    }
+
+
+def _read_hdf5(spec: Mapping[str, Any]) -> dict | None:
+    """The frame an HDF5 file records about itself, or ``None`` if it records none.
+
+    An HDF5 file is a container, not a format with a metadata document, so there is no
+    ``info`` to read — the numbers live in attributes beside the array, and
+    ``HDF5Backend.stored_*`` is what finds them (dataset attributes, then the root
+    group's, then a top-level dataset of that name; writers use all three).
+    ``neu-vol to-hdf5`` writes ``voxel_size``, ``units``, ``axes`` and ``voxel_offset``,
+    so a file this package packed round-trips through ``neu-vol info``, ``create --like``
+    and ``convert`` without anyone retyping a coordinate.
+
+    **``voxel_size`` is the gate.** Without it there is no frame — an offset in voxels
+    means nothing physical and ``units`` describes numbers that are not there — so the
+    whole dict is withheld rather than half-filled, which is what keeps ``convert``'s
+    "voxel_size is required" the honest answer for a bare array.
+
+    **The axis order is read, never assumed, and an uninterpretable one raises.** The
+    field name ``voxel_offset`` is precomputed's, where it means *xyz*, while everything
+    in this package is zyx — so the numbers alone cannot say. A recorded ``axes``
+    settles it; nothing recorded falls back to zyx, which is what the reader already
+    assumes of the array itself, and warns when the fallback could matter (an
+    anisotropic vector is a different volume reversed; an isotropic one is not). An
+    ``axes`` that is neither order is refused outright: it is a *stated* fact that this
+    cannot honour, and quietly substituting zyx for it would mirror the data through the
+    z=x diagonal with nothing downstream able to tell.
+    """
+    import logging
+
+    from .backends.base import open_backend
+
+    backend = open_backend(dict(spec))
+    size = backend.stored_voxel_size(spec.get("voxel_size_field", "voxel_size"))
+    if not size:
+        return None
+    log = logging.getLogger(__name__)
+
+    stated = backend.stored_axes()
+    if stated and stated[0] not in ("zyx", "xyz"):
+        raise ValueError(
+            f"{spec.get('path')} records axes {stated[0]!r} ({stated[1]}), which is "
+            f"neither 'zyx' nor 'xyz', so nothing here can say which way round its "
+            f"voxel_size and voxel_offset are. Fix the attribute, or read the file with "
+            f"an explicit spec")
+    order = stated[0] if stated else "zyx"
+
+    voxel_size = tuple(float(v) for v in size[0])
+    if not stated and voxel_size != voxel_size[::-1]:
+        log.warning(
+            "%s records voxel_size %s but no `axes`, so it is read as zyx (this "
+            "package's convention). Reversed it would be %s — a different volume. "
+            "`neu-vol to-hdf5` records `axes`; add one to remove the doubt",
+            spec.get("path"), voxel_size, voxel_size[::-1])
+    if order == "xyz":
+        voxel_size = voxel_size[::-1]
+
+    found = backend.stored_offset(spec.get("offset_field", "voxel_offset"))
+    voxel_offset = tuple(int(v) for v in found[0]) if found else (0,) * len(voxel_size)
+    if found and order == "xyz":
+        voxel_offset = voxel_offset[::-1]
+
+    units = backend.stored_units()
+    shape = tuple(int(s) for s in backend.shape)
+    axes = tuple(order)
+    return {
+        # The spec as given: an HDF5 dataset IS the array, so there is no level or scale
+        # to descend into, and `data_spec` carries the resolved `dataset` through the
+        # same way every other reader carries the caller's backend (invariant 9).
+        "data_spec": dict(spec),
+        "voxel_size": voxel_size,
+        "offset": tuple(float(o) * v for o, v in zip(voxel_offset, voxel_size)),
+        "voxel_offset": voxel_offset,
+        "units": units[0] if units else None,
+        "spatial_axes": axes,
+        "has_channels": len(shape) > len(axes),
+        # An HDF5 file has nowhere agreed-on to say image or segmentation, and guessing
+        # is the one that averages label ids into ids that were never in the data. So it
+        # stays unrecorded and `convert --kind` is required to say.
+        "kind": None,
     }
 
 
@@ -398,14 +596,53 @@ def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
 # expensive part (see the module docstring). `info`, `downsample`, `create --like`
 # and `write` all go through here, so none of them can disagree about what is on disk.
 # --------------------------------------------------------------------------- #
-def level_spec(volume: str, fmt: str, level: int) -> dict[str, Any]:
+def require_chunked_volume(fmt: str, location: str, op: str) -> str:
+    """``fmt`` if it is a chunked multiscale volume; a useful error if it is not.
+
+    Detection now reaches HDF5 files and image stacks (:func:`detect_file_backend`), so
+    an op that rewrites a volume in place can be handed one — and every such op finds
+    out the same confusing way, deep inside an occupancy listing that finds no chunk
+    keys and reports the volume as holding no data. The formats are not deficient
+    volumes, they are a different thing: one array in one container, with no pyramid to
+    downsample and no keyspace whose contents answer "where is the data".
+
+    Called by the ops that *write*; the read-only ones (``info``, ``align-bbox``,
+    ``create --like``, ``convert``, ``to-hdf5``) deliberately do not, since inspecting
+    and reading these is the whole point of detecting them.
+    """
+    if fmt in SINGLE_LEVEL_FORMATS:
+        raise ValueError(
+            f"`{op}` needs a chunked multiscale volume (zarr or neuroglancer-"
+            f"precomputed), and {location} is {fmt}: one array in one container, with no "
+            f"pyramid and no chunk objects to count. Convert it into a volume first — "
+            f"`neu-vol convert {location} <dst> --voxel-size z,y,x` — and run `{op}` on "
+            f"that. To go the other way, `neu-vol write` places an HDF5 piece INTO a "
+            f"volume.")
+    return fmt
+
+
+def level_spec(volume: str, fmt: str, level: int,
+               *, dataset: str | None = None) -> dict[str, Any]:
     """The backend spec for one level of a multiscale volume.
 
     The two formats address a level differently: zarr v3 puts each level in its own
     subdirectory, while precomputed keeps every scale under one ``info`` and selects
     with ``scale_index``. Everything that opens a level goes through here rather than
     building the path itself.
+
+    A single-container format has exactly one level and any other is an **error**, not
+    a level that happens to be missing. That matters because the specs are permissive:
+    ``HDF5Backend`` ignores a key it does not know, so a spec carrying ``scale_index=7``
+    opened level 0 and reported it as level 7 — which made :func:`existing_levels` probe
+    twelve levels, open the same array twelve times, and report a one-level file as a
+    twelve-level pyramid of identical shapes.
     """
+    if fmt in SINGLE_LEVEL_FORMATS:
+        if int(level) != 0:
+            raise ValueError(
+                f"{volume} is {fmt}, which is a single array and has only level 0; "
+                f"level {level} does not exist")
+        return location_spec(volume, fmt, dataset=dataset)
     if fmt == "zarr3":
         return {"backend": fmt, "path": f"{volume.rstrip('/')}/{level}"}
     if fmt == "dvid":
@@ -415,36 +652,124 @@ def level_spec(volume: str, fmt: str, level: int) -> dict[str, Any]:
     return {"backend": fmt, "path": volume, "scale_index": int(level)}
 
 
-def describe(volume: str) -> dict:
+def describe(volume: str, *, dataset: str | None = None) -> "Description":
     """Detected format, coordinate metadata and the levels actually present.
+
+    Returns a :class:`~neu_vol.report.Description`, which **is** a dict — subscript it as
+    before — that additionally renders itself as the table ``neu-vol info`` prints, so
+    ``print(describe(v))`` in a notebook is legible and ``describe(v).frame()`` is a
+    DataFrame of the per-level (or per-dataset) rows.
+
+    Works for every format detection reaches, which includes an HDF5 file and a
+    directory or glob of 2D slices. Those have one level and may record no coordinate
+    metadata at all, so ``meta`` is ``None`` and ``level_voxel_sizes`` empty for them —
+    ``shape`` and ``dtype`` come from opening the array itself.
+
+    **An HDF5 file may be a CONTAINER of several arrays, and that is described too.** A
+    bag of annotated crops, each keeping its own ``voxel_offset`` so it can be placed
+    back, is what an HDF5 file here usually is — so refusing to describe one until a
+    ``dataset`` is named would refuse exactly the file you run this on to *find out* the
+    names. Instead:
+
+    * ``datasets`` is ``{name: {"shape", "dtype", "chunks", <recorded frame>}}`` for
+      every HDF5 file, however many it holds, and ``None`` for other formats. Frame
+      values there are **as recorded**, each with its own ``axes``;
+    * ``dataset`` is the array the rest of the dict describes, or ``None``;
+    * with one candidate — or with ``dataset`` given — that array is resolved and every
+      field is filled as usual;
+    * with several and none named, ``shape`` / ``dtype`` / ``meta`` / ``level_voxel_sizes``
+      are ``None`` and ``levels`` is empty, because thirteen differently-shaped arrays
+      have no single answer to any of them. Callers that need one array should say so
+      through :func:`require_one_array`, which names the datasets and how to choose.
 
     Raises ``FileNotFoundError`` if nothing at ``volume`` looks like a volume.
     """
     from .backends.base import open_backend
+    from .report import Description
 
     fmt = detect_backend(volume)
     if fmt is None:
         raise FileNotFoundError(f"no volume found at {volume}")
-    spec = location_spec(volume, fmt)
+
+    entries = None
+    if fmt == "hdf5":
+        from .backends.hdf5 import describe_datasets
+
+        entries = describe_datasets(volume)
+        if not entries:
+            raise FileNotFoundError(f"{volume} contains no 3D+ dataset")
+        if dataset is None and len(entries) > 1:
+            # Everything below needs ONE array. Reported rather than raised: the listing
+            # is the useful answer here, and it is the only way to learn the names.
+            return Description(
+                location=volume, format=fmt, meta=None, shape=None, dtype=None,
+                has_channels=False, level_voxel_sizes=None, levels={},
+                spec={"backend": fmt, "path": volume},
+                dataset=None, datasets=entries, other_markers=[])
+
+    spec = location_spec(volume, fmt, dataset=dataset)
     meta = read_source_metadata(spec)
     level0 = open_backend(meta["data_spec"] if meta else spec)
     shape = tuple(int(s) for s in level0.shape)
-    return {"format": fmt, "meta": meta, "shape": shape,
-            "dtype": str(getattr(level0, "dtype", "?")),
-            "has_channels": bool(meta["has_channels"]) if meta else False,
-            "level_voxel_sizes": read_level_voxel_sizes(spec),
-            "levels": existing_levels(volume, fmt),
-            # One extra small read, against several array opens — worth it to notice
-            # a second volume shadowed underneath this one.
-            "other_markers": other_format_markers(volume, fmt)}
+    # A single-container format's one level IS `meta`, so it is reused rather than read
+    # again: `read_level_voxel_sizes` would reopen the file and re-emit any warning the
+    # first read already made (an HDF5 file recording no `axes` warns about the zyx
+    # fallback, and hearing it twice reads as two problems).
+    if fmt in SINGLE_LEVEL_FORMATS:
+        per_level = [tuple(meta["voxel_size"])] if meta else None
+    else:
+        per_level = read_level_voxel_sizes(spec)
+    return Description(
+        # What was described. Carried so the result can render its own first line, and
+        # so a caller holding one no longer has to remember what it asked about.
+        location=volume,
+        format=fmt, meta=meta, shape=shape,
+        dtype=str(getattr(level0, "dtype", "?")),
+        has_channels=bool(meta["has_channels"]) if meta else False,
+        level_voxel_sizes=per_level,
+        levels=existing_levels(volume, fmt, dataset=dataset),
+        # The resolved spec, so a caller that has already paid for the detection can
+        # read the volume without repeating it — and so `info` can say WHICH dataset
+        # of an HDF5 container it just described.
+        spec=spec,
+        dataset=spec.get("dataset"),
+        datasets=entries,
+        # One extra small read, against several array opens — worth it to notice
+        # a second volume shadowed underneath this one.
+        other_markers=other_format_markers(volume, fmt))
 
 
-def existing_levels(volume: str, fmt: str, probe: int = 12) -> dict[int, dict]:
+def require_one_array(described: Mapping[str, Any], location: str, op: str) -> dict:
+    """``described`` if it resolved a single array; a useful error if it did not.
+
+    :func:`describe` describes a multi-array HDF5 container rather than refusing to look
+    at one, which means ``shape`` / ``dtype`` / ``meta`` can legitimately be ``None``.
+    Anything that goes on to *read* the array has to say so, or it hits a ``TypeError``
+    on ``None`` somewhere in its own arithmetic — which says nothing about the container.
+    """
+    if described.get("shape") is not None:
+        # The same object, not a copy: it is a `Description`, and copying it into a plain
+        # dict would take the rendering off a value a caller may still want to print.
+        return described
+    listed = ", ".join(sorted(described.get("datasets") or ()))
+    raise ValueError(
+        f"`{op}` needs one array and {location} is a container of "
+        f"{len(described.get('datasets') or ())}: {listed}. `neu-vol info {location}` "
+        f"lists them with their shapes and offsets; pass --dataset where the command "
+        f"takes one, or point at a file holding a single array.")
+
+
+def existing_levels(volume: str, fmt: str, probe: int = 12,
+                    *, dataset: str | None = None) -> dict[int, dict]:
     """``{level: {"shape", "chunks", "read_chunks"}}`` for the levels that open.
 
     Probes upward until one misses. The multiscale group metadata is written at the
     very end of a conversion, so an in-flight volume has levels but no group metadata
     — probing is what makes this work on a run that is still going.
+
+    A single-container format is not probed at all: it has one level by construction,
+    and :func:`level_spec` refuses any other, so the loop below would stop after one
+    iteration anyway — ``probe`` just stops being a number of store opens.
 
     Chunking is **per level**, not a property of the volume: it lives in each level's
     own array metadata (zarr's ``zarr.json``, precomputed's per-scale ``chunk_sizes``),
@@ -459,9 +784,9 @@ def existing_levels(volume: str, fmt: str, probe: int = 12) -> dict[int, dict]:
     from .backends.base import open_backend
 
     out: dict[int, dict] = {}
-    for i in range(probe):
+    for i in range(1 if fmt in SINGLE_LEVEL_FORMATS else probe):
         try:
-            be = open_backend(level_spec(volume, fmt, i))
+            be = open_backend(level_spec(volume, fmt, i, dataset=dataset))
             shape = tuple(int(s) for s in be.shape)
         except Exception:
             break

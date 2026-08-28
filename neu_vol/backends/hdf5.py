@@ -10,6 +10,15 @@ answered here: :func:`sole_dataset` picks the dataset when there is exactly one,
 :meth:`HDF5Backend.stored_offset` reads a voxel offset the writer recorded beside the
 array. The second is an **optional** backend capability — ``ops/write.py`` asks any
 backend for it and does not care that only this one answers today.
+
+``stored_offset`` / ``stored_voxel_size`` / ``stored_axes`` / ``stored_units`` are the
+four of those, and together they are what makes an HDF5 file describable:
+``source_metadata.read_source_metadata`` composes them into the same coordinate-metadata
+dict a precomputed ``info`` or an OME group yields, so ``neu-vol info`` and ``create
+--like`` work on a file this package packed. They are read strictly — an axis order the
+file states but nobody can interpret is an error, never a guess — because getting the
+order wrong places the data mirrored through the z=x diagonal and nothing downstream can
+tell.
 """
 
 from __future__ import annotations
@@ -21,6 +30,12 @@ import numpy as np
 from .base import Region, register_backend
 
 TAG = "hdf5"
+
+#: Extensions that name an HDF5 container. Public because it is the *detection*
+#: vocabulary too: HDF5 has no marker object to probe for — the format signature is
+#: inside the file — so ``source_metadata.detect_file_backend`` goes by the name, and the
+#: two lists must not drift.
+HDF5_EXTENSIONS = (".h5", ".hdf5", ".hdf", ".he5")
 
 
 def _as_offset(value: Any, where: str) -> tuple[int, ...]:
@@ -86,20 +101,129 @@ def datasets(path: str, *, min_ndim: int = 3) -> list[str]:
     return found
 
 
+#: The attribute names read as a frame, and what each one means. Reported when a file
+#: records none, because "no coordinate metadata" and "this file spells it differently"
+#: look identical otherwise, and the field names are parameters everywhere else
+#: (``voxel_size_field`` / ``offset_field``) precisely because another writer's choice is
+#: not this package's to assume.
+FRAME_ATTRIBUTES = {
+    "voxel_size": "physical size of one voxel, in `units`",
+    "voxel_offset": "where this array starts, in whole voxels",
+    "offset": "the same origin in physical units",
+    "units": "what `voxel_size` is measured in (this suite works in nm)",
+    "axes": "the axis order of the three vectors above ('zyx' or 'xyz')",
+}
+
+
+def describe_datasets(path: str, *, min_ndim: int = 3) -> dict[str, dict]:
+    """Every volumetric dataset in the file, with its geometry and recorded frame.
+
+    ``{name: {"shape", "dtype", "chunks", "ndim", <frame attributes>}}``, in file order,
+    from **one** file open — attributes only, so it is cheap however large the arrays are.
+
+    This is the *container's* answer, and it exists because an HDF5 file is not usually
+    one volume: a bag of ground-truth crops, each with its own ``voxel_offset``, is the
+    ordinary shape of one here, and asking a 13-piece file to name its "sole dataset" can
+    only fail. :func:`~neu_vol.source_metadata.describe` still describes one array —
+    everything downstream of it needs exactly one — so this is what ``neu-vol info``
+    falls back to in order to say *which* arrays there are to choose from.
+
+    Frame values come back **exactly as recorded**, not reoriented into zyx: each entry
+    carries its own ``axes``, and normalising here would mean either dropping that column
+    or silently disagreeing with it. The single-array path
+    (``source_metadata._read_hdf5``) is where the reorientation happens, and it is strict
+    there. Values fall back to the root group's, which is where a file-wide
+    ``voxel_size``/``units`` usually lives.
+    """
+    import h5py
+
+    out: dict[str, dict] = {}
+    with h5py.File(require_local_path(path), "r") as f:
+        root = {k: v for k, v in f.attrs.items() if k in FRAME_ATTRIBUTES}
+
+        def visit(name, obj):
+            if not isinstance(obj, h5py.Dataset) or obj.ndim < min_ndim:
+                return
+            entry = {"shape": tuple(int(s) for s in obj.shape),
+                     "dtype": str(obj.dtype),
+                     "chunks": tuple(int(c) for c in obj.chunks) if obj.chunks else None,
+                     "ndim": int(obj.ndim)}
+            for key in FRAME_ATTRIBUTES:
+                if key in obj.attrs:
+                    value = obj.attrs[key]
+                elif key in root:
+                    value = root[key]
+                else:
+                    continue
+                if key in ("units", "axes"):
+                    entry[key] = (axes_string(value) if key == "axes"
+                                  else (value.decode() if isinstance(value, bytes)
+                                        else str(value)))
+                else:
+                    entry[key] = tuple(float(v) for v in np.asarray(value).ravel())
+            out["/" + name] = entry
+
+        f.visititems(visit)
+    return out
+
+
 def sole_dataset(path: str) -> str:
     """The file's one volumetric dataset, for callers that did not name one.
 
     HDF5 is a container, not an array, so a path alone is ambiguous. Guessing wrongly
     is worse than asking — so this only answers when there is exactly one candidate,
-    and otherwise raises listing what it found.
+    and otherwise raises listing what it found. A bag of ground-truth crops in one file
+    is the ordinary case, not an edge one, so the error says how to choose: `neu-vol
+    info` lists them with their shapes and offsets, and every command that reads an HDF5
+    array takes the name.
     """
     found = datasets(path)
     if len(found) == 1:
         return found[0]
     if not found:
         raise KeyError(f"{path} contains no 3D+ dataset")
-    raise KeyError(f"{path} contains {len(found)} datasets ({', '.join(sorted(found))}); "
-                   f"say which one")
+    listed = ", ".join(sorted(found))
+    raise KeyError(
+        f"{path} contains {len(found)} volumetric datasets ({listed}); say which one — "
+        f"`neu-vol info {path}` lists them with their shapes and offsets, then pass "
+        f"dataset= (`open_hdf5`, `describe`), "
+        f"--dataset (`info`), --dataset (`write`), --src-dataset (`to-hdf5`), or "
+        f"'dataset' in a backend spec")
+
+
+def open_hdf5(path: str, dataset: str | None = None) -> "HDF5Backend":
+    """One dataset of an HDF5 file, ready to read regions from.
+
+    The front door for a file you are pointing at by hand::
+
+        be = open_hdf5("piece.h5")                      # one dataset: found
+        be = open_hdf5("gt_v1_eval.h5", "/z07901")      # a container: name it
+        be.read_region((slice(0, 64), slice(0, 64), slice(0, 64)))
+
+    ``dataset`` is optional only when the file holds exactly one 3D+ array; with several
+    it is **required**, and the error lists them (:func:`sole_dataset`). That is not
+    strictness for its own sake — a bag of annotated crops in one file is the ordinary
+    arrangement here, and picking one of thirteen on the caller's behalf would be
+    picking the wrong one twelve times out of thirteen.
+
+    **Deliberately not a general "open anything" helper**, and deliberately not folded
+    into :func:`~neu_vol.backends.base.open_backend`. The format is in the name, so this
+    needs no detection at all — no marker probes, no store reads. ``open_backend`` stays
+    what its docstring says it is: the spec-driven primitive a per-block dask task
+    reopens on a worker, thousands of times a run, with the reader named rather than
+    inferred (CLAUDE.md invariant 9). To *find out* what something is, use
+    :func:`~neu_vol.source_metadata.describe`.
+
+    Goes through ``open_backend`` rather than constructing the backend directly, so the
+    handle joins the per-process cache: an ``HDF5Backend`` holds an open ``h5py.File``,
+    and two calls for one array should not mean two file handles.
+    """
+    from .base import open_backend
+
+    path = require_local_path(path)
+    return open_backend({"backend": TAG, "path": path,
+                         "dataset": dataset if dataset is not None
+                         else sole_dataset(path)})
 
 
 class HDF5Backend:
@@ -194,6 +318,23 @@ class HDF5Backend:
                              (self._file.attrs, f"/.attrs[{name!r}]")):
             if name in attrs:
                 return axes_string(attrs[name]), where
+        return None
+
+    def stored_units(self, name: str = "units"):
+        """The physical unit the writer recorded, as ``(unit, where)``, or ``None``.
+
+        Attributes only, dataset before root — a unit is a string, so the
+        top-level-dataset fallback the other three readers have would be a 1-element
+        string array nobody writes. ``neu-vol to-hdf5`` records it beside
+        ``voxel_size``, which is the pairing that makes those numbers mean anything:
+        the rest of the suite works in nm, and a file whose voxel size is in
+        micrometres is off by a thousand with nothing to show for it.
+        """
+        for attrs, where in ((self._dset.attrs, f"{self._dataset}.attrs[{name!r}]"),
+                             (self._file.attrs, f"/.attrs[{name!r}]")):
+            if name in attrs:
+                value = attrs[name]
+                return (value.decode() if isinstance(value, bytes) else str(value)), where
         return None
 
     def read_region(self, region: Region) -> np.ndarray:

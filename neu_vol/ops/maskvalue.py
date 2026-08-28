@@ -42,7 +42,8 @@ import numpy as np
 from blockrun import iter_blocks
 
 from ..backends.base import open_backend
-from ..source_metadata import detect_backend, existing_levels, level_spec
+from ..source_metadata import (detect_backend, existing_levels, level_spec,
+                               require_chunked_volume)
 from .annotate import labeled_regions
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,7 @@ def plan_mask_values(volume: str, values: Sequence[int], *, out: str | None = No
     fmt = detect_backend(volume)
     if fmt is None:
         raise FileNotFoundError(f"no volume found at {volume}")
+    require_chunked_volume(fmt, volume, "neu-vol mask-by-value")
     levels = existing_levels(volume, fmt)
     if level not in levels:
         raise ValueError(f"{volume} has no level {level}; present: {sorted(levels)}")

@@ -32,7 +32,8 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..location import list_keys, read_json
-from ..source_metadata import PRECOMPUTED_GZ, detect_backend, existing_levels, level_spec
+from ..source_metadata import (PRECOMPUTED_GZ, detect_backend, existing_levels,
+                               level_spec, require_chunked_volume)
 
 #: Documents that sit beside a zarr array's chunks and are not chunks. v3 writes
 #: ``zarr.json``; the v2 names appear on volumes read through the same driver.
@@ -197,6 +198,11 @@ def labeled_regions(volume: str, *, level: int = 0, tighten_level: int | None = 
     fmt = fmt or detect_backend(volume)
     if fmt is None:
         raise FileNotFoundError(f"no volume found at {volume}")
+    # Occupancy IS chunk presence — an all-fill chunk is never written, which is what
+    # makes the answer exact — so a format with no chunk keyspace cannot answer at all.
+    # Without this the precomputed branch of `occupied_cells` reads an `info` that is not
+    # there and reports "has no scale 0", which reads as a broken volume.
+    require_chunked_volume(fmt, volume, "occupancy analysis")
     # Only the chunk KEYS differ between the two precomputed flavours, and level
     # geometry comes from `info`, which is the same document either way.
     open_fmt = "neuroglancer_precomputed" if fmt == PRECOMPUTED_GZ else fmt

@@ -40,7 +40,8 @@ from ..ngff import (build_dataset, build_multiscales_attrs, ome_unit,
 from ..profiles import (StorageProfile, get_profile, precomputed_create_spec,
                         zarr3_create_spec)
 from ..pyramid import downsample_schedule, level_scale_translation
-from ..source_metadata import describe, existing_levels, other_format_markers
+from ..source_metadata import (describe, existing_levels, other_format_markers,
+                               require_one_array)
 
 logger = logging.getLogger(__name__)
 
@@ -135,12 +136,22 @@ def profile_for(format: str | None, ref: dict | None, dst: str) -> str:
     precomputed frame and silently getting zarr is the sort of thing you only discover
     when the viewer cannot open the result. With neither, zarr v3.
 
+    A reference in a format this cannot *write* — ``--like`` an HDF5 file or an image
+    stack, both of which detection reaches now — falls back to zarr rather than
+    erroring: "like this" is a request to mirror the frame, and there is no HDF5 volume
+    format to produce. Only an explicit ``format`` that is unwritable is an error, since
+    that one was asked for.
+
     Shared with the CLI so `--format` cannot come to mean something different there.
     """
     fmt = str(format or (ref["format"] if ref else "zarr"))
     if fmt.startswith("neuroglancer_precomputed") or fmt == "precomputed":
         return "local-neuroglancer" if is_local(dst) else "s3-neuroglancer"
     if fmt.startswith("zarr"):
+        return "local"
+    if format is None:
+        logger.info("the reference is %s, which is not a volume format this can write; "
+                    "creating zarr. Pass format= to choose", fmt)
         return "local"
     raise ValueError(f"unknown format {format!r}; use 'zarr' or 'precomputed'")
 
@@ -196,6 +207,11 @@ def plan_volume(
     ``compressed_segmentation_block_size`` apply to precomputed only.
     """
     ref = describe(like) if like else None
+    if ref is not None:
+        # `describe` describes a multi-array HDF5 container by resolving no array, so
+        # `ref["shape"]` can be None — and `_spatial` would then raise a TypeError that
+        # says nothing about the container or how to pick from it.
+        ref = require_one_array(ref, str(like), "create --like")
     prof = get_profile(profile if profile is not None
                        else profile_for(format, ref, dst))
     precomputed = prof.format == "neuroglancer_precomputed"

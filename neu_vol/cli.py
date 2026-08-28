@@ -255,17 +255,31 @@ from neu_vol.source_metadata import (describe, existing_levels,  # noqa: E402
                                              level_spec)
 
 
-def _describe(volume: str) -> dict:
+def _describe(volume: str, dataset: str | None = None) -> dict:
     """``describe`` with a missing or unaddressable volume turned into a clean CLI exit.
 
     ``ValueError`` is caught alongside ``FileNotFoundError`` because a location can now
     be malformed rather than merely absent: a ``dvid://`` URL with the wrong number of
     segments is a user typo, and its message already says exactly what is wrong, so it
-    should read as an error rather than as a traceback.
+    should read as an error rather than as a traceback. ``KeyError`` joins them for the
+    same reason — it is what an HDF5 container raises when it holds several datasets and
+    nobody said which, and its message lists them, so ``--dataset`` is the whole fix.
     """
     try:
-        return describe(volume)
+        return describe(volume, dataset=dataset)
     except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+    except KeyError as e:
+        raise SystemExit(str(e.args[0] if e.args else e)) from None
+
+
+def _one_array(described: dict, volume: str, op: str) -> dict:
+    """``require_one_array`` as a clean CLI exit rather than a traceback."""
+    from neu_vol.source_metadata import require_one_array
+
+    try:
+        return require_one_array(described, volume, op)
+    except ValueError as e:
         raise SystemExit(str(e)) from None
 
 
@@ -342,55 +356,28 @@ def _print_provenance(volume: str, full: bool) -> None:
 
 
 def cmd_info(args) -> int:
-    d = _describe(args.volume)
-    meta = d["meta"] or {}
-    print(f"{args.volume}")
-    print(f"  format      {d['format']}")
-    print(f"  dtype       {d['dtype']}")
-    print(f"  kind        {meta.get('kind') or '(not recorded)'}")
-    if meta.get("voxel_size"):
-        print(f"  voxel size  {'x'.join(f'{v:g}' for v in meta['voxel_size'])} nm")
-    else:
-        print("  voxel size  (not recorded — --voxel-size required for convert/downsample)")
-    if meta.get("offset"):
-        print(f"  offset      {tuple(meta['offset'])}")
-    if d["has_channels"]:
-        print("  channels    yes (leading axis)")
+    """Report a volume's format, coordinate metadata and the levels present.
+
+    **The table itself is `Description`'s, not this function's.** It used to be built
+    here with print statements, which made this the only place that could produce it —
+    so `neu_vol.describe` in a notebook returned a dict of nested tuples and people ran
+    `neu-vol info` in a subprocess to read the same thing. The rendering moved to
+    `neu_vol/report.py`; what stays here is the two sections that need a STORE read, and
+    they are the reason the header and the table are separate methods: `provenance.json`
+    and the DVID node summary belong between them, and a `__repr__` that makes network
+    calls is a trap in a notebook, where anything can echo an object.
+    """
+    d = _describe(args.volume, getattr(args, "dataset", None))
+    print("\n".join(d.header_lines()))
     if d["format"] == "dvid":
         _print_dvid_nodes(args.volume)
-    else:
+    elif not d.is_container:
+        # A container is a local file: it has no `provenance.json` beside it, and looking
+        # for one would probe `piece.h5/provenance.json`.
         _print_provenance(args.volume, getattr(args, "provenance", False))
-    if d["other_markers"]:
-        # Two volumes in one directory. Whichever loses the detection order is
-        # unreachable through every path in this package, but still occupies the store.
-        print(f"\n  WARNING: this directory also contains "
-              f"{', '.join(d['other_markers'])} — a second volume of another format "
-              f"is shadowed\n  here and cannot be opened while {d['format']} wins "
-              f"detection. Move or delete one of them.\n")
-
-    if not d["levels"]:
-        print("  levels      none found")
-        return 0
-    # Each level's OWN recorded voxel size — never derived from shape ratios, which
-    # ceil-division makes inexact (32 nm reads back as 31.9953), and never 2**level,
-    # which is wrong on the anisotropic pyramids that are common.
-    per_level = d["level_voxel_sizes"]
-    sharded = any(lv["read_chunks"] and lv["chunks"] != lv["read_chunks"]
-                  for lv in d["levels"].values())
-    header = f"  {'level':>5}  {'shape':>24}  {'voxel nm':>20}  {'chunk':>17}"
-    print(header + (f"  {'shard':>17}" if sharded else ""))
-    for i, lv in sorted(d["levels"].items()):
-        vox = ("x".join(f"{v:g}" for v in per_level[i])
-               if per_level and i < len(per_level) else "(not recorded)")
-        # With sharding the *read* chunk is the unit actually fetched, so that is
-        # what belongs in the "chunk" column; the write chunk is the shard.
-        chunk = lv["read_chunks"] or lv["chunks"]
-        chunk_s = "x".join(str(c) for c in chunk) if chunk else "?"
-        row = f"  {i:>5}  {str(lv['shape']):>24}  {vox:>20}  {chunk_s:>17}"
-        if sharded:
-            shard = lv["chunks"] if lv["chunks"] != lv["read_chunks"] else None
-            row += f"  {('x'.join(str(c) for c in shard) if shard else '—'):>17}"
-        print(row)
+    for line in d.warning_lines():
+        print(line)
+    print("\n".join(d.table_lines()))
     return 0
 
 
@@ -747,6 +734,10 @@ def cmd_copy(args) -> int:
             f"DVID labelmap (dvid://server/uuid/instance). For an image stack, HDF5 or "
             f"a bare array, use `neu-vol convert` and state them.") \
             from None
+    # An HDF5 container resolves no array, so `copy`'s source-derived defaults have
+    # nothing to come from. It is refused above for other reasons anyway; this is the
+    # message that names the actual problem if that ever changes.
+    d = _one_array(d, args.src, "neu-vol copy")
     meta = d["meta"] or {}
 
     # A `.gz`-chunked source (CloudVolume) copies out as PLAIN precomputed, which is
@@ -840,8 +831,16 @@ def _downsample_plan(args):
     anything is written.
     """
     from neu_vol.pyramid import downsample_schedule
+    from neu_vol.source_metadata import require_chunked_volume
 
     d = _describe(args.volume)
+    # Before the schedule, not after: this command plans in the CLI and only then calls
+    # the op, so leaving the check to `plan_regenerate` meant an HDF5 file first got a
+    # full eight-level plan and a complaint about --kind.
+    try:
+        require_chunked_volume(d["format"], args.volume, "neu-vol downsample")
+    except ValueError as e:
+        raise SystemExit(str(e)) from None
     meta = d["meta"] or {}
     if not meta.get("voxel_size") and args.voxel_size is None:
         raise SystemExit(f"{args.volume} has no coordinate metadata; pass --voxel-size")
@@ -1265,13 +1264,22 @@ def cmd_progress(args) -> int:
     note in CLAUDE.md.
     """
     from neu_vol.location import default_progress_path
-    from neu_vol.source_metadata import PRECOMPUTED_GZ, detect_backend
+    from neu_vol.source_metadata import (PRECOMPUTED_GZ, detect_backend,
+                                         require_chunked_volume)
 
     volume = args.volume.rstrip("/")
     manifest_path = args.progress_path or default_progress_path(volume)
     manifest = None if args.storage else _manifest_counts(manifest_path)
 
     fmt = detect_backend(volume)
+    if fmt is not None:
+        # Progress is chunk objects against the number a level has. A single array has
+        # neither, so `_stored_chunks` would list a prefix that holds no chunk keys and
+        # report 0% for a file that is entirely present.
+        try:
+            require_chunked_volume(fmt, volume, "neu-vol progress")
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
     if fmt == PRECOMPUTED_GZ:
         # Only the chunk KEYS differ, and nothing here reads a chunk — shapes and
         # scale keys come from `info`, which is the same document either way.
@@ -1583,6 +1591,8 @@ def cmd_align_bbox(args) -> int:
         raise SystemExit("give --volume (to take the grid from it) or --block z,y,x")
     boxes = [_sextuple(b, "bbox") for b in args.bbox]
     d = _describe(args.volume) if args.volume else None
+    if d is not None:
+        d = _one_array(d, args.volume, "neu-vol align-bbox")
     block, source = _align_grid(args, d)
 
     extent = None
@@ -1749,8 +1759,21 @@ def build_parser() -> argparse.ArgumentParser:
     # --- info ---------------------------------------------------------------
     q = sub.add_parser("info", help="what a volume is, and which levels exist",
                        description="Report a volume's format, coordinate metadata "
-                                   "and the levels present. Reads only.")
+                                   "and the levels present. Reads only.\n\n"
+                                   "Works on anything this package can read: a zarr or "
+                                   "neuroglancer-precomputed volume, a dvid:// "
+                                   "instance, an HDF5 file, or a directory or glob of "
+                                   "2D slices. The last two are a single array, so they "
+                                   "report one level; an HDF5 file also reports whatever "
+                                   "frame it records about itself, which is what "
+                                   "`neu-vol to-hdf5` writes.",
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("volume")
+    q.add_argument("--dataset", default=None,
+                   help="which array to describe inside an HDF5 container. Only needed "
+                        "when the file holds more than one 3D+ dataset — with one, it is "
+                        "found; with several, the error lists them. Ignored for every "
+                        "other format")
     q.add_argument("--provenance", action="store_true",
                    help="print the whole provenance.json record if the volume has one "
                         "(a one-line summary is shown without this). Written by "
@@ -1773,11 +1796,13 @@ def build_parser() -> argparse.ArgumentParser:
                        "defaulting them.",
                        formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("--src-format", default=None,
-                   help="backend for --src (default: auto-detect; a dvid:// URL is "
-                        "detected by its scheme). Use 'image_stack' for a directory or "
-                        "glob of ordered 2D slices (PNG/TIFF) — that one is never "
-                        "auto-detected, and needs --voxel-size since image files carry "
-                        "no physical scale")
+                   help="backend for --src (default: auto-detect). A dvid:// URL is "
+                        "detected by its scheme, a zarr or precomputed volume by its "
+                        "metadata document, and an HDF5 file or a directory/glob of "
+                        "ordered 2D slices (PNG/TIFF) by name — pass this to override, "
+                        "or to name a format whose files are called something unusual. "
+                        "An image stack always needs --voxel-size, since image files "
+                        "carry no physical scale")
     _add_convert_args(q, source_defaults=False)
     q.set_defaults(func=cmd_convert)
 
@@ -2107,8 +2132,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the HDF5 file to write. Created, or added to if it already "
                         "records the same frame")
     q.add_argument("--src-format", default=None,
-                   help="backend for --src (default: auto-detect, falling back to "
-                        "image_stack for a directory or glob of images)")
+                   help="backend for --src (default: auto-detect — a zarr or "
+                        "precomputed volume by its metadata document, an HDF5 file or a "
+                        "glob/file/directory of 2D slices by name)")
     q.add_argument("--voxel-size", default=None, metavar="Z,Y,X",
                    help="physical size of one voxel, e.g. 8,8,8. Required for a source "
                         "that records none (an image stack, an HDF5 file, a bare array); "

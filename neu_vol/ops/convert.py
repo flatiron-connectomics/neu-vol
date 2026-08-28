@@ -3,9 +3,10 @@ neuroglancer-precomputed volume, whole or cropped to a box.
 
 Generalizes ``ingest``: the source is any registered backend. Coordinate metadata
 (``voxel_size``/``offset``/``units``/``axes``) is read from the source when it
-carries it (OME-NGFF zarr groups, precomputed ``info``); anything the caller
-passes explicitly overrides the read value. Sources without metadata (bare
-arrays, HDF5) require the caller to supply at least ``voxel_size``.
+carries it — OME-NGFF zarr groups, precomputed ``info``, a DVID instance, and an HDF5
+file that records its own frame beside the array; anything the caller passes explicitly
+overrides the read value. Sources that record nothing (bare arrays, image stacks, a
+plain HDF5 file) require the caller to supply at least ``voxel_size``.
 
 ``crop_start``/``crop_stop`` restrict the copy to a box **without changing the model
 space**: the physical offset shifts by the crop origin, so the output lands on top of
@@ -161,11 +162,15 @@ def convert(
     """Convert ``src`` into a multiscale volume at ``dst``, whole or cropped.
 
     ``src`` is a path or a full backend spec dict. For a path, ``src_format`` is
-    auto-detected (``info``->precomputed, ``zarr.json``->zarr3,
-    ``.zarray``/``.zgroup``->zarr2) unless given. Metadata not passed explicitly is
-    taken from the source where available; ``voxel_size`` is required if the source
-    carries none. With ``resume=True`` an interrupted run continues, skipping
-    already-done blocks instead of recreating them.
+    auto-detected unless given: ``info``->precomputed, ``zarr.json``->zarr3,
+    ``.zarray``/``.zgroup``->zarr2, a ``dvid://`` URL->dvid, and — from the name, since
+    neither has a marker object — an HDF5 file or a glob, file or directory of 2D slices.
+    Metadata not passed explicitly is taken from the source where available;
+    ``voxel_size`` is required if the source carries none, which an image stack always
+    does and an HDF5 file does unless it records its own frame.
+
+    With ``resume=True`` an interrupted run continues, skipping already-done blocks
+    instead of recreating them.
 
     ``background`` names the values the source uses for background — manual segmentation
     numbered from 0 makes it 1 — and replaces them with 0 as the source is read. Do this
@@ -197,12 +202,13 @@ def convert(
         fmt = src_format or detect_backend(src)
         if fmt is None:
             raise ValueError(
-                f"could not detect source format at {src!r} (no info/zarr.json/.zarray); "
-                "pass src_format= explicitly (use 'image_stack' for a directory or "
-                "glob of ordered 2D slices)"
+                f"could not detect source format at {src!r}: no info / zarr.json / "
+                f".zarray marker, and the name is neither an HDF5 file nor a glob, "
+                f"file or directory of 2D slices. Pass src_format= explicitly"
             )
-        # Not every source is a store: an image stack is addressed by `source` and a
-        # DVID instance by server/uuid/instance. `location_spec` owns all three forms.
+        # Not every source is a store: an image stack is addressed by `source`, an HDF5
+        # file by path plus the dataset inside it, and a DVID instance by
+        # server/uuid/instance. `location_spec` owns all four forms.
         src_spec = location_spec(src, fmt)
 
     if prefer_locked:

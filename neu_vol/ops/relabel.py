@@ -39,7 +39,8 @@ from typing import Any, Sequence
 import numpy as np
 
 from ..backends.base import open_backend
-from ..source_metadata import detect_backend, existing_levels, level_spec
+from ..source_metadata import (detect_backend, existing_levels, level_spec,
+                               require_chunked_volume)
 from .annotate import labeled_regions
 
 # A whole region is read at once so its ids can be collected in one pass. 8 GiB is far
@@ -84,6 +85,7 @@ def plan_relabel(volume: str, *, out: str | None = None, in_place: bool = False,
     fmt = fmt or detect_backend(volume)
     if fmt is None:
         raise FileNotFoundError(f"no volume found at {volume}")
+    require_chunked_volume(fmt, volume, "neu-vol relabel")
     levels = existing_levels(volume, fmt)
     if level not in levels:
         raise ValueError(f"{volume} has no level {level}; present: {sorted(levels)}")
