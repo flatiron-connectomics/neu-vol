@@ -218,12 +218,17 @@ def open_hdf5(path: str, dataset: str | None = None) -> "HDF5Backend":
     handle joins the per-process cache: an ``HDF5Backend`` holds an open ``h5py.File``,
     and two calls for one array should not mean two file handles.
     """
+    from ..logs import quiet_reads
     from .base import open_backend
 
-    path = require_local_path(path)
-    return open_backend({"backend": TAG, "path": path,
-                         "dataset": dataset if dataset is not None
-                         else sole_dataset(path)})
+    # A notebook-facing entry point with no `main()` to wrap; see `source_metadata.describe`.
+    # HDF5 itself is local and silent, but `require_local_path` goes through `location`, and
+    # a caller reaching for this in a loop should not have to think about it.
+    with quiet_reads():
+        path = require_local_path(path)
+        return open_backend({"backend": TAG, "path": path,
+                             "dataset": dataset if dataset is not None
+                             else sole_dataset(path)})
 
 
 class HDF5Backend:

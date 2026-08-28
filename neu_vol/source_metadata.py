@@ -685,6 +685,22 @@ def describe(volume: str, *, dataset: str | None = None) -> "Description":
     Raises ``FileNotFoundError`` if nothing at ``volume`` looks like a volume.
     """
     from .backends.base import open_backend
+    from .logs import quiet_reads
+    from .report import Description
+
+    # Wrapped because `describe` IS the entry point from a notebook's point of view —
+    # there is no `main()` to wrap, and an S3 open logs two `AuthCredentialsProvider`
+    # lines at `E` severity per prefix that are not failures, only the two providers that
+    # missed before the environment one succeeded. Erik's rule: a user must not have to
+    # invoke anything to get legible output, and a manual call is worse than the noise,
+    # because forgetting it after a kernel restart looks identical to a broken filter.
+    # `quiet_reads` nests and is thread-safe, so the CLI wrapping `main()` too is fine.
+    with quiet_reads():
+        return _describe(volume, dataset=dataset)
+
+
+def _describe(volume: str, *, dataset: str | None = None) -> "Description":
+    from .backends.base import open_backend
     from .report import Description
 
     fmt = detect_backend(volume)

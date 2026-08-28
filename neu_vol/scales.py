@@ -33,7 +33,20 @@ from neu_lib import Frame, ScaleInfo
 
 
 def read_scales(spec: str | Mapping[str, Any]) -> list[ScaleInfo]:
-    """All pyramid levels of a source, finest first. Raises if metadata is absent."""
+    """All pyramid levels of a source, finest first. Raises if metadata is absent.
+
+    Store logging is filtered for the duration: this is called straight from notebooks
+    (it is why the function moved down here from neu-morpho), and an S3 open emits two
+    benign `AuthCredentialsProvider` lines per prefix. See `source_metadata.describe`.
+    """
+    from .logs import quiet_reads
+    from .source_metadata import detect_backend
+
+    with quiet_reads():
+        return _read_scales(spec)
+
+
+def _read_scales(spec: str | Mapping[str, Any]) -> list[ScaleInfo]:
     from .source_metadata import detect_backend
 
     spec = {"path": spec} if isinstance(spec, str) else dict(spec)
