@@ -29,7 +29,7 @@ from .profiles import StorageProfile, PROFILES, get_profile
 from .ops import (convert, create_volume, extract_roi, ingest_image_stack,
                   mask_values, pack_hdf5, plan_subvolume_write, plan_volume,
                   rebuild_pyramid, write_subvolume, write_subvolumes)
-from .piece import read_piece
+from .piece import piece_name, read_piece
 from .source_metadata import describe, existing_levels, level_spec
 # Per-level shape, voxel size and origin, read from the source's own metadata. Came
 # from neu-morpho, which had meant neu-draw importing a meshing package to learn a
@@ -70,6 +70,7 @@ __all__ = [
     "pack_hdf5",
     "open_hdf5",
     "read_piece",
+    "piece_name",
     "mask_values",
     "describe",
     "describe_scales",
