@@ -34,6 +34,10 @@ def _natural_key(s: str) -> list:
 
 
 def _list_files(source: str) -> list[str]:
+    # `~` is expanded here for the same reason `require_local_path` does it: glob and
+    # listdir take a relative path but not a tilde, so it would reach them verbatim and
+    # match nothing, reported as "no image files matched" rather than as a path problem.
+    source = os.path.expanduser(source)
     if _glob.has_magic(source):
         files = _glob.glob(source)
     elif os.path.isdir(source):

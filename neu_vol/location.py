@@ -8,25 +8,55 @@ user-facing location into a kvstore and joins subpaths uniformly.
 from __future__ import annotations
 
 import hashlib
+import os
 from typing import Any, Mapping
 
 _SCHEMES = {"s3://": "s3", "gs://": "gcs"}
+
+
+def _resolve_local(path: str) -> str:
+    """A filesystem path as tensorstore will accept it: absolute, with ``~`` expanded.
+
+    **tensorstore's file driver rejects a relative path outright** — a ``..`` segment gives
+    ``Invalid file path`` from deep inside the JSON binding, naming neither the caller nor
+    the reason. So ``../data/piece.h5`` from a notebook one directory down failed, which is
+    the most ordinary way anyone refers to a file.
+
+    Resolved here rather than in each entry point because this is the one place every local
+    location passes through, and a path that is absolute by the time it reaches a spec is
+    also a path that still means the same thing on a dask worker with a different working
+    directory — which is the harder version of the same bug.
+
+    ``normpath`` (inside ``abspath``) collapses the ``..``; a trailing slash goes with it,
+    which costs nothing because every caller that needs one appends it itself.
+    """
+    if not path:
+        return path        # a degenerate location, left alone rather than made the cwd
+    return os.path.abspath(os.path.expanduser(path))
 
 
 def to_kvstore(location: str | Mapping[str, Any]) -> dict[str, Any]:
     """Normalize a location to a TensorStore kvstore spec.
 
     Accepts a local path, an ``s3://bucket/prefix`` / ``gs://bucket/prefix`` URL,
-    or an existing kvstore dict (returned as-is).
+    or an existing kvstore dict.
+
+    A local path is made **absolute** with ``~`` expanded (:func:`_resolve_local`), because
+    tensorstore's file driver refuses a relative one — and because an absolute path still
+    means the same thing on a worker whose working directory is elsewhere.
     """
     if isinstance(location, Mapping):
-        return dict(location)
+        kv = dict(location)
+        if kv.get("driver") == "file":
+            # A hand-written spec is as likely to carry a relative path as a string is.
+            kv["path"] = _resolve_local(str(kv.get("path", "")))
+        return kv
     s = str(location)
     for scheme, driver in _SCHEMES.items():
         if s.startswith(scheme):
             bucket, _, prefix = s[len(scheme):].partition("/")
             return {"driver": driver, "bucket": bucket, "path": prefix}
-    return {"driver": "file", "path": s}
+    return {"driver": "file", "path": _resolve_local(s)}
 
 
 def join(kvstore: Mapping[str, Any], *parts: str) -> dict[str, Any]:

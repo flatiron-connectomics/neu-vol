@@ -57,7 +57,7 @@ def require_local_path(path: str, what: str = "an HDF5 file") -> str:
     file called* ``s3://bucket/piece.h5`` and reports ``errno = 2, No such file or
     directory``, which says nothing about what is actually wrong.
     """
-    from ..location import is_local
+    from ..location import is_local, local_path
 
     if not is_local(path):
         raise ValueError(
@@ -65,7 +65,11 @@ def require_local_path(path: str, what: str = "an HDF5 file") -> str:
             f"object-store driver, so nothing here can read or write HDF5 on one. Copy the "
             f"file to local storage first (`rclone copy`, `aws s3 cp`), or write it locally "
             f"and upload it afterwards.")
-    return path
+    # Resolved, not just vetted: h5py takes a relative path but does **not** expand `~`, so
+    # `~/data/piece.h5` reaches it verbatim and fails with errno 2 on a path that plainly
+    # exists. `local_path` goes through `to_kvstore`, so this and every store path get the
+    # same treatment.
+    return local_path(path)
 
 
 def _as_floats(value: Any, where: str) -> tuple[float, ...]:

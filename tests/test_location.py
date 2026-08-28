@@ -211,3 +211,70 @@ def test_remote_locations_split_into_prefix_and_key():
     store, key = _kv("s3://bucket/info")          # bucket root
     assert key == "info"
     assert store.spec().to_json().get("path", "") == ""
+
+
+# --------------------------------------------------------------------------- #
+# a local path is resolved, because tensorstore refuses a relative one
+# --------------------------------------------------------------------------- #
+def test_a_relative_local_path_is_made_absolute(tmp_path, monkeypatch):
+    """**tensorstore's file driver rejects a relative path outright** — a `..` segment gives
+    `Invalid file path` from inside its JSON binding, naming neither the caller nor the
+    reason. So `neu_vol.describe("../data/piece.h5")` from a notebook one directory down
+    failed, which is the most ordinary way anyone refers to a file.
+
+    Resolved in `to_kvstore` because that is the one place every local location passes
+    through — and an absolute path also still means the same thing on a dask worker whose
+    working directory is elsewhere, which is the harder version of the same bug.
+    """
+    import os
+
+    from neu_vol.location import to_kvstore
+
+    (tmp_path / "data").mkdir()
+    (tmp_path / "notebooks").mkdir()
+    monkeypatch.chdir(tmp_path / "notebooks")
+
+    kv = to_kvstore("../data/piece.h5")
+    assert kv["path"] == str(tmp_path / "data" / "piece.h5")
+    assert os.path.isabs(kv["path"]) and ".." not in kv["path"]
+    # relative-to-cwd works the same way
+    assert to_kvstore("piece.h5")["path"] == str(tmp_path / "notebooks" / "piece.h5")
+
+
+def test_a_tilde_is_expanded(monkeypatch, tmp_path):
+    """h5py takes a relative path but does not expand `~`, so it reached the reader verbatim
+    and failed with errno 2 on a path that plainly exists."""
+    from neu_vol.location import to_kvstore
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert to_kvstore("~/vol.zarr")["path"] == str(tmp_path / "vol.zarr")
+
+
+def test_a_hand_written_file_spec_is_resolved_too(tmp_path, monkeypatch):
+    """A spec someone typed is as likely to carry a relative path as a string is."""
+    from neu_vol.location import to_kvstore
+
+    monkeypatch.chdir(tmp_path)
+    assert to_kvstore({"driver": "file", "path": "vol.zarr"})["path"] \
+        == str(tmp_path / "vol.zarr")
+
+
+def test_a_remote_location_is_untouched():
+    """Only the file driver. An s3 path is a key prefix, not a filesystem path, and
+    absolutising one would both corrupt it and rename every progress manifest, since a
+    remote manifest's name carries a digest of the location."""
+    from neu_vol.location import default_progress_path, to_kvstore
+
+    assert to_kvstore("s3://my-bucket/a/b") == {"driver": "s3", "bucket": "my-bucket",
+                                                "path": "a/b"}
+    # the remote manifest name carries a digest of the location, so it must not move
+    assert default_progress_path("s3://my-bucket/a/gt_v1").startswith("gt_v1.")
+    assert to_kvstore({"driver": "s3", "bucket": "b", "path": "../x"})["path"] == "../x"
+
+
+def test_an_empty_location_is_left_alone():
+    """Degenerate, and turning it into the cwd would make `detect_file_backend("")` stat the
+    working directory instead of answering None."""
+    from neu_vol.location import to_kvstore
+
+    assert to_kvstore("")["path"] == ""
