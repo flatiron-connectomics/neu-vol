@@ -28,6 +28,14 @@ from typing import Any, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
+#: How much a single read may pull into memory before it has to be asked for explicitly.
+#: **This exists because the alternative is a hang, not an error.** A whole level 0 of a
+#: production EM volume is terabytes (measured on one: 11260x9000x13750 = 1.27 TiB), and
+#: `read_piece(volume)` with no crop would sit there reading it — which in a notebook looks
+#: exactly like a wedged kernel, with every later cell pending behind it. Nothing about the
+#: call says "this is 1.27 TiB", so the function has to.
+DEFAULT_MAX_BYTES = 4 * 1024 ** 3
+
 
 def _crop_request(crop: Any, what: str = "crop"):
     """``(voxel_box, nm_bounds)`` — at most one of them.
@@ -63,6 +71,7 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
                level: int = 0, crop: Any = None, dataset: str | None = None,
                src_format: str | None = None,
                voxel_size: Sequence[float] | None = None,
+               max_bytes: int | None = DEFAULT_MAX_BYTES,
                backend: Any = None):
     """The voxels at ``src``, with the frame that says where they are.
 
@@ -83,6 +92,11 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
 
     ``voxel_size`` overrides the recorded scale, and is required for a source that records
     none — a slice stack, or a plain HDF5 file.
+
+    ``max_bytes`` caps what one call will pull into memory, and **refusing is the whole
+    point**: a whole production level 0 is terabytes, so reading it does not fail, it
+    *hangs* — which in a notebook is indistinguishable from a wedged kernel. The error names
+    the size and which level would fit. ``None`` lifts the cap for a caller who means it.
 
     Store logging is filtered for the duration (``logs.quiet_reads``): this is a notebook
     entry point, and an S3 open emits two benign ``AuthCredentialsProvider`` lines per
@@ -189,6 +203,9 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
             region = tuple(slice(0, int(s)) for s in spatial)
         if channel_axis:
             region = (slice(0, shape[0]),) + region
+        if max_bytes is not None:
+            _refuse_if_too_big(region, source.dtype, max_bytes, path=path, level=level,
+                               per_level=per_level, spatial=spatial, cropped=bool(box))
 
         # A crop out of something that already knows where it belongs lands at the SUM, the
         # same rule `neu-vol to-hdf5 --crop-bbox` follows.
@@ -196,6 +213,51 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
         return Piece(array=source.read_region(region),
                      frame=Frame(voxel_size_nm=voxel, origin_nm=origin),
                      kind=kind or meta.get("kind"))
+
+
+def _size(nbytes: float) -> str:
+    """Bytes as the unit a human would use, so a small cap does not read as "0.0 GiB"."""
+    for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+        if nbytes >= scale:
+            return f"{nbytes / scale:,.1f} {unit}"
+    return f"{nbytes:.0f} B"
+
+
+def _refuse_if_too_big(region, dtype, max_bytes: int, *, path: str, level: int,
+                       per_level, spatial, cropped: bool) -> None:
+    """Raise before reading, naming the size and a level that would fit.
+
+    Before, not after: the read is the thing that takes forever, and a message that arrives
+    once it finishes is no message at all.
+    """
+    import numpy as np
+
+    extents = [s.stop - s.start for s in region]
+    nbytes = math.prod(extents) * np.dtype(dtype).itemsize
+    if nbytes <= max_bytes:
+        return
+
+    # Which coarser level WOULD fit, predicted from the recorded per-level voxel sizes
+    # rather than by opening anything — the ratio to level 0 gives each level's extent.
+    fits = ""
+    if per_level and level < len(per_level):
+        here = per_level[level]
+        for i in range(level + 1, len(per_level)):
+            factor = [c / f for c, f in zip(per_level[i], here)]
+            shrunk = math.prod(max(1, e / f) for e, f in zip(extents, factor + [1.0]))
+            if shrunk * np.dtype(dtype).itemsize <= max_bytes:
+                fits = (f" level={i} would be about "
+                        f"{_size(shrunk * np.dtype(dtype).itemsize)}.")
+                break
+
+    raise ValueError(
+        f"reading {tuple(extents)} from {path} at level {level} is "
+        f"{_size(nbytes)}, over the {_size(max_bytes)} cap — and "
+        f"the failure this prevents is a HANG, not an error: a read that size does not stop, "
+        f"it just never finishes, which in a notebook looks like a wedged kernel."
+        + ("" if cropped else " Pass crop= to take a box out of it.")
+        + fits
+        + " Raise max_bytes= (or pass None) if you mean it.")
 
 
 def _physical_to_voxels(bounds_nm, frame, spatial, *, path: str, level: int):

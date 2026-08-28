@@ -685,3 +685,36 @@ def test_open_hdf5_needs_no_detection(tmp_path, monkeypatch):
 
     monkeypatch.setattr(source_metadata, "detect_backend", refuse)
     assert open_hdf5(_framed(tmp_path / "piece.h5")).shape == (2, 3, 4)
+
+
+def test_read_piece_refuses_a_read_that_would_hang(tmp_path):
+    """The failure this prevents is a HANG, not an error. A production level 0 is terabytes
+    (measured on one: 11260x9000x13750 uint8 = 1.27 TiB), and a read that size does not
+    stop — in a notebook it is indistinguishable from a wedged kernel, with every later cell
+    pending behind it. Nothing about `read_piece(volume)` says how big that is, so it says.
+    """
+    from neu_vol import read_piece
+
+    vol = _pyramid(tmp_path)               # 8^3 uint16 = 4 KiB, two levels
+    with pytest.raises(ValueError) as e:
+        read_piece(vol, max_bytes=512)
+    msg = str(e.value)
+    assert "over the" in msg and "HANG" in msg
+    assert "crop=" in msg, "say what to do"
+    assert "max_bytes" in msg, "...and how to mean it anyway"
+
+    # under the cap, and with the cap lifted, it reads
+    assert read_piece(vol, max_bytes=None).shape == (8, 8, 8)
+    assert read_piece(vol).shape == (8, 8, 8)
+    # a crop brings it under
+    assert read_piece(vol, crop=((0, 0, 0), (4, 4, 4)),
+                      max_bytes=512).shape == (4, 4, 4)
+
+
+def test_the_refusal_names_a_level_that_would_fit(tmp_path):
+    """Predicted from the recorded per-level voxel sizes, not by opening anything."""
+    from neu_vol import read_piece
+
+    vol = _pyramid(tmp_path)
+    with pytest.raises(ValueError, match="level=1 would be"):
+        read_piece(vol, max_bytes=600)
