@@ -71,6 +71,7 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
                level: int = 0, crop: Any = None, dataset: str | None = None,
                src_format: str | None = None,
                voxel_size: Sequence[float] | None = None,
+               name: str | None = None,
                max_bytes: int | None = DEFAULT_MAX_BYTES,
                backend: Any = None):
     """The voxels at ``src``, with the frame that says where they are.
@@ -92,6 +93,11 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
 
     ``voxel_size`` overrides the recorded scale, and is required for a source that records
     none — a slice stack, or a plain HDF5 file.
+
+    The piece is **named after the source** — ``stem`` or ``stem/dataset``
+    (:func:`piece_name`) — so a consumer three calls away can still say what it is looking
+    at. ``name`` overrides that, for when the derived one is longer than it needs to be;
+    ``Piece.with_name`` renames one afterwards.
 
     ``max_bytes`` caps what one call will pull into memory, and **refusing is the whole
     point**: a whole production level 0 is terabytes, so reading it does not fail, it
@@ -212,7 +218,34 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
         origin = tuple(o + i * v for o, i, v in zip(recorded, lo, voxel))
         return Piece(array=source.read_region(region),
                      frame=Frame(voxel_size_nm=voxel, origin_nm=origin),
-                     kind=kind or meta.get("kind"))
+                     kind=kind or meta.get("kind"),
+                     name=name or piece_name(path, dataset))
+
+
+#: Suffixes stripped when naming a piece after its source. A volume's directory name is
+#: the useful part; the format marker is not.
+_NAME_SUFFIXES = (".h5", ".hdf5", ".hdf", ".he5", ".zarr", ".precomputed", ".n5")
+
+
+def piece_name(path: str, dataset: str | None = None) -> str:
+    """What to call a piece read from ``path`` — ``stem`` or ``stem/dataset``.
+
+    Both halves, because either alone is ambiguous in a way that bites: two crops from
+    different files share a dataset name (``/data`` is what `to-hdf5` writes by default),
+    and one file's nine crops share a stem. Serving two of either is ordinary, and
+    neuroglancer keys a layer by name, so a collision is a collision rather than a
+    duplicate.
+    """
+    import os
+    import posixpath
+
+    stem = os.path.basename(str(path).rstrip("/")) or str(path)
+    for suffix in _NAME_SUFFIXES:
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    inner = posixpath.basename(str(dataset).strip("/")) if dataset else ""
+    return f"{stem}/{inner}" if inner else (stem or "piece")
 
 
 def _size(nbytes: float) -> str:

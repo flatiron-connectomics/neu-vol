@@ -718,3 +718,23 @@ def test_the_refusal_names_a_level_that_would_fit(tmp_path):
     vol = _pyramid(tmp_path)
     with pytest.raises(ValueError, match="level=1 would be"):
         read_piece(vol, max_bytes=600)
+
+
+def test_a_piece_is_named_after_its_source(tmp_path):
+    """`stem/dataset`, or just the stem. Both halves, because either alone collides: `/data`
+    is what `to-hdf5` writes by default, so two files' crops share it, and one file's nine
+    crops share a stem."""
+    from neu_vol import piece_name, read_piece
+
+    assert piece_name("data/gt_v1_eval.h5", "/vol_03700") == "gt_v1_eval/vol_03700"
+    assert piece_name("piece.h5") == "piece"
+    assert piece_name("s3://my-bucket/dataset/image_v3.zarr") == "image_v3"
+    assert piece_name("/p/seg_v1") == "seg_v1"
+    # a nested dataset keeps only its leaf, since the path to it is not the name
+    assert piece_name("/p/x.h5", "/g/nested/vol") == "x/vol"
+
+    path = _framed(tmp_path / "gt.h5")
+    assert read_piece(path).name == "gt/data"
+    # name= overrides the derived one, for when it is longer than it needs to be
+    assert read_piece(path, name="mine").name == "mine"
+    assert read_piece(path).with_name("later").name == "later"

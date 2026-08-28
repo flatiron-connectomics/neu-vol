@@ -130,6 +130,23 @@ the default when nothing else says. An existing file is added to if its recorded
 matches — several pieces of one volume in one file, each with its own `voxel_offset` — and
 refused if it does not. `neu-vol info <file.h5>` lists what such a file ended up holding.
 
+`read_piece()` is the general read: a box out of any source, as a `neu_lib.Piece` that
+carries the frame, the kind and a name derived from the source. It is what the neu-glance
+viewer constructors call, so a notebook and a viewer see the same thing:
+
+```python
+from neu_vol import read_piece
+gt = read_piece("gt.h5:/vol_03700", "segmentation")   # frame from the file's attributes
+em = read_piece("s3://my-bucket/em", crop=gt)         # the SAME physical box
+gt.bbox, gt.bounds_nm                                 # where it is, in voxels and in nm
+```
+
+`crop=` takes a voxel box, another `Piece` (meaning *the same physical box as that*), or
+`{"nm": (lo, hi)}` — nanometres being the only space that transfers between frames, since
+two levels have different voxel sizes and a crop and its parent different origins. A single
+read is capped at 4 GiB, because a whole production level 0 is terabytes and a read that
+size does not fail, it **hangs**; the error names a coarser level that would fit.
+
 `open_hdf5()` is the read side — one dataset of a file, ready to read regions from, with
 no spec to write out:
 
