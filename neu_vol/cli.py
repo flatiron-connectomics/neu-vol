@@ -1012,28 +1012,69 @@ def _print_one_write(r: dict) -> None:
           f"({_human_bytes(r['nbytes'])}, level-{r['level']} chunk {r['dst_chunk']})")
 
 
+def _write_row_labels(results: list[dict]) -> tuple[list[str], str | None]:
+    """A label per source, and the container they all came from if they share one.
+
+    **Every row of an `--all-datasets` batch has the same file name**, so labelling by
+    basename alone would print thirteen identical rows and nothing to tell them apart. The
+    dataset is the distinguishing part there, and the path is said once above the table.
+    """
+    paths = [str(r["src_spec"].get("path") or r["src_spec"].get("source", "?")).rstrip("/")
+             for r in results]
+    datasets = [r["src_spec"].get("dataset") for r in results]
+    shared = paths[0] if len(set(paths)) == 1 and any(datasets) else None
+    if shared:
+        return [str(d or "(only dataset)") for d in datasets], shared
+    return [os.path.basename(p) + (f":{d}" if d else "")
+            for p, d in zip(paths, datasets)], None
+
+
 def _print_write_table(results: list[dict]) -> None:
     """One row per source. A per-source block would be a screenful for a batch."""
-    print(f"  {'source':<34} {'shape':>16} {'offset':>18}  {'tiles':>5}  {'size':>9}")
-    for r in results:
-        name = os.path.basename(str(r["src_spec"].get("path")
-                                    or r["src_spec"].get("source", "?")).rstrip("/"))
-        print(f"  {name[:34]:<34} {str(r['src_shape']):>16} "
+    labels, shared = _write_row_labels(results)
+    if shared:
+        print(f"  from {shared}")
+    width = max(34, min(48, max(len(name) for name in labels)))
+    print(f"  {'source':<{width}} {'shape':>16} {'offset':>18}  {'tiles':>5}  {'size':>9}")
+    for name, r in zip(labels, results):
+        print(f"  {name[:width]:<{width}} {str(r['src_shape']):>16} "
               f"{str(tuple(r['start'])):>18}  {r['num_tiles']:>5}  "
               f"{_human_bytes(r['nbytes']):>9}")
 
 
 def cmd_write(args) -> int:
-    from neu_vol.ops.write import write_subvolumes
+    from neu_vol.ops.write import container_sources, write_subvolumes
 
     offsets = ([_triple(o, "offset") for o in args.offset] if args.offset else None)
     if offsets is not None and len(offsets) != len(args.src):
         raise SystemExit(
             f"{len(args.src)} --src but {len(offsets)} --offset: give one --offset per "
             f"--src, or none and let each source supply its own (see --offset-field)")
+
+    srcs: list = list(args.src)
+    if args.all_datasets is not None:
+        if args.dataset:
+            raise SystemExit(
+                f"--dataset {args.dataset} names one array and --all-datasets means every "
+                f"one. To write a subset, give --all-datasets a glob instead")
+        if offsets is not None:
+            raise SystemExit(
+                "--offset cannot be combined with --all-datasets: the datasets are "
+                "expanded from the file, so there is nothing for one typed offset to "
+                "belong to. Each carries its own voxel_offset, which is what makes a bag "
+                "of crops placeable — write one dataset at a time to override it")
+        try:
+            srcs = [spec for s in args.src
+                    for spec in container_sources(s, args.all_datasets,
+                                                  src_format=args.src_format)]
+        except (FileNotFoundError, ValueError, KeyError) as e:
+            raise SystemExit(str(e).strip("'")) from None
+        print(f"--all-datasets {args.all_datasets!r}: {len(srcs)} dataset(s) from "
+              f"{len(args.src)} file(s)")
+
     try:
         results = write_subvolumes(
-            args.volume, args.src, offsets, level=args.level,
+            args.volume, srcs, offsets, level=args.level,
             offset_level=args.offset_level, offset_field=args.offset_field,
             voxel_size_field=args.voxel_size_field,
             offset_order=args.offset_order, src_format=args.src_format,
@@ -2018,6 +2059,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "with an info or zarr.json is detected properly)")
     q.add_argument("--dataset", default=None,
                    help="HDF5 dataset path (default: the file's only 3D+ dataset)")
+    q.add_argument("--all-datasets", nargs="?", const="*", default=None, metavar="GLOB",
+                   help="write EVERY volumetric dataset of an HDF5 --src, each at its own "
+                        "recorded voxel_offset — a bag of ground-truth crops in one file "
+                        "goes back into the volume in one command. Give a GLOB to narrow "
+                        "it (--all-datasets 'z*'), matched against the dataset path and "
+                        "its basename. All of them are still planned before any is "
+                        "written. Cannot be combined with --dataset or --offset")
     q.add_argument("--cast", action="store_true",
                    help="allow a lossy dtype conversion into the destination")
     q.add_argument("--dry-run", action="store_true",

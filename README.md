@@ -305,6 +305,22 @@ checked before any is written. `--offset-order xyz` if the stored numbers are xy
 field name is precomputed's, where it is, and reversed the piece lands mirrored through
 the z=x diagonal.
 
+`--all-datasets` writes **every** volumetric dataset of an HDF5 `--src`, each at its own
+recorded offset — a bag of ground-truth crops in one file goes back into the volume in one
+command, rather than one `--dataset` at a time:
+
+```bash
+neu-vol write <volume> --src gt_v1_eval_cleaned.h5 --all-datasets
+neu-vol write <volume> --src gt_v1_eval_cleaned.h5 --all-datasets 'z*'   # a subset
+```
+
+The optional glob is matched against the dataset path *and* its basename, so `'z*'` and
+`'/edge_*'` both mean what they look like, and a pattern matching nothing **raises** rather
+than writing nothing and reporting success. The expansion feeds the same batch, so all of
+them are still planned before any is written. It cannot be combined with `--dataset` (which
+names one) or `--offset` (which belongs to a source you typed). `ops.write.container_sources`
+is the same thing from Python.
+
 `--format zarr|precomputed` picks the target (default: the reference's own).
 Precomputed keeps its scales in one intrinsic `info` and takes `--encoding`
 (`compressed_segmentation` for `--kind segmentation`, else `raw`); it cannot shard,

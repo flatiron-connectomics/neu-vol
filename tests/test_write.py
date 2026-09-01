@@ -153,6 +153,134 @@ def test_a_batch_of_sources_each_lands_at_its_own_stored_offset(tmp_path):
     assert not got.any(), "something outside the pieces was written"
 
 
+# --------------------------------------------------------------------------- #
+# every dataset of one container
+#
+# The other shape a batch arrives in: not several files but one file holding a bag of
+# ground-truth crops, each with its own `voxel_offset`. Naming thirteen datasets on the
+# command line is transcription, and a transcription error places a crop in the wrong
+# volume-sized hole.
+# --------------------------------------------------------------------------- #
+def _container(tmp_path, offsets, *, name="bag", shape=(8, 10, 12), voxel=(8.0, 8.0, 8.0)):
+    """One HDF5 file holding several crops, each recording where it belongs."""
+    import h5py
+
+    path = str(tmp_path / f"{name}.h5")
+    rng = np.random.default_rng(7)
+    data = {}
+    with h5py.File(path, "w") as f:
+        for dataset, at in offsets.items():
+            data[dataset] = rng.integers(1, 99, shape, dtype=np.uint64)
+            d = f.create_dataset(dataset, data=data[dataset])
+            d.attrs["voxel_offset"] = np.asarray(at, dtype="int64")
+            d.attrs["voxel_size"] = np.asarray(voxel, dtype="float64")
+            d.attrs["axes"] = "zyx"
+    return path, data
+
+
+def test_a_container_expands_to_one_source_per_dataset(tmp_path):
+    from neu_vol.ops.write import container_sources
+
+    path, _ = _container(tmp_path, {"z01": (0, 0, 0), "z02": (16, 0, 0),
+                                    "edge_z03": (32, 0, 0)})
+    specs = container_sources(path)
+
+    assert [s["dataset"] for s in specs] == ["/edge_z03", "/z01", "/z02"], \
+        "sorted, so a run's order does not depend on how h5py walked the file"
+    assert all(s["backend"] == "hdf5" and s["path"] == path for s in specs)
+
+
+def test_a_glob_narrows_it_by_path_or_by_basename(tmp_path):
+    from neu_vol.ops.write import container_sources
+
+    path, _ = _container(tmp_path, {"z01": (0, 0, 0), "z02": (16, 0, 0),
+                                    "edge_z03": (32, 0, 0)})
+
+    assert [s["dataset"] for s in container_sources(path, "z*")] == ["/z01", "/z02"], \
+        "matched against the basename, which is what a user types"
+    assert [s["dataset"] for s in container_sources(path, "/edge_*")] == ["/edge_z03"], \
+        "and against the full path, which is what `neu-vol info` prints"
+
+
+def test_a_glob_matching_nothing_raises_rather_than_writing_nothing(tmp_path):
+    """A write that reports success and places no data is the failure noticed a week
+    later, so the empty selection is refused and what IS there is listed."""
+    from neu_vol.ops.write import container_sources
+
+    path, _ = _container(tmp_path, {"z01": (0, 0, 0)})
+    with pytest.raises(ValueError, match="no dataset in .* matches 'nope\\*'"):
+        container_sources(path, "nope*")
+
+
+def test_expanding_something_that_is_not_a_container_says_so(tmp_path):
+    from neu_vol.ops.write import container_sources
+
+    with pytest.raises(ValueError, match="applies to an HDF5 container"):
+        container_sources(_volume(tmp_path))
+
+
+def test_every_dataset_lands_at_its_own_offset(tmp_path):
+    from neu_vol.ops.write import container_sources
+
+    vol = _volume(tmp_path)
+    offsets = {"z01": (0, 0, 0), "z02": (16, 24, 32), "edge_z03": (40, 8, 8)}
+    path, data = _container(tmp_path, offsets)
+
+    results = write_subvolumes(vol, container_sources(path))
+    assert sorted(r["start"] for r in results) == sorted(offsets.values())
+
+    got = _level(vol, 0).read_region((slice(0, 64),) * 3)
+    for dataset, at in offsets.items():
+        np.testing.assert_array_equal(got[_region(at, data[dataset].shape)], data[dataset])
+        got[_region(at, data[dataset].shape)] = 0
+    assert not got.any(), "something outside the crops was written"
+
+
+def test_the_cli_writes_them_all_and_names_each_one(tmp_path, capsys):
+    """The table has one row per dataset and they all share a file name, so labelling by
+    basename would print three identical rows with nothing to tell them apart."""
+    from neu_vol import cli
+
+    vol = _volume(tmp_path)
+    path, data = _container(tmp_path, {"z01": (0, 0, 0), "z02": (16, 24, 32)})
+
+    assert cli.main(["write", vol, "--src", path, "--all-datasets"]) == 0
+    out = capsys.readouterr().out
+    assert "2 dataset(s) from 1 file(s)" in out
+    assert "/z01" in out and "/z02" in out
+    assert f"from {path}" in out, "the container said once, above the table"
+
+    got = _level(vol, 0).read_region((slice(0, 64),) * 3)
+    np.testing.assert_array_equal(got[_region((16, 24, 32), (8, 10, 12))], data["z02"])
+
+
+def test_the_cli_refuses_the_combinations_that_contradict(tmp_path):
+    """`--dataset` names one array and `--offset` belongs to a source you typed; neither
+    means anything once the datasets come out of the file."""
+    from neu_vol import cli
+
+    vol = _volume(tmp_path)
+    path, _ = _container(tmp_path, {"z01": (0, 0, 0)})
+
+    with pytest.raises(SystemExit, match="names one array"):
+        cli.main(["write", vol, "--src", path, "--all-datasets", "--dataset", "/z01"])
+    with pytest.raises(SystemExit, match="cannot be combined"):
+        cli.main(["write", vol, "--src", path, "--all-datasets", "--offset", "0,0,0"])
+
+
+def test_one_bad_dataset_stops_the_expanded_batch_too(tmp_path):
+    """Expansion feeds the same plan-everything-first batch, so the guarantee holds."""
+    from neu_vol import cli
+
+    vol = _volume(tmp_path, shape=(32, 32, 32))
+    path, _ = _container(tmp_path, {"z01": (0, 0, 0), "z02": (30, 30, 30)})
+
+    with pytest.raises(SystemExit, match="does not fit"):
+        cli.main(["write", vol, "--src", path, "--all-datasets"])
+    assert not _level(vol, 0).read_region((slice(0, 32),) * 3).any(), \
+        "the good dataset was written before the bad one was checked"
+
+
 def test_one_bad_source_stops_the_batch_before_anything_is_written(tmp_path):
     """Planning resolves offsets and checks bounds and touches nothing, so doing all
     of it first means a mistake in the last file is caught while the volume is still

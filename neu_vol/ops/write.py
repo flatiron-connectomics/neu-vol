@@ -80,6 +80,52 @@ def source_spec(src: str | Mapping[str, Any], src_format: str | None = None,
     return location_spec(src, fmt, dataset=dataset)
 
 
+def container_sources(src: str | Mapping[str, Any], pattern: str = "*", *,
+                      src_format: str | None = None) -> list[dict[str, Any]]:
+    """Every volumetric dataset of an HDF5 container, as one source spec each.
+
+    The batch form of pointing at a file. A bag of ground-truth crops in one HDF5 file is
+    the ordinary arrangement here — each dataset carrying its own ``voxel_offset``, which is
+    what makes it placeable — so writing the file back into a volume means writing every
+    dataset in it, and naming them one at a time is transcription rather than a decision::
+
+        write_subvolumes(volume, container_sources("gt_v1_eval_cleaned.h5"))
+
+    ``pattern`` is an fnmatch glob, tried against the **full path** (``/edge_z07801``) and
+    against the **basename** (``edge_z07801``), so both ``'/edge_*'`` and ``'z*'`` mean what
+    they look like. Datasets come back sorted, so a run's order does not depend on how h5py
+    happened to walk the file.
+
+    **A pattern that matches nothing raises**, listing what is there. The alternative is a
+    write that reports success and places no data, which for a resumed or scripted run is
+    the failure that gets noticed a week later.
+    """
+    import posixpath
+    from fnmatch import fnmatch
+
+    from ..backends.hdf5 import datasets
+
+    # **Not `source_spec`**: for an HDF5 path with no dataset it resolves the *sole* one,
+    # which raises for exactly the containers this function is for. The format is settled
+    # first and the specs are built per dataset afterwards.
+    base: dict[str, Any] = dict(src) if isinstance(src, Mapping) else {}
+    path = str(base.get("path") if base else src)
+    fmt = base.get("backend") if base else (src_format or detect_backend(path))
+    if fmt != "hdf5":
+        raise ValueError(
+            f"expanding every dataset applies to an HDF5 container, and {path!r} is "
+            f"{fmt or 'not one'} — a single array, not a bag of them")
+
+    found = sorted(datasets(path))
+    chosen = [d for d in found
+              if fnmatch(d, pattern) or fnmatch(posixpath.basename(d), pattern)]
+    if not chosen:
+        raise ValueError(
+            f"no dataset in {path} matches {pattern!r}; it holds "
+            + (", ".join(found) if found else "no 3D+ dataset"))
+    return [{**base, **location_spec(path, "hdf5", dataset=d)} for d in chosen]
+
+
 def resolve_offset(backend, offset, *, field: str, order: str | None, ndim: int):
     """The offset to write at, as ``(offset, provenance)``, taking it from the source
     if none was given.
