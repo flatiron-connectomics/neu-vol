@@ -738,3 +738,40 @@ def test_a_piece_is_named_after_its_source(tmp_path):
     # name= overrides the derived one, for when it is longer than it needs to be
     assert read_piece(path, name="mine").name == "mine"
     assert read_piece(path).with_name("later").name == "later"
+
+
+def test_a_piece_can_be_read_in_the_dtype_it_will_be_used_in(tmp_path):
+    """Crops exported by different tools arrive as uint8/16/32/64; a consumer that has to
+    handle all four is what `dtype=` avoids. Everything else about the piece is unchanged."""
+    from neu_vol import read_piece
+
+    path = _framed(tmp_path / "gt.h5")
+    piece = read_piece(path)
+    wide = read_piece(path, dtype="uint64")
+
+    assert piece.dtype == np.dtype("uint16") and wide.dtype == np.dtype("uint64")
+    np.testing.assert_array_equal(wide.array, piece.array)
+    assert wide.frame == piece.frame and wide.name == piece.name
+
+
+def test_a_narrowing_read_warns_because_a_wrapped_label_id_is_another_label_id(tmp_path,
+                                                                              caplog):
+    """Not refused — reading deliberately narrower is legitimate and only the caller knows
+    the range their labels use. Not silent either: a segmentation has no invalid values, so
+    nothing downstream can notice that 65538 came back as 2."""
+    import logging
+
+    from neu_vol import read_piece
+
+    path = _framed(tmp_path / "big.h5",
+                   data=np.array([[[0, 1, 65538]]], dtype="uint32"))
+    with caplog.at_level(logging.WARNING, logger="neu_vol.piece"):
+        narrow = read_piece(path, dtype="uint16")
+
+    assert narrow.array.tolist() == [[[0, 1, 2]]], "65538 wrapped, which is the hazard"
+    assert "not a safe cast" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="neu_vol.piece"):
+        read_piece(path, dtype="uint64")
+    assert not caplog.text, "widening among unsigned ints loses nothing, so it says nothing"

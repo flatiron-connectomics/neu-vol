@@ -147,6 +147,12 @@ two levels have different voxel sizes and a crop and its parent different origin
 read is capped at 4 GiB, because a whole production level 0 is terabytes and a read that
 size does not fail, it **hangs**; the error names a coarser level that would fit.
 
+`dtype=` casts after the read, so a piece arrives in the dtype it will be used in — crops
+exported by different tools come as uint8/16/32/64, and a consumer that has to handle all
+four is what this avoids. A narrowing cast is warned about rather than refused: widening
+among unsigned ints loses nothing, while narrowing wraps a label id into another plausible
+label id, which nothing downstream can detect.
+
 `write_piece()` is the inverse, and the door for an array **already in memory** — where
 `pack_hdf5` reads from a location. Read a crop, transform it, write the result:
 

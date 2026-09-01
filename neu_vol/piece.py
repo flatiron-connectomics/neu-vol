@@ -78,7 +78,7 @@ def _crop_request(crop: Any, what: str = "crop"):
 
 def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
                level: int = 0, crop: Any = None, dataset: str | None = None,
-               src_format: str | None = None,
+               src_format: str | None = None, dtype: str | type | None = None,
                voxel_size: Sequence[float] | None = None,
                name: str | None = None,
                max_bytes: int | None = DEFAULT_MAX_BYTES,
@@ -102,6 +102,15 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
 
     ``voxel_size`` overrides the recorded scale, and is required for a source that records
     none — a slice stack, or a plain HDF5 file.
+
+    ``dtype`` casts the voxels **after** the read, so a piece can arrive in the dtype it is
+    going to be used in — the destination volume's, usually, since a set of crops exported
+    by different tools arrives as uint8/uint16/uint32/uint64 and a consumer that has to
+    handle all four is the thing this avoids. A **narrowing** cast is warned about rather
+    than refused (``--cast`` on `neu-vol write` sets the same precedent): widening among
+    unsigned ints loses nothing, while narrowing wraps label ids into other label ids, which
+    is silent and unrecoverable. ``max_bytes`` governs the *read*, which is what can hang,
+    so a cast to a wider dtype costs memory the cap did not count.
 
     The piece is **named after the source** — ``stem`` or ``stem/dataset``
     (:func:`piece_name`) — so a consumer three calls away can still say what it is looking
@@ -225,10 +234,39 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
         # A crop out of something that already knows where it belongs lands at the SUM, the
         # same rule `neu-vol to-hdf5 --crop-bbox` follows.
         origin = tuple(o + i * v for o, i, v in zip(recorded, lo, voxel))
-        return Piece(array=source.read_region(region),
+        array = source.read_region(region)
+        if dtype is not None:
+            array = _cast(array, dtype, path=path, dataset=dataset)
+        return Piece(array=array,
                      frame=Frame(voxel_size_nm=voxel, origin_nm=origin),
                      kind=kind or meta.get("kind"),
                      name=name or piece_name(path, dataset))
+
+
+def _cast(array, dtype, *, path: str, dataset: str | None):
+    """``array`` as ``dtype``, saying so when the cast can change the values.
+
+    Warned about, not refused, for the reason `neu-vol write --cast` exists: reading a
+    piece deliberately narrower is legitimate, and only the caller knows the range their
+    labels actually use. What is not legitimate is *not being told* — a uint64 id narrowed
+    to uint32 comes back as a different, perfectly plausible id, which no later check can
+    catch because a segmentation has no invalid values.
+
+    ``np.can_cast``'s ``"safe"`` rule, so it costs nothing: it compares the two dtypes, not
+    the voxels, and a full-volume value check on every read is not a trade worth making.
+    """
+    import numpy as np
+
+    want = np.dtype(dtype)
+    if array.dtype == want:
+        return array
+    if not np.can_cast(array.dtype, want, "safe"):
+        logger.warning(
+            "reading %s%s as %s from %s is not a safe cast: a value that does not fit "
+            "wraps to a different one, and for label ids that is silent — the result is "
+            "another plausible id. Widening (uint32 -> uint64) is always safe",
+            path, f":{dataset}" if dataset else "", want, array.dtype)
+    return array.astype(want)
 
 
 def _host_block(block):
