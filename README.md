@@ -147,6 +147,23 @@ two levels have different voxel sizes and a crop and its parent different origin
 read is capped at 4 GiB, because a whole production level 0 is terabytes and a read that
 size does not fail, it **hangs**; the error names a coarser level that would fit.
 
+`write_piece()` is the inverse, and the door for an array **already in memory** — where
+`pack_hdf5` reads from a location. Read a crop, transform it, write the result:
+
+```python
+from neu_vol import read_piece, write_piece
+piece = read_piece("gt_v1_eval.h5:/vol_03700", "segmentation")
+write_piece(piece.apply(clean), "gt_v1_eval_cleaned.h5")     # -> /vol_03700, same frame
+```
+
+Four of `pack_hdf5`'s arguments are absent because the piece answers them: `voxel_size` is
+the frame's, `voxel_offset` is `piece.origin_voxel` (which raises rather than rounding a
+fractional origin), `axes` is always zyx and `units` always nm. The dataset name comes from
+the piece's own name, so a whole bag of crops round-trips through a cleaning pass with no
+arguments at all, accumulating into one output file. `kind` travels too — a cleaned
+segmentation reads back as one. Both writers go through the same layout code in `ops/pack`,
+so `write_subvolume` places either file the same way.
+
 `open_hdf5()` is the read side — one dataset of a file, ready to read regions from, with
 no spec to write out:
 

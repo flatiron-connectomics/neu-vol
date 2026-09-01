@@ -1,13 +1,22 @@
-"""Read a box out of any source, as a :class:`neu_lib.Piece`.
+"""Read a box out of any source as a :class:`neu_lib.Piece`, and write one back.
 
-One function, and it is the answer to "give me these voxels and everything known about
-where they are". Every consumer wanted it: neu-glance to host a crop, `write` to place
-one, `to-hdf5` to pack one, and a notebook to look at one — and each was assembling the
-array, the voxel size and the origin separately, which is three chances to drop the origin
-and land the data at nm zero (invariant 1).
+Two functions, and between them they are the answer to "give me these voxels and everything
+known about where they are" and "put them back". Every consumer wanted the first:
+neu-glance to host a crop, `write` to place one, `to-hdf5` to pack one, and a notebook to
+look at one — and each was assembling the array, the voxel size and the origin separately,
+which is three chances to drop the origin and land the data at nm zero (invariant NM-SPACE).
 
     piece = read_piece("gt.h5:/vol_03700")               # frame from the file
     piece = read_piece("s3://bucket/em", level=2, crop=piece)   # the SAME physical box
+    write_piece(cleaned, "gt_cleaned.h5")                # ...and back out again
+
+:func:`write_piece` closes that loop for an array **already in memory**, which is the shape
+of every in-process workflow: read a crop, transform it (``piece.apply``, neu-proc), write
+the result. Before it, the only way out was :func:`~neu_vol.pack_hdf5`, which reads from a
+*location* — so an in-memory result had to be written to a temporary file first in order to
+be written to a file. It shares `ops/pack.py`'s layout helpers rather than reimplementing
+them, so the two produce the same file and `neu-vol write` can place either with no
+arguments.
 
 **The crop may be given three ways, and the physical one is the point.** A voxel box means
 nothing outside its own frame — two levels of one volume have different voxel sizes, and a
@@ -220,6 +229,167 @@ def read_piece(src: str | Mapping[str, Any], kind: str | None = None, *,
                      frame=Frame(voxel_size_nm=voxel, origin_nm=origin),
                      kind=kind or meta.get("kind"),
                      name=name or piece_name(path, dataset))
+
+
+def _host_block(block):
+    """One block of a piece's array as a host numpy array.
+
+    **Not** ``piece.to_numpy()`` once up front: a ``Piece`` may hold a *lazy* array — a dask
+    or zarr array, an open h5py dataset — and converting the whole thing would materialise
+    exactly what a blocked write exists to avoid. **Not** ``np.asarray`` alone either: cupy
+    makes ``__array__`` raise on purpose, so a device array needs its own ``.get()``. Same
+    rule as ``neu_lib``'s own conversion, and checked by module rather than by catching
+    numpy's ``TypeError``, which also emits a spurious ``__array__`` deprecation warning
+    that would reach the caller looking like a bug in their code.
+    """
+    import numpy as np
+
+    if type(block).__module__.split(".")[0] == "cupy":
+        return np.asarray(block.get())
+    return np.asanyarray(block)
+
+
+def write_piece(piece, out: str, *, dataset: str | None = None,
+                dtype: Any = None, chunk: Sequence[int] | None = None,
+                compression: str | None = "gzip", overwrite: bool = False,
+                dry_run: bool = False,
+                voxel_size_field: str | None = None,
+                offset_field: str | None = None,
+                block_bytes: int | None = None) -> dict:
+    """Write a :class:`neu_lib.Piece` to an HDF5 file, frame and position included.
+
+    The inverse of :func:`read_piece`, and the round trip is the point::
+
+        piece = read_piece("gt_v1_eval.h5:/z07901")
+        cleaned = piece.apply(dust).apply(dilate)
+        write_piece(cleaned, "gt_v1_eval_cleaned.h5")    # -> /z07901, same frame
+
+    **Four arguments `pack_hdf5` needs are not here, because the piece answers them.**
+    ``voxel_size`` is ``piece.frame``'s; ``voxel_offset`` is ``piece.origin_voxel``, which
+    *raises* rather than rounding when the origin is not a whole number of voxels, since
+    rounding would shift the piece against whatever it is meant to line up with; ``axes`` is
+    always ``zyx`` and ``units`` always ``nm``, both by construction of the type (invariants
+    ZYX-XYZ and NM-SPACE). So there is no axis-order question on this path at all — the file
+    records ``axes="zyx"`` and ``neu-vol write`` reads it rather than assuming.
+
+    ``kind`` travels too, when the piece has one, and that is what makes the round trip
+    lossless: a cleaned segmentation read back is still a segmentation, where before it came
+    back as ``None`` and the next thing to coarsen it would have been free to average label
+    ids. Use ``piece.with_kind(...)`` to change it.
+
+    ``dataset`` defaults to **the last component of ``piece.name``** when that name has one
+    (``"specimen5_gt_v1_eval/z07901"`` -> ``/z07901``), which is what makes a bag of crops
+    round-trip through a whole cleaning pass with no arguments — :func:`read_piece` names a
+    piece after its source, so the names are already there. A piece named after a volume
+    rather than an array inside one has no such component and gets
+    :data:`~neu_vol.ops.pack.DEFAULT_DATASET`. Pass ``dataset`` for anything else, including
+    a nested path, which the derived name does not preserve.
+
+    An existing file is **added to** when its recorded frame matches, which is how a set of
+    cleaned crops accumulates into one file; a frame that disagrees, and a dataset name
+    already in use without ``overwrite``, are refused rather than guessed
+    (:func:`~neu_vol.ops.pack.check_hdf5_target`).
+
+    Writing is **blocked**, so a piece holding a lazy array streams rather than being
+    materialised whole. ``dry_run`` returns the same plan dict without touching the file.
+
+    ``out`` must be a local path with an HDF5 extension — h5py has no object-store driver,
+    and detection goes by name, so a file written under any other name would be unreadable
+    by everything here that has to *recognise* it. To place a piece into an existing volume
+    instead, write it here and then ``neu-vol write <volume> --src <file>``, which needs no
+    offset because this recorded one.
+    """
+    import numpy as np
+
+    from blockrun import iter_blocks
+
+    from .backends.hdf5 import HDF5_EXTENSIONS, require_local_path
+    from .logs import quiet_reads
+    from .ops.pack import (DEFAULT_BLOCK_BYTES, DEFAULT_OFFSET_FIELD,
+                           DEFAULT_VOXEL_SIZE_FIELD, _block_shape, check_hdf5_target,
+                           hdf5_dataset_name, write_hdf5_array)
+
+    voxel_size_field = voxel_size_field or DEFAULT_VOXEL_SIZE_FIELD
+    offset_field = offset_field or DEFAULT_OFFSET_FIELD
+
+    out = require_local_path(out, "the HDF5 file to write")
+    if not out.lower().endswith(HDF5_EXTENSIONS):
+        raise ValueError(
+            f"{out!r} does not end in one of {', '.join(HDF5_EXTENSIONS)}, and this writes "
+            f"an HDF5 file. The extension is not cosmetic: HDF5 has no marker object, so "
+            f"`describe`, `neu-vol info` and `neu-vol write` recognise a container BY NAME "
+            f"and would not recognise this one. To write into a volume instead, write the "
+            f"piece to an .h5 and place it with `neu-vol write <volume> --src <file>`")
+
+    # A piece is zyx nanometres by construction; those are the two invariants that make the
+    # arguments `pack_hdf5` has to ask for unnecessary here.
+    axes = ("z", "y", "x")
+    units = "nm"
+    voxel_size = tuple(float(v) for v in piece.voxel_size_nm)
+    voxel_offset = tuple(int(v) for v in piece.origin_voxel)
+
+    name = hdf5_dataset_name(dataset if dataset is not None
+                             else _dataset_from_piece_name(piece.name))
+    shape = piece.shape
+    out_dtype = np.dtype(dtype or piece.dtype)
+    frame = {"voxel_size": voxel_size, "units": units, "axes": axes}
+
+    _existing, existing_datasets, replacing = check_hdf5_target(
+        out, name, frame, overwrite=overwrite, voxel_size_field=voxel_size_field)
+    others = [d for d in existing_datasets if d != name]
+    block = _block_shape(shape, out_dtype.itemsize, block_bytes or DEFAULT_BLOCK_BYTES)
+    plan = {
+        "out": out, "dataset": name, "piece": piece.name, "shape": shape,
+        "dtype": str(out_dtype), "has_channels": piece.channel_axis,
+        "voxel_size": voxel_size, "voxel_offset": voxel_offset, "units": units,
+        "axes": axes, "kind": piece.kind, "chunk": tuple(chunk) if chunk else None,
+        "compression": compression, "nbytes": float(out_dtype.itemsize) * math.prod(shape),
+        "blocks": len(list(iter_blocks(shape, block))), "block_shape": block,
+        "replacing": replacing, "appending": bool(existing_datasets) and not replacing,
+        "other_datasets": others,
+    }
+    if dry_run:
+        return plan
+
+    if others:
+        # INFO, where `pack_hdf5` warns: a file of many datasets is what this path is FOR —
+        # a bag of crops written back one at a time — so warning would fire once per crop on
+        # a normal cleaning pass, twelve times over for a thirteen-crop set. The fact stays
+        # on the record, and a reader that later needs a name gets `sole_dataset`'s error,
+        # which lists them.
+        logger.info("%s now holds %d volumetric datasets (%s); readers must name one "
+                    "— `neu-vol write --dataset %s`, or HDF5Backend's `dataset` key",
+                    out, len(others) + 1, ", ".join(others + [name]), name)
+
+    array = piece.array
+    # `quiet_reads` for the same reason `read_piece` uses it: this is a notebook entry
+    # point, and a lazy array may reach across a store to fill each block.
+    with quiet_reads():
+        write_hdf5_array(out, name, lambda region: _host_block(array[region]),
+                         shape=shape, dtype=out_dtype, voxel_size=voxel_size,
+                         voxel_offset=voxel_offset, units=units, axes=axes,
+                         kind=piece.kind, chunk=chunk, compression=compression,
+                         replacing=replacing, block=block,
+                         has_channels=piece.channel_axis,
+                         voxel_size_field=voxel_size_field, offset_field=offset_field)
+    logger.info("wrote %s -> %s%s (%s %s, %d block(s))", piece.name or "piece", out, name,
+                shape, out_dtype, plan["blocks"])
+    return plan
+
+
+def _dataset_from_piece_name(name: str | None) -> str | None:
+    """The array half of a piece's name, or ``None`` if it names no array.
+
+    :func:`piece_name` builds ``stem/inner`` for an array inside a container and a bare
+    ``stem`` for a volume, so the slash is exactly the signal that the source had a dataset
+    name of its own worth reusing. Without one, the caller gets the default dataset rather
+    than a file whose single array is named after a volume directory.
+    """
+    import posixpath
+
+    if not name or "/" not in str(name):
+        return None
+    return posixpath.basename(str(name).strip("/")) or None
 
 
 #: Suffixes stripped when naming a piece after its source. A volume's directory name is

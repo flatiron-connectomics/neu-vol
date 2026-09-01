@@ -17,7 +17,7 @@ from .volume import Volume
 # the common names here for convenience / backward compatibility.
 from blockrun import Block, iter_blocks, block_map, idempotent
 from .backends.base import (ArrayBackend, clear_backend_cache, open_backend,
-                            register_backend)
+                            register_backend, release_backends)
 # The one format-specific opener, and the reason it earns a top-level name: an HDF5 file
 # is a container, so "open this path" is ambiguous in a way it is not for a volume, and
 # `open_backend` deliberately stays spec-only (see `open_hdf5`'s own docstring). Costs
@@ -29,7 +29,7 @@ from .profiles import StorageProfile, PROFILES, get_profile
 from .ops import (convert, create_volume, extract_roi, ingest_image_stack,
                   mask_values, pack_hdf5, plan_subvolume_write, plan_volume,
                   rebuild_pyramid, write_subvolume, write_subvolumes)
-from .piece import piece_name, read_piece
+from .piece import piece_name, read_piece, write_piece
 from .source_metadata import describe, existing_levels, level_spec
 # Per-level shape, voxel size and origin, read from the source's own metadata. Came
 # from neu-morpho, which had meant neu-draw importing a meshing package to learn a
@@ -52,6 +52,7 @@ __all__ = [
     "ArrayBackend",
     "open_backend",
     "clear_backend_cache",
+    "release_backends",
     "register_backend",
     "is_transient",
     "with_retry",
@@ -70,6 +71,7 @@ __all__ = [
     "pack_hdf5",
     "open_hdf5",
     "read_piece",
+    "write_piece",
     "piece_name",
     "mask_values",
     "describe",

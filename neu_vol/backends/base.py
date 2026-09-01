@@ -90,6 +90,57 @@ def clear_backend_cache() -> None:
     _BACKENDS.clear()
 
 
+def spec_names_path(spec: Any, path: str) -> bool:
+    """Whether ``spec`` reaches ``path``, nested views included.
+
+    A view backend (``crop``, ``mask``, ``remap``) carries its source spec inside itself,
+    so a match has to be looked for at any depth: a cached crop over an HDF5 file holds
+    that file's handle just as directly as the plain backend does.
+    """
+    if isinstance(spec, Mapping):
+        if str(spec.get("path", "")) == path:
+            return True
+        return any(spec_names_path(v, path) for v in spec.values())
+    if isinstance(spec, (list, tuple)):
+        return any(spec_names_path(v, path) for v in spec)
+    return False
+
+
+def release_backends(path: str) -> int:
+    """Drop and **close** every cached backend that reads ``path``. Returns how many.
+
+    Call before rewriting a file in place. This exists because of a failure that says
+    nothing about caching: an ``HDF5Backend`` holds an open ``h5py.File`` for the life of
+    the cache entry, and HDF5 refuses to open a file for writing while any handle has it
+    open read-only — ``OSError: Unable to synchronously open file (file is already open for
+    read-only)``. So reading a file and then writing to it *in the same process* — exactly
+    what a notebook cleaning pass does, and what a re-run of one does — failed on the
+    write with an error pointing at the file rather than at the reader still holding it.
+
+    The other half is staleness: an entry that survived a rewrite would keep serving the
+    array and the attributes from before it, which is the same hazard
+    :func:`clear_backend_cache` was written for and is silent instead of loud.
+
+    Closing, not merely dropping, is the load-bearing part — the lock belongs to the open
+    handle, and waiting for garbage collection to release it makes the failure depend on
+    when a reference happens to die. A backend with no ``close`` is simply dropped.
+    """
+    dropped = 0
+    for key, backend in list(_BACKENDS.items()):
+        try:
+            spec = backend.to_spec()
+        except Exception:                                    # pragma: no cover - defensive
+            continue
+        if not spec_names_path(spec, str(path)):
+            continue
+        _BACKENDS.pop(key, None)
+        closer = getattr(backend, "close", None)
+        if callable(closer):
+            closer()
+        dropped += 1
+    return dropped
+
+
 def open_backend(spec: Mapping[str, Any]) -> ArrayBackend:
     """Open a backend from a serializable spec (cached per spec, per process).
 

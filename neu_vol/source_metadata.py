@@ -477,6 +477,20 @@ def _read_hdf5(spec: Mapping[str, Any]) -> dict | None:
     units = backend.stored_units()
     shape = tuple(int(s) for s in backend.shape)
     axes = tuple(order)
+
+    # An HDF5 file has no agreed-on place to say image or segmentation, so a `kind` this
+    # package did not write is not evidence — `kind` is a plain word another tool may have
+    # used for something else. Only a member of the vocabulary is trusted, the same rule
+    # `_read_zarr_ome` applies to the multiscales `type`, and anything else reads as
+    # unrecorded rather than raising: it costs a `convert --kind`, where trusting it wrongly
+    # would average label ids into ids that were never in the data.
+    from neu_lib import KINDS
+
+    stated_kind = backend.stored_kind()
+    kind = stated_kind[0] if stated_kind and stated_kind[0] in KINDS else None
+    if stated_kind and kind is None:
+        log.info("%s records kind %r (%s), which is not one of %s, so it is ignored",
+                 spec.get("path"), stated_kind[0], stated_kind[1], ", ".join(KINDS))
     return {
         # The spec as given: an HDF5 dataset IS the array, so there is no level or scale
         # to descend into, and `data_spec` carries the resolved `dataset` through the
@@ -488,10 +502,10 @@ def _read_hdf5(spec: Mapping[str, Any]) -> dict | None:
         "units": units[0] if units else None,
         "spatial_axes": axes,
         "has_channels": len(shape) > len(axes),
-        # An HDF5 file has nowhere agreed-on to say image or segmentation, and guessing
-        # is the one that averages label ids into ids that were never in the data. So it
-        # stays unrecorded and `convert --kind` is required to say.
-        "kind": None,
+        # Recorded when the file says so in this package's own vocabulary, and `None`
+        # otherwise — never inferred from the dtype, which is the guess that averages label
+        # ids into ids that were never in the data. Unrecorded means `convert --kind`.
+        "kind": kind,
     }
 
 

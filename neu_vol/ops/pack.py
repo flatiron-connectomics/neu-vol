@@ -75,7 +75,19 @@ DEFAULT_OFFSET_FIELD = "voxel_offset"
 #: of dying. Blocks cover whole z-slabs, the natural read unit of an image stack.
 DEFAULT_BLOCK_BYTES = 1 * 1024 ** 3
 
-
+#: Attribute recording what the voxels MEAN (:data:`neu_lib.KINDS`), on the dataset.
+#:
+#: HDF5 has no agreed-on place for this, which is why the *reader* refuses to guess one —
+#: a uint8 label array is indistinguishable from an image by dtype, and guessing wrong
+#: authorises averaging label ids into ids that were never in the data. Recording it when
+#: it is **known** is the other half of that: a :class:`neu_lib.Piece` carries its kind, so
+#: writing one out and reading it back should not lose it. Read back only when the value is
+#: one this package would have written, the same rule the zarr reader applies to the
+#: multiscales ``type``.
+#:
+#: On the dataset only, not the root: it describes an array, where ``voxel_size`` / ``units``
+#: / ``axes`` describe the file's coordinate system and several arrays share it.
+KIND_ATTR = "kind"
 
 
 def resolve_source(src: str | dict, src_format: str | None = None, level: int = 0,
@@ -125,6 +137,10 @@ def resolve_source(src: str | dict, src_format: str | None = None, level: int = 
             if order:
                 frame["axes"] = tuple(order[0])
                 logger.info("axes taken from the source, %s", order[1])
+            meaning = backend.stored_kind()
+            if meaning:
+                frame["kind"] = meaning[0]
+                logger.info("kind taken from the source, %s", meaning[1])
             found = backend.stored_offset(offset_field)
             if found:
                 # Through `resolve_offset` so the axis-order rule lives in one place: a
@@ -157,6 +173,11 @@ def resolve_source(src: str | dict, src_format: str | None = None, level: int = 
         frame["voxel_size"] = tuple(per_level[level])
     if meta.get("units"):
         frame["units"] = meta["units"]
+    if meta.get("kind"):
+        # A volume states what its voxels mean; the packed piece should not have to be
+        # told again. This is the one direction that is safe to carry automatically —
+        # inferring it from a dtype is the mistake, reading a recorded value is not.
+        frame["kind"] = meta["kind"]
     return level_spec(volume, fmt, level), frame
 
 
@@ -210,6 +231,141 @@ def _frame_mismatch(existing: dict, wanted: dict) -> list[str]:
     return bad
 
 
+# --------------------------------------------------------------------------- #
+# The file layout, in one place
+#
+# Two callers write an HDF5 piece and they must produce the *same* file: `pack_hdf5`
+# streams one out of a source location, and `neu_vol.write_piece` writes an array that is
+# already in memory. The three functions below are everything either of them knows about
+# the layout — the dataset name, what an existing file allows, and which attributes land
+# where — so a change to the convention cannot reach one writer and miss the other. That
+# had a real cost available: a file whose `axes` said one thing and whose sibling dataset
+# said another would place the two pieces mirrored against each other.
+# --------------------------------------------------------------------------- #
+def hdf5_dataset_name(dataset: str | None) -> str:
+    """A dataset name as a rooted path, defaulting to :data:`DEFAULT_DATASET`.
+
+    Rooted because that is the form ``h5py`` reports back from ``visititems`` and the form
+    every caller compares against; ``"gt/piece0"`` and ``"/gt/piece0"`` naming the same
+    array while failing an equality test is how a second write silently became an append.
+    """
+    name = dataset or DEFAULT_DATASET
+    return name if name.startswith("/") else "/" + name
+
+
+def check_hdf5_target(out: str, name: str, frame: dict, *, overwrite: bool = False,
+                      voxel_size_field: str = DEFAULT_VOXEL_SIZE_FIELD
+                      ) -> tuple[dict, list[str], bool]:
+    """What an existing ``out`` allows: ``(its frame, its datasets, replacing)``.
+
+    An existing file is **added to** rather than replaced — several pieces of one volume
+    in one file is a legitimate arrangement, and each dataset keeps its own
+    ``voxel_offset``. Two things are refused instead of guessed:
+
+    * a frame that disagrees with the file's, since one file describing two coordinate
+      systems has no correct reading;
+    * a dataset name already in use, unless ``overwrite``.
+
+    A missing file is not an error — it is the ordinary case — so this answers with empties.
+    """
+    import os
+
+    import h5py
+
+    if not os.path.exists(out):
+        return {}, [], False
+
+    with h5py.File(out, "r") as f:
+        existing_frame = _read_frame(f, voxel_size_field)
+        found: list[str] = []
+        f.visititems(lambda n, o: found.append("/" + n)
+                     if isinstance(o, h5py.Dataset) and o.ndim >= 3 else None)
+        existing_datasets = sorted(found)
+
+    mismatch = _frame_mismatch(existing_frame, frame)
+    if mismatch:
+        raise ValueError(
+            f"{out} already records a different frame, so adding to it would make one "
+            f"file describe two coordinate systems: " + "; ".join(mismatch))
+    replacing = name in existing_datasets
+    if replacing and not overwrite:
+        raise FileExistsError(
+            f"{out} already has a dataset at {name}. Give another name, or pass "
+            f"overwrite=True to replace it.")
+    return existing_frame, existing_datasets, replacing
+
+
+def write_hdf5_array(out: str, name: str, read_region, *, shape: Sequence[int],
+                     dtype: Any, voxel_size: Sequence[float],
+                     voxel_offset: Sequence[int], units: str = "nm",
+                     axes: Sequence[str] = ("z", "y", "x"), kind: str | None = None,
+                     chunk: Sequence[int] | None = None,
+                     compression: str | None = "gzip", replacing: bool = False,
+                     block: Sequence[int] | None = None,
+                     has_channels: bool = False,
+                     voxel_size_field: str = DEFAULT_VOXEL_SIZE_FIELD,
+                     offset_field: str = DEFAULT_OFFSET_FIELD) -> None:
+    """Create ``out``'s ``name`` from ``read_region``, and record the frame beside it.
+
+    ``read_region(region) -> ndarray`` is called once per block, so nothing here holds the
+    whole array: a "small" piece that turns out not to be still writes. ``voxel_offset``
+    describes the **spatial** axes; a leading channel axis, if there is one, is prepended
+    as 0, since a channel is not a position.
+
+    What is recorded, and why in two places: ``voxel_size`` / ``units`` / ``axes`` go on the
+    root *and* the dataset, so either the file or the array alone is self-describing;
+    ``voxel_offset`` (whole voxels), ``offset`` (the same place in ``units``) and ``kind``
+    go on the dataset alone, being that piece's own. ``axes`` is the one that pays for
+    itself immediately — ``voxel_offset``'s axis order is otherwise **unknowable from the
+    file**, since the name is precomputed's and means xyz there while everything in this
+    package is zyx, and a wrong guess mirrors the piece through the z=x diagonal with
+    nothing downstream able to tell.
+    """
+    import h5py
+
+    from ..backends.base import release_backends
+
+    # Before opening for writing: a cached reader holds an open handle, and HDF5 refuses to
+    # open a file for writing while one does — so reading a file and then writing to it in
+    # the same process failed on the write, with an error naming the file rather than the
+    # reader still holding it. `release_backends` closes those and says why.
+    release_backends(out)
+
+    shape = tuple(int(s) for s in shape)
+    out_dtype = np.dtype(dtype)
+    axes = tuple(axes)
+    voxel_size = tuple(float(v) for v in voxel_size)
+    voxel_offset = tuple(int(v) for v in voxel_offset)
+
+    chunk_full = tuple(chunk) if chunk else tuple(min(64, s) for s in shape)
+    if len(chunk_full) != len(shape):
+        raise ValueError(f"chunk {chunk_full} does not match the source's {len(shape)} axes")
+    chunk_full = tuple(min(int(c), int(s)) for c, s in zip(chunk_full, shape))
+    block = tuple(block) if block else _block_shape(shape, out_dtype.itemsize)
+
+    with h5py.File(out, "a") as f:
+        if replacing:
+            del f[name]
+        dset = f.create_dataset(name, shape=shape, dtype=out_dtype, chunks=chunk_full,
+                                **({"compression": compression} if compression else {}))
+        for b in iter_blocks(shape, block):
+            data = read_region(b.region)
+            if str(data.dtype) != str(out_dtype):
+                data = data.astype(out_dtype)
+            dset[b.region] = data
+
+        for target in (f, dset):
+            target.attrs[voxel_size_field] = np.asarray(voxel_size, dtype="float64")
+            target.attrs["units"] = units
+            target.attrs["axes"] = "".join(axes)
+        full_offset = ((0,) + voxel_offset) if has_channels else voxel_offset
+        dset.attrs[offset_field] = np.asarray(full_offset, dtype="int64")
+        dset.attrs["offset"] = np.asarray(
+            [o * v for o, v in zip(voxel_offset, voxel_size)], dtype="float64")
+        if kind is not None:
+            dset.attrs[KIND_ATTR] = str(kind)
+
+
 def pack_hdf5(
     src: str | dict,
     out: str,
@@ -227,6 +383,7 @@ def pack_hdf5(
     voxel_size_field: str = DEFAULT_VOXEL_SIZE_FIELD,
     offset_field: str = DEFAULT_OFFSET_FIELD,
     background: Sequence[int] | None = None,
+    kind: str | None = None,
     dtype: str | None = None,
     chunk: Sequence[int] | None = None,
     compression: str | None = "gzip",
@@ -245,17 +402,21 @@ def pack_hdf5(
 
     ``voxel_offset`` is in the same axis order as ``axes``, whole voxels, and names the
     position of the piece's ``(0, ...)`` corner in the volume it belongs to.
-    """
-    import h5py
 
+    ``kind`` records what the voxels mean (:data:`KIND_ATTR`) and defaults to what the
+    source recorded — a precomputed or zarr volume says so in its own metadata, an image
+    stack or a bare array cannot. Pass it explicitly for those, or leave it unrecorded:
+    guessing from the dtype is the mistake that later averages label ids.
+
+    To write an array that is **already in memory**, use
+    :func:`neu_vol.write_piece` — same file layout, no round trip through a store.
+    """
     from ..backends.hdf5 import require_local_path
 
     # Up front, before any of the source is read: h5py has no object-store driver, and
     # discovering that after streaming a volume through it would be a poor trade.
     out = require_local_path(out, "the HDF5 file to write")
-    name = dataset or DEFAULT_DATASET
-    if not name.startswith("/"):
-        name = "/" + name
+    name = hdf5_dataset_name(dataset)
     axes = tuple(axes)
 
     # `write.source_spec` for a file someone is pointing at — the same situation `write`
@@ -264,6 +425,19 @@ def pack_hdf5(
     # the frame that volume already records.
     spec, frame = resolve_source(src, src_format, level, src_dataset, voxel_size_field,
                                  offset_field)
+    from ..backends.base import spec_names_path
+
+    if spec_names_path(spec, out):
+        # The source is read block by block *while* the destination is open for writing, and
+        # HDF5 permits only one of those at a time on one file — so this has never worked; it
+        # failed on `h5py.File(out, "a")` with an error about the file being open read-only.
+        # Said plainly here instead, because the intent (add a dataset to this same file) is
+        # reasonable and the way to do it is a second file, or `neu_vol.write_piece` on a
+        # piece already read out.
+        raise ValueError(
+            f"src and out are the same file ({out}), which HDF5 cannot do: the source is "
+            f"read while the destination is open for writing, and one file cannot be both. "
+            f"Pack into a new file, or `read_piece` the array and `write_piece` it back.")
     if voxel_size is None:
         voxel_size = frame.get("voxel_size")
         if voxel_size is None:
@@ -318,31 +492,14 @@ def pack_hdf5(
         raise ValueError(f"voxel_size {voxel_size}, voxel_offset {voxel_offset} and axes "
                          f"{axes} must describe the same number of axes")
 
+    if kind is None:
+        kind = frame.get("kind")
+
     # The frame describes the spatial axes; a channel axis is not a physical dimension.
     frame = {"voxel_size": voxel_size, "units": units, "axes": axes}
-    full_offset = ((0,) + voxel_offset) if has_channels else voxel_offset
 
-    existing_frame, existing_datasets, replacing = {}, [], False
-    import os
-
-    if os.path.exists(out):
-        with h5py.File(out, "r") as f:
-            existing_frame = _read_frame(f, voxel_size_field)
-            found: list[str] = []
-            f.visititems(lambda n, o: found.append("/" + n)
-                         if isinstance(o, h5py.Dataset) and o.ndim >= 3 else None)
-            existing_datasets = sorted(found)
-        mismatch = _frame_mismatch(existing_frame, frame)
-        if mismatch:
-            raise ValueError(
-                f"{out} already records a different frame, so adding to it would make one "
-                f"file describe two coordinate systems: " + "; ".join(mismatch))
-        if name in existing_datasets:
-            if not overwrite:
-                raise FileExistsError(
-                    f"{out} already has a dataset at {name}. Give another name, or pass "
-                    f"overwrite=True to replace it.")
-            replacing = True
+    _existing_frame, existing_datasets, replacing = check_hdf5_target(
+        out, name, frame, overwrite=overwrite, voxel_size_field=voxel_size_field)
 
     others = [d for d in existing_datasets if d != name]
     block = _block_shape(shape, out_dtype.itemsize, max_bytes)
@@ -350,7 +507,7 @@ def pack_hdf5(
         "out": out, "dataset": name, "src_spec": spec, "shape": shape,
         "dtype": str(out_dtype), "has_channels": has_channels,
         "voxel_size": voxel_size, "voxel_offset": voxel_offset, "units": units,
-        "axes": axes, "chunk": tuple(chunk) if chunk else None,
+        "axes": axes, "kind": kind, "chunk": tuple(chunk) if chunk else None,
         "compression": compression, "nbytes": float(out_dtype.itemsize) * math.prod(shape),
         "blocks": len(list(iter_blocks(shape, block))), "block_shape": block,
         "replacing": replacing, "appending": bool(existing_datasets) and not replacing,
@@ -366,31 +523,11 @@ def pack_hdf5(
                        "— `neu-vol write --dataset %s`, or HDF5Backend's `dataset` key",
                        out, len(others) + 1, ", ".join(others + [name]), name)
 
-    chunk_full = tuple(chunk) if chunk else tuple(min(64, s) for s in shape)
-    if len(chunk_full) != len(shape):
-        raise ValueError(f"chunk {chunk_full} does not match the source's {len(shape)} axes")
-    chunk_full = tuple(min(int(c), int(s)) for c, s in zip(chunk_full, shape))
-
-    with h5py.File(out, "a") as f:
-        if replacing:
-            del f[name]
-        dset = f.create_dataset(name, shape=shape, dtype=out_dtype, chunks=chunk_full,
-                                **({"compression": compression} if compression else {}))
-        for b in iter_blocks(shape, block):
-            data = backend.read_region(b.region)
-            if str(data.dtype) != str(out_dtype):
-                data = data.astype(out_dtype)
-            dset[b.region] = data
-
-        # Frame on the root (the file's coordinate system) and on the dataset (so the
-        # array is self-describing), plus this piece's own position on the dataset.
-        for target in (f, dset):
-            target.attrs[voxel_size_field] = np.asarray(voxel_size, dtype="float64")
-            target.attrs["units"] = units
-            target.attrs["axes"] = "".join(axes)
-        dset.attrs[offset_field] = np.asarray(full_offset, dtype="int64")
-        dset.attrs["offset"] = np.asarray(
-            [o * v for o, v in zip(voxel_offset, voxel_size)], dtype="float64")
+    write_hdf5_array(out, name, backend.read_region, shape=shape, dtype=out_dtype,
+                     voxel_size=voxel_size, voxel_offset=voxel_offset, units=units,
+                     axes=axes, kind=kind, chunk=chunk, compression=compression,
+                     replacing=replacing, block=block, has_channels=has_channels,
+                     voxel_size_field=voxel_size_field, offset_field=offset_field)
     logger.info("packed %s -> %s%s (%s %s, %d block(s))", spec, out, name, shape,
                 out_dtype, plan["blocks"])
     return plan
