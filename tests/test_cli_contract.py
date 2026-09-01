@@ -42,9 +42,43 @@ def test_every_subcommand_is_reachable_from_the_parser():
     # and `gen`. A clean break with no aliases, so an old invocation fails loudly.
     assert set(subs) == {"info", "convert", "copy", "downsample", "create", "write",
                          "to-hdf5", "progress",
-                         "align-bbox", "relabel", "mask-by-value"}
+                         "align-bbox", "relabel", "mask-by-value", "help"}
     for name, sub in subs.items():
         assert sub.format_usage().strip(), f"{name} renders no usage line"
+
+
+def test_help_is_a_subcommand_as_well_as_a_flag(capsys):
+    """`neu-vol help write` and `neu-vol write --help` are the same thing to everyone
+    except argparse, and being told "invalid choice" for one of them is a poor greeting
+    from a tool whose whole surface is subcommands."""
+    from neu_vol import cli
+
+    assert cli.main(["help"]) == 0
+    assert "usage: neu-vol" in capsys.readouterr().out
+
+    assert cli.main(["help", "write"]) == 0
+    printed = capsys.readouterr().out
+    assert "usage: neu-vol write" in printed and "--all-datasets" in printed
+
+
+def test_the_help_subcommand_IS_the_flag_rather_than_a_copy_of_it(capsys):
+    """Re-parsing is what keeps the two identical: there is no second rendering to drift."""
+    import pytest
+
+    from neu_vol import cli
+
+    cli.main(["help", "write"])
+    subcommand = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["write", "--help"])
+    assert capsys.readouterr().out == subcommand
+
+
+def test_help_for_something_that_is_not_a_command_lists_the_real_ones(capsys):
+    from neu_vol import cli
+
+    assert cli.main(["help", "nosuch"]) == 2, "argparse's own exit code for a bad choice"
+    assert "invalid choice: 'nosuch'" in capsys.readouterr().err
 
 
 def test_parse_args_still_goes_through_build_parser():

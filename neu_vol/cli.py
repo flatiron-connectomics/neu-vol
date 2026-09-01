@@ -2348,7 +2348,39 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_relabel)
 
+    _add_help_command(sub)
     return p
+
+
+def _add_help_command(sub) -> None:
+    """``neu-vol help [COMMAND ...]`` — the same text ``--help`` prints.
+
+    Because ``help write`` and ``write --help`` are the same thing to everyone except
+    argparse: one of the two is what a person types first, and being told "invalid choice"
+    for it is a poor greeting from a tool whose whole surface is subcommands.
+
+    It **re-parses** rather than reaching into the parser, so what it prints cannot drift
+    from ``--help``: it literally is ``--help``. A nested command works for the same reason
+    (``neu-morpho help measure run``), and an unknown one gets argparse's own error listing
+    the real choices, which is better than anything written here.
+    """
+    q = sub.add_parser(
+        "help", help="what `--help` prints, as a subcommand",
+        description="Print the help for the tool, or for one of its subcommands.\n\n"
+                    "`neu-vol help write` and `neu-vol write --help` are the same thing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("command", nargs="*", metavar="COMMAND",
+                   help="the subcommand to describe (default: the whole tool)")
+    q.set_defaults(func=cmd_help)
+
+
+def cmd_help(args) -> int:
+    """Hand the arguments back to the parser as ``--help``, and report its exit code."""
+    try:
+        build_parser().parse_args([*args.command, "--help"])
+    except SystemExit as e:                      # what --help always does
+        return int(e.code or 0)
+    return 0
 
 
 def _parse_args(argv=None):

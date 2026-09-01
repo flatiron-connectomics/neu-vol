@@ -276,6 +276,7 @@ neu-vol to-hdf5 --src slices/ --out piece.h5  # pack a piece, frame and position
 neu-vol align-bbox --volume ... --bbox ...    # move a box onto the block grid
 neu-vol relabel <volume> --out ...            # one id range per occupied region
 neu-vol mask-by-value <volume> --values 1     # background that is not 0, made 0
+neu-vol help    [COMMAND]                     # what --help prints, as a subcommand
 ```
 
 Anything a **viewer** consumes lives in [neu-glance](../neu-glance): `neu-glance gen` for a link or a
