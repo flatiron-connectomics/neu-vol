@@ -88,6 +88,15 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "be abbreviated or carry a branch (93fdbc:main), INSTANCE is the "
                         "labelmap name. Use dvid+https:// for a TLS server. e.g. "
                         "dvid://dvid.example.org/93fdbc:main/labels")
+    p.add_argument("--src-level", type=int, default=None, metavar="N",
+                   help="which scale of a MULTISCALE SOURCE becomes the output's level "
+                        "0 (default: the finest one that actually stores data). An "
+                        "`info` may declare scales that were never written — one "
+                        "neuropil mask declares seven and stores one — and such a scale "
+                        "opens, reports the extent its metadata claims, and reads as "
+                        "the fill value everywhere, so without this the output is a "
+                        "correct-looking volume of zeros. The output's voxel size is "
+                        "that scale's own, never an assumed 2**N")
     p.add_argument("--dvid-supervoxels", action="store_true",
                    help="read SUPERVOXELS rather than agglomerated bodies (DVID sources "
                         "only). Default is bodies, i.e. the proofread segmentation")
@@ -121,6 +130,13 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "label-preserving mode for segmentation. Getting this wrong "
                         "is silent — averaging label ids invents ids. Default: from the "
                         "source where it records one, else image")
+    p.add_argument("--dtype", default=None, metavar="TYPE",
+                   help="cast to this dtype on the way out, e.g. uint64 (default: the "
+                        "source's). Mainly for --kind segmentation, whose precomputed "
+                        "encoding is compressed_segmentation and accepts uint32/uint64 "
+                        "only — a uint8 mask has to be widened here or it cannot be "
+                        "written as a segmentation at all. The cast must be lossless "
+                        "for the values present; narrowing is not checked")
     p.add_argument("--voxel-size", default=None,
                    help="z,y,x nm (default: from source)")
     p.add_argument("--chunk", default=None if source_defaults else "128,128,128",
@@ -554,7 +570,7 @@ def _level0_chunking(d, src):
     """
     from neu_vol.backends.base import open_backend
 
-    lvl0 = d["levels"].get(0) or {}
+    lvl0 = d["levels"].get(d.get("source_level") or 0) or {}
     if lvl0.get("read_chunks") or lvl0.get("chunks"):
         return lvl0.get("read_chunks"), lvl0.get("chunks")
     meta = d["meta"] or {}
@@ -670,6 +686,8 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
             summary = convert(
                 args.src, target, voxel_size=voxel,
                 src_format=getattr(args, "src_format", None),
+                src_level=getattr(args, "src_level", None),
+                dtype=getattr(args, "dtype", None),
                 profile=profile, kind=kind, chunk=chunk,
                 crop_start=crop_start, crop_stop=crop_stop,
                 mask_boxes=[[lo, hi] for lo, hi in masks],
@@ -723,7 +741,10 @@ def cmd_copy(args) -> int:
             f"Add --dvid-locked for an immutable node, and --crop-bbox to take a box.")
 
     try:
-        d = describe(args.src)
+        # `level=` so every source-derived default below — voxel size, chunking, dtype,
+        # the reported extent — comes from the scale that will actually be read, rather
+        # than from a finer one the volume may only have declared.
+        d = describe(args.src, level=args.src_level)
     except ValueError as e:
         raise SystemExit(str(e)) from None       # malformed location, not a missing one
     except FileNotFoundError:
@@ -739,6 +760,18 @@ def cmd_copy(args) -> int:
     # message that names the actual problem if that ever changes.
     d = _one_array(d, args.src, "neu-vol copy")
     meta = d["meta"] or {}
+
+    # Before the plan is printed, not just before the run: --dry-run is where you check
+    # a copy, and an unwritten source scale otherwise reports a perfectly plausible
+    # 10.1 TiB of level 0 that would all read as the fill value. `convert` guards again
+    # for callers that never come through here.
+    from neu_vol.source_metadata import require_populated_scale
+
+    if meta.get("data_spec"):
+        try:
+            require_populated_scale(meta["data_spec"], op="copy")
+        except ValueError as e:
+            raise SystemExit(str(e)) from None
 
     # A `.gz`-chunked source (CloudVolume) copies out as PLAIN precomputed, which is
     # much of the point: the copy is addressable by tensorstore, the original is not.
@@ -769,6 +802,16 @@ def cmd_copy(args) -> int:
     # the source extent rather than padding, so clip before reporting or the printed
     # shape and byte count are not what runs.
     spatial = tuple(d["shape"][1:] if d["has_channels"] else d["shape"])
+    # --bbox-scale counts levels from the source's finest DECLARED scale, and level 0
+    # here is the finest one that stores data. When those differ the same number names
+    # two different boxes, and picking either silently crops the wrong region — the
+    # failure --bbox-scale exists to prevent. Refused rather than guessed.
+    if d.get("source_level") and (getattr(args, "bbox_scale", 0) or 0):
+        raise SystemExit(
+            f"--bbox-scale {args.bbox_scale} is ambiguous here: this volume's level 0 "
+            f"is source scale {d['source_level']}, because the finer scales its `info` "
+            f"declares store no data. Give the box in the voxels of the scale being "
+            f"read (--bbox-scale 0), or name a scale explicitly with --src-level.")
     crop_start, crop_stop = _crop_bbox(args, d["level_voxel_sizes"])
     masks = _mask_bboxes(args, d["level_voxel_sizes"])
     start = tuple(max(0, a) for a in crop_start) if crop_start else (0,) * len(spatial)
@@ -782,11 +825,15 @@ def cmd_copy(args) -> int:
     import numpy as np
 
     levels = _pyramid_levels(out_shape, voxel, args)
-    nbytes = float(np.dtype(d["dtype"]).itemsize) * math.prod(out_shape)
+    # The OUTPUT's dtype, not the source's: a uint8 -> uint64 cast is 8x, and this
+    # number is what the run is sized against.
+    nbytes = float(np.dtype(args.dtype or d["dtype"]).itemsize) * math.prod(out_shape)
     dst = args.dst.rstrip("/")
     print(f"{args.src}  ->  {dst}")
     print(f"  format      {fmt}{' (from the source)' if fmt_from_source else ''}")
-    print(f"  dtype       {d['dtype']}")
+    print(f"  dtype       {args.dtype or d['dtype']}"
+          + (f"   (cast from {d['dtype']})" if args.dtype
+             and args.dtype != d["dtype"] else ""))
     print(f"  kind        {kind}{'' if args.kind else ' (from the source)'}")
     print(f"  voxel size  {'x'.join(f'{v:g}' for v in voxel)} nm"
           f"{'' if args.voxel_size else ' (from the source)'}")

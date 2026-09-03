@@ -22,7 +22,8 @@ import logging
 from typing import Any, Sequence
 
 from ..backends.base import open_backend
-from ..source_metadata import detect_backend, location_spec, read_source_metadata
+from ..source_metadata import (detect_backend, location_spec, read_source_metadata,
+                               require_populated_scale)
 from ._multiscale import materialize_multiscale
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ def convert(
     *,
     voxel_size: Sequence[float] | None = None,
     src_format: str | None = None,
+    src_level: int | None = None,
     units: str | None = None,
     axes: Sequence[str] | None = None,
     offset: Sequence[float] | None = None,
@@ -211,6 +213,14 @@ def convert(
         # server/uuid/instance. `location_spec` owns all four forms.
         src_spec = location_spec(src, fmt)
 
+    if src_level is not None:
+        # Which scale of a multiscale SOURCE becomes the output's level 0. Left unset,
+        # `read_source_metadata` picks the finest one that actually stores chunks; this
+        # names a scale instead. The output is a new volume either way — its own level 0
+        # is whatever was read, at that scale's real voxel size (invariant NM-SPACE),
+        # never at an assumed 2**level of the source's finest.
+        src_spec["scale_index"] = int(src_level)
+
     if prefer_locked:
         if src_spec.get("backend") != "dvid":
             raise ValueError(
@@ -231,8 +241,15 @@ def convert(
 
     meta = read_source_metadata(src_spec)
 
-    # The array/scale to actually read (level 0 of an OME group / finest precomputed scale).
+    # The array/scale to actually read (level 0 of an OME group / the finest precomputed
+    # scale that stores data, or `src_level` if it was named).
     data_spec = meta["data_spec"] if meta else src_spec
+
+    # Refuse a source scale that was declared but never written, BEFORE any work: it
+    # opens, reports the extent its `info` claims and reads as the fill value at every
+    # block, so the run would succeed and write a volume of zeros. Only fires when some
+    # other scale stores data and this one does not — see `require_populated_scale`.
+    require_populated_scale(data_spec, op="convert")
 
     # Warned here rather than in the metadata reader, which is also on the read-only
     # inspection path: this is where an export is about to happen, which is what makes

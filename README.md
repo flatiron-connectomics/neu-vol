@@ -93,6 +93,19 @@ anything it does not record an error rather than a guess. That last part is why 
 averages label ids into ids that were never in the data, silently, while the source's
 `info` said `segmentation` all along.
 
+**A source's `info` may declare scales it never wrote**, and level 0 is then a scale that
+does not exist: it opens, reports the extent the metadata claims, and reads as the fill
+value at every block — a structurally perfect output volume of zeros, with nothing raised
+anywhere. A registered neuropil mask declaring five scales and storing one is not
+hypothetical. So level 0 resolves to the finest scale that actually *stores* data,
+`--src-level N` names one explicitly, and a scale storing nothing while another one does
+is refused rather than read. On an ordinary volume the probe is a single existence check.
+
+`--dtype` casts on the way out, and `--kind segmentation` usually needs it: the
+precomputed segmentation encoding is `compressed_segmentation`, which accepts uint32 and
+uint64 only, so a uint8 mask must be widened or it cannot be written as a segmentation at
+all. Widening interacts with chunk size — see [Cluster config](#cluster-config).
+
 `create_volume()` + `write_subvolume()` are the other shape of the problem: several
 small pieces that belong at known positions inside one frame, rather than one source
 converted wholesale. Create the (empty) frame — optionally copying a reference
@@ -473,6 +486,22 @@ jobqueue:
 
 Unrecognised keys raise rather than merging silently. Site-specific configs are
 deliberately not in this repo; the top-level `configs/` is gitignored.
+
+**Size workers against a *pyramid* task, not a level-0 one.** Three multipliers compound,
+and only the first is visible in the plan the command prints:
+
+| | factor | 512³ chunk, uint64 |
+|---|---|---|
+| output chunk | — | 1 GiB |
+| reduction window (2³) is read, not written | ×8 | 8 GiB |
+| the segmentation mode reducer peaks over its input | ×8 | **64 GiB** |
+
+A 512³ uint64 chunk therefore needs ~64 GiB per worker at level 1, against a level-0 task
+for the same chunk costing 1 GiB — so a copy sails through level 0 and every worker is
+killed on level 1. `--chunk 128,128,128` (the profile default) makes the same task 1.1 GiB
+and is the right output anyway: a 512³ uint64 chunk is a 1 GiB object, which is poor for
+random access and for a viewer. Inheriting a source's large chunk is `copy`'s
+source-preserving default and is worth overriding whenever `--dtype` widens the type.
 
 Next: brightness/normalization + morphological transforms.
 

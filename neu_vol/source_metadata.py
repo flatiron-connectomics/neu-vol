@@ -22,9 +22,12 @@ narrow question when the narrow answer will do.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Mapping
+import logging
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from .location import join, spec_kvstore, to_kvstore
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:                       # the class is imported inside `describe`, where
     from .report import Description     # it is used, so the module stays import-light
@@ -52,9 +55,10 @@ def _first_chunk_key(scale: Mapping[str, Any]) -> str | None:
     return "_".join(f"{off[a]}-{off[a] + min(chunk[a], size[a])}" for a in range(3))
 
 
-def precomputed_chunks_are_gzipped(location: str | Mapping[str, Any],
-                                   scale: Mapping[str, Any]) -> bool:
-    """True if this precomputed scale's chunk objects are ``.gz``-suffixed.
+def precomputed_chunks_are_gzipped(
+        location: str | Mapping[str, Any],
+        scales: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> bool:
+    """True if these precomputed scales' chunk objects are ``.gz``-suffixed.
 
     CloudVolume gzips chunks and appends ``.gz`` to the key, which is legal for
     something that serves them over HTTP with ``Content-Encoding: gzip`` but is not what
@@ -68,26 +72,211 @@ def precomputed_chunks_are_gzipped(location: str | Mapping[str, Any],
     `detect_backend`, which nearly every op calls before doing anything.** Probing the
     one key the metadata predicts is O(1) and needs no enumeration at all.
 
-    Falls back to a listing only when the origin chunk is absent — legitimate on a
-    sparse volume — and then over the caller's chosen scale, which is why
-    :func:`detect_backend` hands it the *coarsest*: it holds the fewest chunks.
+    Falls back to a listing only when no origin chunk is found — legitimate on a sparse
+    volume — and then over the *first* scale given, which is why :func:`detect_backend`
+    orders them coarsest-first: that one holds the fewest chunks.
+
+    ``scales`` is one entry of ``info["scales"]`` or several in preference order. **With
+    several, every O(1) origin probe is tried before any listing**, which is what makes
+    a volume whose ``info`` declares scales it never wrote answerable at all. A
+    ``sample3`` neuropil mask declares seven scales and stores exactly one (``64_64_64``,
+    18 chunks): asked about the coarsest alone this found no origin chunk, listed an
+    empty prefix, and reported the volume as un-gzipped — so every block read as zeros,
+    the precise failure the two-check probe exists to prevent. Sweeping the origins
+    first costs 14 existence checks and 53 ms there, and still answers a dense volume on
+    the very first probe, so the 51 s enumeration stays gone.
     """
     from .location import exists, list_keys
 
-    key = _first_chunk_key(scale)
-    if key is not None:
+    entries = [scales] if isinstance(scales, Mapping) else list(scales)
+
+    for scale in entries:
+        key = _first_chunk_key(scale)
+        if key is None:
+            continue
         prefix = scale.get("key", "")
         if exists(location, prefix, key):
             return False
         if exists(location, prefix, key + ".gz"):
             return True
 
-    for name in (k.rsplit("/", 1)[-1] for k in list_keys(location, scale.get("key", ""))):
-        # A chunk key looks like `0-2048_0-2048_0-128`; anything else (a shard index,
-        # a stray file) is not evidence either way.
-        if name and "_" in name and "-" in name:
-            return name.endswith(".gz")
+    # Every scale, in the order given, until one yields a chunk name — NOT just the
+    # first. Stopping at the first was the same origin-chunk assumption in another
+    # costume: a volume sparse at the origin of every scale falls through pass 1
+    # entirely, and if its cheapest scale is one of the unwritten ones the listing
+    # finds nothing and reports the volume as un-gzipped. That is what happened to a
+    # registered neuropil mask — declared five scales, wrote only `64_64_64`, and none
+    # of its 26 chunks at the origin. Detection answered `neuroglancer_precomputed`,
+    # tensorstore asked for unsuffixed keys, and all 80 level-0 tasks recorded "empty":
+    # a full run that wrote nothing and raised nothing.
+    #
+    # Cost is unchanged where it matters. An unwritten scale's prefix is empty and
+    # lists instantly, and a volume whose chunks ARE at the origin never reaches here.
+    for scale in entries:
+        for name in (k.rsplit("/", 1)[-1]
+                     for k in list_keys(location, scale.get("key", ""))):
+            # A chunk key looks like `0-2048_0-2048_0-128`; anything else (a shard
+            # index, a stray file) is not evidence either way.
+            if name and "_" in name and "-" in name:
+                return name.endswith(".gz")
     return False
+
+
+def scale_stores_chunks(location: str | Mapping[str, Any],
+                        scale: Mapping[str, Any]) -> bool:
+    """True if this precomputed scale's ORIGIN chunk object is stored.
+
+    The same two O(1) existence checks :func:`precomputed_chunks_are_gzipped` makes,
+    asked for the other reason — either suffix counts, since a CloudVolume-written
+    scale is still a written one.
+
+    **A True is evidence of a written scale; a False is not proof of an empty one.** A
+    sparse volume may legitimately store nothing at its origin, which is why
+    :func:`finest_populated_scale` falls back rather than raising and why
+    :func:`require_populated_scale` needs a second scale to disagree with before it
+    will refuse anything.
+    """
+    from .location import exists
+
+    key = _first_chunk_key(scale)
+    if key is None:
+        return False
+    prefix = scale.get("key", "")
+    return bool(exists(location, prefix, key) or exists(location, prefix, key + ".gz"))
+
+
+def scale_is_empty(location: str | Mapping[str, Any],
+                   scale: Mapping[str, Any]) -> bool:
+    """True if this precomputed scale's prefix holds NO chunk object at all.
+
+    The conclusive form of the question :func:`scale_stores_chunks` answers cheaply,
+    and the two exist as a pair because **the origin chunk is not a sound test for an
+    unwritten scale**. A sparse volume elides all-background chunks, so a ground-truth
+    crop sitting away from the origin stores nothing there while being perfectly
+    written — reading the origin alone, such a scale is indistinguishable from one that
+    was only ever declared.
+
+    Costs a listing, so it is used only after the cheap probe has already failed. Note
+    it is **cheap exactly when it matters**: an unwritten scale's prefix is empty and
+    the listing returns immediately. The expensive case is a genuinely sparse volume
+    whose origin happens to be background, where the full prefix is enumerated
+    (``limit`` does not bound a listing — invariant STORE-ACCESS). Naming the level with
+    ``--src-level`` skips the probe entirely and costs nothing.
+    """
+    from .location import list_keys
+
+    for key in list_keys(location, scale.get("key", "")):
+        name = key.rsplit("/", 1)[-1]
+        # A chunk key looks like `0-2048_0-2048_0-128`; a shard index or a stray file
+        # is not a chunk and says nothing about whether this scale holds data.
+        if name and "_" in name and "-" in name:
+            return False
+    return True
+
+
+def finest_populated_scale(location: str | Mapping[str, Any],
+                           scales: Sequence[Mapping[str, Any]]) -> int | None:
+    """Index into ``scales`` of the finest one that actually holds data.
+
+    ``None`` when no scale stores anything findable, which is a caller's problem to
+    decide about rather than an answer.
+
+    **An `info` may declare scales that were never written**, and level 0 is then a
+    scale that does not exist. A sample3 neuropil mask declares seven (8 nm through
+    512 nm) and stores exactly one — ``64_64_64``, 18 chunk objects. The finest scale
+    opened without complaint and reported the full ``(11260, 9000, 13750)`` extent its
+    ``info`` claims, so ``convert`` read *that*, every block came back as the fill
+    value, and the copy would have been a structurally perfect volume of zeros.
+
+    Three tiers, cheapest first, and an ordinary volume never leaves the first:
+
+    1. Probe origin chunks finest-first. The finest scale is normally written like
+       every other, so this answers in ONE existence check and nothing else runs.
+    2. If some coarser scale has an origin chunk and finer ones do not, those finer
+       scales are either unwritten or merely sparse at the origin — which the origin
+       cannot distinguish. :func:`scale_is_empty` settles it, and settles it instantly
+       in the unwritten case, because an unwritten prefix is empty.
+    3. If NO scale has an origin chunk, fall back to the conclusive test across every
+       scale, finest-first. A volume can be sparse at the origin of *all* of its
+       scales and still be perfectly written — a registered neuropil mask whose data
+       starts 512 voxels in stores 26 chunks at 64 nm, none of them the origin one, so
+       tier 1 sees nothing anywhere. Giving up here fell back to the finest declared
+       scale, which is the very failure this function exists to prevent.
+
+    Tier 2 is what stops a sparse ground-truth volume — no origin chunk at scale 0, one
+    at scale 1, every scale correctly written — from being read at the wrong scale.
+    """
+    order = sorted(range(len(scales)), key=lambda i: tuple(scales[i]["resolution"]))
+    for pos, i in enumerate(order):
+        if not scale_stores_chunks(location, scales[i]):
+            continue
+        if pos == 0:
+            return i                     # the finest scale holds data: nothing to weigh
+        # Finer scales exist on paper but had no origin chunk. Sparse, or never written?
+        for j in order[:pos]:
+            if not scale_is_empty(location, scales[j]):
+                return j                 # sparse, and genuinely the finest data present
+        return i
+
+    # Tier 3. Nothing was found at any origin, so every scale is still in question and
+    # only a listing can separate "sparse here" from "never written". Finest-first, so
+    # the answer is the same one tiers 1-2 would have given.
+    for i in order:
+        if not scale_is_empty(location, scales[i]):
+            return i
+    return None
+
+
+def require_populated_scale(spec: Mapping[str, Any], *, op: str = "convert") -> None:
+    """Raise if ``spec`` names a precomputed scale this volume never wrote.
+
+    The failure this prevents is entirely silent. An unwritten scale opens, reports the
+    extent its ``info`` declares, and reads as the fill value at every block — so the
+    run succeeds, the manifest fills up, and the output is a correct-looking volume of
+    zeros. Nothing downstream can tell it from a volume that really is empty.
+
+    **Raises only on conclusive evidence**: this scale's prefix holds no chunk object
+    at all, while some other scale's does. An absent *origin* chunk is not enough —
+    a sparse volume elides background chunks and may legitimately store nothing there,
+    and refusing one of those would be a worse failure than the one being prevented.
+    The cheap origin probe runs first and returns immediately on any ordinary volume,
+    so the listing behind the conclusive form is only reached when there is already
+    something to explain.
+    """
+    if not str(spec.get("backend", "")).startswith("neuroglancer_precomputed"):
+        return
+    kv = _kvstore_of(spec)
+    raw = _read_key(kv, "info")
+    if raw is None:
+        return
+    scales = json.loads(raw)["scales"]
+    idx = int(spec.get("scale_index") or 0)
+    if not 0 <= idx < len(scales):
+        raise ValueError(
+            f"`{op}`: source level {idx} does not exist; its `info` declares "
+            f"{len(scales)} scale(s), 0-{len(scales) - 1}")
+    if scale_stores_chunks(kv, scales[idx]) or not scale_is_empty(kv, scales[idx]):
+        return
+
+    populated = [i for i in range(len(scales))
+                 if i != idx and (scale_stores_chunks(kv, scales[i])
+                                  or not scale_is_empty(kv, scales[i]))]
+    if not populated:
+        logger.warning(
+            "source scale %s (%s) holds no chunk objects, and neither does any other "
+            "scale — this volume appears to be entirely empty, so reading it will "
+            "produce nothing but the fill value.",
+            idx, scales[idx].get("key"))
+        return
+
+    listed = ", ".join(f"{i} ({scales[i].get('key')})" for i in populated)
+    raise ValueError(
+        f"`{op}`: source level {idx} ({scales[idx].get('key')}) stores no data — its "
+        f"`info` declares the scale, but nothing was ever written there, so every "
+        f"block would read as the fill value and the output would be a volume of "
+        f"zeros with nothing raised.\n\n"
+        f"  levels that DO store data: {listed}\n\n"
+        f"Pass --src-level to choose one explicitly.")
 
 
 #: The object whose presence identifies each volume format at a location. Order
@@ -232,13 +421,15 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
     if raw is not None:
         try:
             scales = json.loads(raw)["scales"]
-            # The COARSEST scale, not the finest: gzipping is a property of how the
-            # whole volume was written, so any scale answers the question, and this one
-            # holds the fewest chunks if the probe has to fall back to a listing.
-            coarsest = max(scales, key=lambda s: tuple(s["resolution"]))
+            # COARSEST FIRST, then the rest. Gzipping is a property of how the whole
+            # volume was written, so any scale that STORES a chunk answers the question
+            # — but one that stores nothing answers nothing, and an `info` may well
+            # declare scales that were never written. So all of them are offered, in the
+            # order that keeps the listing fallback on the cheapest prefix.
+            ordered = sorted(scales, key=lambda s: tuple(s["resolution"]), reverse=True)
         except Exception:
             return "neuroglancer_precomputed"
-        if precomputed_chunks_are_gzipped(kv, coarsest):
+        if precomputed_chunks_are_gzipped(kv, ordered):
             return PRECOMPUTED_GZ
         return "neuroglancer_precomputed"
     if _read_key(kv, "zarr.json") is not None:
@@ -572,13 +763,37 @@ def _read_dvid(spec: Mapping[str, Any]) -> dict | None:
 
 
 def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
-    raw = _read_key(_kvstore_of(spec), "info")
+    kv = _kvstore_of(spec)
+    raw = _read_key(kv, "info")
     if raw is None:
         return None
     info = json.loads(raw)
     scales = info["scales"]
-    # level 0 = finest scale (smallest resolution).
-    idx, sc0 = min(enumerate(scales), key=lambda kv: tuple(kv[1]["resolution"]))
+    finest = min(range(len(scales)), key=lambda i: tuple(scales[i]["resolution"]))
+
+    # Level 0 = the finest scale that was actually WRITTEN, not simply the finest one
+    # declared. `info` is a claim about the volume's layout and the chunk objects are
+    # the volume; where they disagree, believe the store. An explicit `scale_index`
+    # (what `--src-level` sets) always wins, so the caller can name a scale the probe
+    # would not have chosen — including one it thinks is empty, which `neu-vol write`
+    # legitimately does when filling a level that does not exist yet.
+    idx = spec.get("scale_index")
+    if idx is None:
+        idx = finest_populated_scale(kv, scales)
+        if idx is None:
+            idx = finest
+        elif idx != finest:
+            logger.warning(
+                "level 0 is scale %s (%s): the %s finer scale(s) this volume's `info` "
+                "declares store no data. Reading %s would have returned the fill value "
+                "everywhere. Override with --src-level.",
+                idx, scales[idx].get("key"), idx, scales[finest].get("key"))
+    idx = int(idx)
+    if not 0 <= idx < len(scales):
+        raise ValueError(
+            f"source level {idx} does not exist: this volume's `info` declares "
+            f"{len(scales)} scale(s), 0-{len(scales) - 1}")
+    sc0 = scales[idx]
     res_xyz = sc0["resolution"]
     voxel_size = tuple(float(v) for v in res_xyz[::-1])          # -> (z, y, x)
     voxel_offset_xyz = sc0.get("voxel_offset", [0, 0, 0])
@@ -666,7 +881,8 @@ def level_spec(volume: str, fmt: str, level: int,
     return {"backend": fmt, "path": volume, "scale_index": int(level)}
 
 
-def describe(volume: str, *, dataset: str | None = None) -> "Description":
+def describe(volume: str, *, dataset: str | None = None,
+             level: int | None = None) -> "Description":
     """Detected format, coordinate metadata and the levels actually present.
 
     Returns a :class:`~neu_vol.report.Description`, which **is** a dict — subscript it as
@@ -710,10 +926,11 @@ def describe(volume: str, *, dataset: str | None = None) -> "Description":
     # because forgetting it after a kernel restart looks identical to a broken filter.
     # `quiet_reads` nests and is thread-safe, so the CLI wrapping `main()` too is fine.
     with quiet_reads():
-        return _describe(volume, dataset=dataset)
+        return _describe(volume, dataset=dataset, level=level)
 
 
-def _describe(volume: str, *, dataset: str | None = None) -> "Description":
+def _describe(volume: str, *, dataset: str | None = None,
+              level: int | None = None) -> "Description":
     from .backends.base import open_backend
     from .report import Description
 
@@ -738,6 +955,11 @@ def _describe(volume: str, *, dataset: str | None = None) -> "Description":
                 dataset=None, datasets=entries, other_markers=[])
 
     spec = location_spec(volume, fmt, dataset=dataset)
+    if level is not None:
+        # `shape`, `dtype` and `meta` then describe THAT scale, which is what a caller
+        # deriving a copy's parameters from the source needs. `levels` below still maps
+        # the volume's whole declared pyramid — it answers a different question.
+        spec["scale_index"] = int(level)
     meta = read_source_metadata(spec)
     level0 = open_backend(meta["data_spec"] if meta else spec)
     shape = tuple(int(s) for s in level0.shape)
@@ -763,6 +985,11 @@ def _describe(volume: str, *, dataset: str | None = None) -> "Description":
         # of an HDF5 container it just described.
         spec=spec,
         dataset=spec.get("dataset"),
+        # WHICH source scale `shape`/`dtype`/`meta` above describe. Usually 0, but a
+        # volume whose `info` declares scales it never wrote resolves to the finest one
+        # that stores data, and a caller reading level-0 properties out of `levels`
+        # needs to look them up under this rather than under 0.
+        source_level=int((meta or {}).get("data_spec", {}).get("scale_index") or 0),
         datasets=entries,
         # One extra small read, against several array opens — worth it to notice
         # a second volume shadowed underneath this one.
