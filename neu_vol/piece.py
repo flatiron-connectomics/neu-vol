@@ -316,7 +316,7 @@ def write_piece(piece, out: str, *, dataset: str | None = None,
     ids. Use ``piece.with_kind(...)`` to change it.
 
     ``dataset`` defaults to **the last component of ``piece.name``** when that name has one
-    (``"specimen5_gt_v1_eval/z07901"`` -> ``/z07901``), which is what makes a bag of crops
+    (``"gt_eval/z07901"`` -> ``/z07901``), which is what makes a bag of crops
     round-trip through a whole cleaning pass with no arguments — :func:`read_piece` names a
     piece after its source, so the names are already there. A piece named after a volume
     rather than an array inside one has no such component and gets
