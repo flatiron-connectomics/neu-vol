@@ -1,41 +1,25 @@
 """neu-vol: convert, downsample and inspect large 3D volumes, locally or on SLURM.
 
-The command-line entry point for this package. Every write is block-mapped over a dask
-cluster (local or SLURM, chosen by ``--config``) and resumable, so an interrupted run
-continues where it stopped rather than starting over.
+Every write is block-mapped over a dask cluster — local or SLURM, chosen by --config —
+and resumable, so an interrupted run continues rather than starting over. --config takes
+a bundled template name or a path and is repeatable, deep-merged left to right, so a
+site config carries only the keys that differ from a template.
 
-    neu-vol info    <volume>                      # what is it, what levels exist
-    neu-vol convert --src ... --dst ...           # build a multiscale volume
-    neu-vol copy    --src ... --dst ...           # copy one as it is, whole or a box
-    neu-vol downsample <volume> --start-level 2   # rebuild levels above a trusted one
-    neu-vol progress <volume>                     # chunks written, per level
-    neu-vol create  <dst> --like <reference>      # an EMPTY volume in a known frame
-    neu-vol write   <volume> --src ... --offset   # put one subvolume into it
-    neu-vol align-bbox --volume ... --bbox ...     # move a box onto the block grid
-    neu-vol relabel <volume> --out ...            # one id range per occupied region
+convert and copy are one operation under two defaulting policies: convert states the
+output it wants, copy takes the source's own format, chunking, voxel size and
+image/segmentation type. Either takes the whole volume or one --crop-bbox.
 
-Anything a *viewer* consumes now lives in **neu-glance**: `neu-glance gen` for a link or a state,
-`neu-glance bboxes` for a layer of boxes over a sparse volume's data, `neu-glance annotate` for a
-layer of your own coordinates. This package supplies the occupancy analysis those build on
-(``ops.annotate.labeled_regions``) and knows nothing about neuroglancer beyond it.
+create and write are the small-pieces path and are not block-mapped: create lays out an
+empty volume, optionally copying a reference's frame exactly, then each write places one
+image stack, HDF5 file or array into one level of it at a voxel offset. Single-scale by
+design — run downsample afterwards if the result needs a pyramid.
 
-``convert`` and ``copy`` are the same operation under two defaulting policies: convert
-states the output it wants, copy takes the source's own format, chunking, voxel size and
-image/segmentation type. Either copies the whole volume or one ``--crop-bbox``.
+Anything a viewer consumes lives in neu-glance: `neu-glance gen` for a link or a state,
+`bboxes` for a layer of boxes over a sparse volume's data, `annotate` for a layer of
+your own coordinates. This package supplies the occupancy analysis those build on
+(ops.annotate.labeled_regions) and knows nothing about neuroglancer beyond it.
 
-``create`` + ``write`` are the small-pieces path, and they are not block-mapped:
-``create`` lays out an empty volume (optionally copying a reference's frame exactly),
-then each ``write`` places one image stack / HDF5 / array into one level of it at a
-voxel offset. Single-scale by design — run ``downsample`` afterwards if the result
-needs a pyramid.
-
-``python -m neu_vol`` is equivalent. Run ``neu-vol <subcommand> --help`` for the
-arguments of each.
-
-**--config takes a bundled template name or a path, and is repeatable**, deep-merged
-left to right — so a site config is the few keys that differ from a template rather
-than a fork of it. Templates and validation live in :mod:`blockrun.dask_config`;
-site-specific configs do not belong in this repo.
+`python -m neu_vol` is equivalent. Run `neu-vol <subcommand> --help` for its arguments.
 """
 
 from __future__ import annotations
@@ -89,14 +73,11 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "labelmap name. Use dvid+https:// for a TLS server. e.g. "
                         "dvid://dvid.example.org/93fdbc:main/labels")
     p.add_argument("--src-level", type=int, default=None, metavar="N",
-                   help="which scale of a MULTISCALE SOURCE becomes the output's level "
-                        "0 (default: the finest one that actually stores data). An "
-                        "`info` may declare scales that were never written — one "
-                        "neuropil mask declares seven and stores one — and such a scale "
-                        "opens, reports the extent its metadata claims, and reads as "
-                        "the fill value everywhere, so without this the output is a "
-                        "correct-looking volume of zeros. The output's voxel size is "
-                        "that scale's own, never an assumed 2**N")
+                   help="which scale of a multiscale source becomes the output's level 0 "
+                        "(default: the finest one that actually stores data — an `info` "
+                        "may declare scales that were never written, and those read as "
+                        "the fill value everywhere). The output's voxel size is that "
+                        "scale's own, never an assumed 2**N")
     p.add_argument("--dvid-supervoxels", action="store_true",
                    help="read SUPERVOXELS rather than agglomerated bodies (DVID sources "
                         "only). Default is bodies, i.e. the proofread segmentation")
@@ -131,12 +112,10 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "is silent — averaging label ids invents ids. Default: from the "
                         "source where it records one, else image")
     p.add_argument("--dtype", default=None, metavar="TYPE",
-                   help="cast to this dtype on the way out, e.g. uint64 (default: the "
-                        "source's). Mainly for --kind segmentation, whose precomputed "
-                        "encoding is compressed_segmentation and accepts uint32/uint64 "
-                        "only — a uint8 mask has to be widened here or it cannot be "
-                        "written as a segmentation at all. The cast must be lossless "
-                        "for the values present; narrowing is not checked")
+                   help="cast to this dtype on the way out (default: the source's). "
+                        "Usually needed with --kind segmentation, whose "
+                        "compressed_segmentation encoding takes uint32/uint64 only. "
+                        "Narrowing is not checked")
     p.add_argument("--voxel-size", default=None,
                    help="z,y,x nm (default: from source)")
     p.add_argument("--chunk", default=None if source_defaults else "128,128,128",
@@ -1896,27 +1875,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser(
         "copy", help="copy a volume, or a box out of it, as it is",
-        description="Copy a volume — or a box out of it — keeping the source's own "
-                    "format, chunking, voxel size and image/segmentation type.\n\n"
-                    "It is `convert` with a different defaulting policy, and that is "
-                    "the whole point: `convert` defaults to precomputed, 128^3 chunks "
-                    "and --kind image, so copying a segmentation with it and forgetting "
-                    "--kind segmentation averages label ids into ids that were never in "
-                    "the data — silently, while the source's own metadata said "
-                    "`segmentation` all along. Here every one of those comes from the "
-                    "source, and anything it does not record is an error rather than a "
-                    "guess. Pass any of them to override.\n\n"
-                    "--crop-bbox copies one box instead of the whole volume, and the "
-                    "output keeps the source's coordinate frame (its physical offset "
-                    "shifts by the crop origin), so the two overlay in a viewer. "
-                    "--mask-bbox is the complement: copy everything EXCEPT a box, which "
-                    "is how you hold a region out of a copy. The two compose, and mask "
-                    "coordinates are always the source's.\n\n"
-                    "The pyramid is REBUILT from the copied level 0, not copied: the "
-                    "source's coarse levels are never read. For a crop that is what you "
-                    "want — a slice of the source's coarse level is not the reduction of "
-                    "the crop — but a whole-volume copy pays to recompute what already "
-                    "exists.\n\nResumable, like `convert`; re-run to continue.",
+        description="Copy a volume, or a box out of it, keeping the source's own format, "
+                    "chunking, voxel size and image/segmentation type.\n\n"
+                    "The same operation as `convert` under a different defaulting "
+                    "policy: each of those parameters is read from the source rather "
+                    "than defaulted, and one the source does not record is an error "
+                    "rather than a guess. Pass any of them explicitly to override.\n\n"
+                    "--crop-bbox copies one box instead of the whole volume; the output "
+                    "keeps the source's coordinate frame, its physical offset shifted by "
+                    "the crop origin. --mask-bbox is the complement, copying everything "
+                    "except a box. The two compose, and coordinates for both are always "
+                    "the source's.\n\n"
+                    "The pyramid is rebuilt from the copied level 0; the source's coarse "
+                    "levels are never read, so a whole-volume copy recomputes levels the "
+                    "source already has.\n\n"
+                    "Resumable: re-run to continue.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_convert_args(q, source_defaults=True)
     q.add_argument("--dry-run", action="store_true",
