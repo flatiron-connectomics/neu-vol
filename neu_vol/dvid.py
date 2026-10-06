@@ -18,7 +18,12 @@ branch ref, and a branch ref names a node that moves. See :func:`resolve_node`.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Sequence
+
+import numpy as np
+
+from neu_lib import Frame
 
 #: Accepted URL schemes -> the scheme handed to neuclease. A bare host gets ``http://``
 #: prepended by neuclease's own ``dvid_api_wrapper``, so ``dvid://`` needs no prefix;
@@ -278,3 +283,149 @@ def check_instance_type(info: Mapping[str, Any], spec: Mapping[str, Any],
         raise ValueError(
             f"{spec_url(spec)} is a {actual!r} instance; expected {want}")
     return str(actual)
+
+
+# --------------------------------------------------------------------------- #
+# ROIs
+# --------------------------------------------------------------------------- #
+ROI_INSTANCE = "roi"
+
+#: DVID stores an ROI as a set of whole blocks of the scale-0 grid, 32 voxels on a side,
+#: and its ``ranges`` endpoint answers in block coordinates. So an ROI's native resolution
+#: is one block per voxel — "scale 5" in neuclease's terms — and nothing finer exists.
+ROI_BLOCK_VOXELS = 32
+
+
+def available_rois(spec: Mapping[str, Any]) -> list[str]:
+    """Every ``roi`` instance on this node."""
+    try:
+        from neuclease.dvid import fetch_repo_info
+    except ImportError as exc:
+        raise ImportError(MISSING) from exc
+
+    server, uuid, _instance = address(spec)
+    repo = fetch_repo_info(server, uuid)
+    return sorted(name for name, d in (repo.get("DataInstances") or {}).items()
+                  if d.get("Base", {}).get("TypeName") == ROI_INSTANCE)
+
+
+def resolve_roi_set(spec: Mapping[str, Any], rois: Sequence[str]) -> list[str]:
+    """Validate an ROI name list against the node, before anything expensive happens.
+
+    Checked up front because building a combined volume fetches every named ROI — ~1 s
+    each on a real server — and a typo would otherwise surface as a failure or, worse, as
+    a silently smaller region. The order given is kept: it decides which ROI wins where
+    two intersect.
+    """
+    wanted = [str(r).strip() for r in rois if str(r).strip()]
+    if not wanted:
+        raise ValueError(
+            "no ROIs given. There is deliberately no default: the combined ROI volume is "
+            "built by overwriting, so asking for every ROI on the node would label a point "
+            "in ME(L) as whichever of ME(L) / OL(L) / all_neuropils was written last.")
+    duplicated = sorted({r for r in wanted if wanted.count(r) > 1})
+    if duplicated:
+        raise ValueError(f"ROI list repeats {', '.join(duplicated)}")
+    have = set(available_rois(spec))
+    missing = [r for r in wanted if r not in have]
+    if missing:
+        raise ValueError(
+            f"no roi instance on this node named {', '.join(missing)}. "
+            f"{len(have)} are available; the closest are "
+            f"{', '.join(_closest(missing[0], have))}.")
+    return wanted
+
+
+def _closest(name: str, candidates: Iterable[str], n: int = 5) -> list[str]:
+    import difflib
+
+    return difflib.get_close_matches(name, sorted(candidates), n=n, cutoff=0.4) or \
+        sorted(candidates)[:n]
+
+
+def fetch_roi_ranges(spec: Mapping[str, Any], rois: Sequence[str], *,
+                     processes: int = 0) -> tuple[list[str], dict, dict]:
+    """``(names, ranges, boxes)`` — the expensive half of building an ROI volume.
+
+    One request per ROI. Kept separate from the unpack because a caller measuring overlap
+    unpacks the same ranges twice in different orders, and should not refetch to do it.
+    ``boxes`` omits any ROI that holds no blocks.
+    """
+    try:
+        from neuclease.dvid.roi import fetch_roi_ranges_and_boxes
+    except ImportError as exc:
+        raise ImportError(MISSING) from exc
+
+    names = resolve_roi_set(spec, rois)
+    server, uuid, _instance = address(spec)
+    ranges, boxes = fetch_roi_ranges_and_boxes(server, uuid, names, processes=processes)
+    return names, ranges, boxes
+
+
+def roi_frame(box_lo_blocks: Sequence[int], voxel_size_nm: Sequence[float],
+              origin_nm: Sequence[float] = (0.0, 0.0, 0.0)) -> Frame:
+    """The :class:`Frame` of an ROI array whose voxel ``(0, 0, 0)`` is block ``box_lo``.
+
+    ``voxel_size_nm`` and ``origin_nm`` describe the **scale-0 grid** the DVID node
+    indexes (the same grid its synapse coordinates are in). DVID records neither, which is
+    why they are arguments: an ROI is integer blocks, and only the caller's volume knows
+    how large a voxel is.
+    """
+    size = np.asarray(voxel_size_nm, dtype=np.float64) * ROI_BLOCK_VOXELS
+    lo = np.asarray(box_lo_blocks, dtype=np.float64)
+    return Frame(tuple(size), tuple(np.asarray(origin_nm, dtype=np.float64) + lo * size))
+
+
+@dataclass(frozen=True)
+class RoiVolume:
+    """A combined ROI label array, positioned in nm.
+
+    ``labels[z, y, x] == i`` means block ``(z, y, x)`` belongs to ``names[i - 1]``; 0 is
+    in none of them. Where ROIs intersect, the one named **later** holds the voxel, and
+    ``overlaps`` records each intersecting pair with its size in blocks, so a caller can
+    decide whether that matters rather than never learning it happened.
+    """
+
+    labels: np.ndarray
+    frame: Frame
+    names: tuple[str, ...]
+    overlaps: tuple[tuple[str, str, int], ...] = ()
+
+    def mask(self, *names: str) -> np.ndarray:
+        """Boolean array of the named ROIs (all of them when none are named)."""
+        if not names:
+            return self.labels != 0
+        unknown = [n for n in names if n not in self.names]
+        if unknown:
+            raise KeyError(f"no ROI {unknown} in this volume; it holds {list(self.names)}")
+        return np.isin(self.labels, [self.names.index(n) + 1 for n in names])
+
+
+def roi_volume(spec: Mapping[str, Any], rois: Sequence[str], *,
+               voxel_size_nm: Sequence[float],
+               origin_nm: Sequence[float] = (0.0, 0.0, 0.0),
+               processes: int = 0) -> RoiVolume:
+    """Fetch the named ROIs as one label array with its :class:`Frame`.
+
+    ``spec`` addresses any instance on the node (ROIs are per node, not per instance).
+    ``voxel_size_nm`` / ``origin_nm`` are the scale-0 grid's — see :func:`roi_frame`.
+
+    An ROI holding no blocks **raises**: it would otherwise contribute nothing and the
+    result would look like a smaller region rather than a broken name.
+    """
+    try:
+        from neuclease.dvid.roi import unpack_roi_ranges_to_combined_volume
+    except ImportError as exc:
+        raise ImportError(MISSING) from exc
+
+    names, ranges, boxes = fetch_roi_ranges(spec, rois, processes=processes)
+    empty = [n for n in names if n not in boxes]
+    if empty:
+        raise ValueError(f"ROI(s) {', '.join(empty)} on {spec_url(spec)} hold no blocks")
+    labels, box, overlaps = unpack_roi_ranges_to_combined_volume(names, ranges, boxes)
+    pairs = () if overlaps is None or not len(overlaps) else tuple(
+        (str(a), str(b), int(n)) for a, b, n in
+        overlaps[["roi_a", "roi_b", "overlap"]].itertuples(index=False))
+    return RoiVolume(labels=np.asarray(labels), frame=roi_frame(box[0], voxel_size_nm,
+                                                                 origin_nm),
+                     names=tuple(names), overlaps=pairs)
