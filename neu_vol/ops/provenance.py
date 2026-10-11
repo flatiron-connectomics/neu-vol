@@ -46,6 +46,26 @@ def source_provenance(spec: Mapping[str, Any]) -> dict[str, Any]:
         node = {**node, "ref": spec.get("requested_ref", node["ref"]),
                 "walked": spec.get("ancestors_walked", node["walked"])}
         return provenance(spec, node)
+    if backend == "webknossos":
+        # The resolved spec already holds everything that identifies the read — server,
+        # dataset id, layer, mapping — and never the token. Said explicitly so a missing
+        # `mapping` reads as a statement rather than an omission.
+        return {"source": backend, **{k: v for k, v in spec.items() if k != "backend"},
+                "mapping": spec.get("mapping"),
+                "ids": "agglomerates" if spec.get("mapping") else "supervoxels (raw ids)"}
+    if backend == "mapped":
+        # A view of another volume: record both halves. Said explicitly because the
+        # generic form below would let the spec's own `source` key overwrite this one.
+        from ..mapped import read_descriptor
+
+        rec = {"source": "mapped", "mapping": spec.get("mapping"),
+               "table": spec.get("table"), "descriptor": spec.get("descriptor"),
+               "of": source_provenance(spec["source"])}
+        try:
+            rec["origin"] = read_descriptor(spec["descriptor"]).get("origin")
+        except Exception:                                      # noqa: BLE001
+            pass
+        return rec
     return {"source": backend, **{k: v for k, v in spec.items() if k != "backend"}}
 
 

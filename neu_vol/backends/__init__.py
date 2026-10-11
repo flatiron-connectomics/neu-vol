@@ -16,6 +16,8 @@ from .base import ArrayBackend, Region, open_backend, register_backend
 # `import neuclease.dvid` costs ~9 s, which nothing that merely lists backends should
 # pay (see tests/test_cli_contract.py).
 from . import tensorstore, imagestack, hdf5, view, cloudvolume, dvid  # noqa: E402,F401
+from . import webknossos  # noqa: E402,F401  (stdlib HTTP only; credentials read at open)
+from . import mapped  # noqa: E402,F401
 
 __all__ = [
     "ArrayBackend",

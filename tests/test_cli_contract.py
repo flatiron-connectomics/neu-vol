@@ -42,7 +42,8 @@ def test_every_subcommand_is_reachable_from_the_parser():
     # and `gen`. A clean break with no aliases, so an old invocation fails loudly.
     assert set(subs) == {"info", "convert", "copy", "downsample", "create", "write",
                          "to-hdf5", "progress",
-                         "align-bbox", "relabel", "mask-by-value", "help"}
+                         "align-bbox", "relabel", "mask-by-value", "wk-mappings",
+                         "help"}
     for name, sub in subs.items():
         assert sub.format_usage().strip(), f"{name} renders no usage line"
 

@@ -71,7 +71,9 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "may carry a port (emdata3:8900) and defaults to http, UUID may "
                         "be abbreviated or carry a branch (93fdbc:main), INSTANCE is the "
                         "labelmap name. Use dvid+https:// for a TLS server. e.g. "
-                        "dvid://dvid.example.org/93fdbc:main/labels")
+                        "dvid://dvid.example.org/93fdbc:main/labels. Or a webknossos "
+                        "layer as wk://DATASET/LAYER (dataset name or id), with the "
+                        "server and token from ~/.config/webknossos/credentials.toml")
     p.add_argument("--src-level", type=int, default=None, metavar="N",
                    help="which scale of a multiscale source becomes the output's level 0 "
                         "(default: the finest one that actually stores data — an `info` "
@@ -90,6 +92,12 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "pull is not reproducible. Needs the repo:branch form, since "
                         "walking ancestors uses DVID's ref~N syntax. Either way the "
                         "resolved node id is recorded in provenance.json")
+    p.add_argument("--wk-mapping", default=None, metavar="NAME",
+                   help="apply this mapping, e.g. an agglomerate view, on the server as "
+                        "the layer is read (webknossos sources only). Default: none, i.e. "
+                        "SUPERVOXELS — the raw ids — even when the viewer shows the layer "
+                        "through a default mapping. `neu-vol info wk://...` lists the "
+                        "mappings")
     p.add_argument("--dst", required=True,
                    help="destination base (path or s3://bucket/prefix). With "
                         "--format both, '.precomputed' and '.zarr' are appended. "
@@ -314,6 +322,30 @@ def _print_dvid_nodes(volume: str) -> None:
               "the locked one instead.")
 
 
+def _print_wk_mappings(d) -> None:
+    """The dataset a name resolved to, and every mapping the layer can be read through.
+
+    Listed because choosing one is the decision a webknossos export turns on: no mapping
+    is supervoxels, and each agglomerate view is a different segmentation.
+    """
+    from neu_vol.webknossos import mappings
+
+    spec = (d.get("meta") or {}).get("provenance_spec") or {}
+    print(f"  dataset     {spec.get('dataset_id')}  ({spec.get('organization')}, "
+          f"{spec.get('url')})")
+    try:
+        have = mappings(spec)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"  mappings    (could not list: {type(exc).__name__}: {exc})")
+        return
+    default = (d.get("meta") or {}).get("default_mapping")
+    print(f"  default     {default or '(none)'}   (what the viewer applies; reads here "
+          f"apply nothing unless --wk-mapping)")
+    for kind, names in have.items():
+        if names:
+            print(f"  {kind:<11} {', '.join(names)}")
+
+
 def _print_provenance(volume: str, full: bool) -> None:
     """Report ``provenance.json`` if the volume has one.
 
@@ -366,6 +398,8 @@ def cmd_info(args) -> int:
     print("\n".join(d.header_lines()))
     if d["format"] == "dvid":
         _print_dvid_nodes(args.volume)
+    elif d["format"] == "webknossos":
+        _print_wk_mappings(d)
     elif not d.is_container:
         # A container is a local file: it has no `provenance.json` beside it, and looking
         # for one would probe `piece.h5/provenance.json`.
@@ -410,6 +444,8 @@ def _src_spec(args, src: str | None = None):
             spec["prefer_locked"] = True
         if getattr(args, "dvid_supervoxels", False):
             spec["supervoxels"] = True
+    if fmt == "webknossos" and getattr(args, "wk_mapping", None):
+        spec["mapping"] = args.wk_mapping
     return spec, fmt
 
 
@@ -675,6 +711,7 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
                             if args.background else None),
                 supervoxels=getattr(args, "dvid_supervoxels", False),
                 prefer_locked=getattr(args, "dvid_locked", False),
+                wk_mapping=getattr(args, "wk_mapping", None),
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
                 sparse=args.sparse,
@@ -718,6 +755,16 @@ def cmd_copy(args) -> int:
             f"instance just as `copy` would:\n\n"
             f"    neu-vol convert --src {args.src} --dst {args.dst}\n\n"
             f"Add --dvid-locked for an immutable node, and --crop-bbox to take a box.")
+    from neu_vol.webknossos import is_url as _is_wk_url
+
+    if _is_wk_url(args.src):
+        # The same argument as DVID: webknossos is a server, and its 512^3 request size is
+        # not a chunking anyone wants on disk.
+        raise SystemExit(
+            f"`copy` does not take a webknossos source; use `convert`, which reads the "
+            f"kind and voxel size from the layer:\n\n"
+            f"    neu-vol convert --src {args.src} --dst {args.dst} --format zarr\n\n"
+            f"Add --wk-mapping NAME for an agglomerate view (default: supervoxels).")
 
     try:
         # `level=` so every source-derived default below — voxel size, chunking, dtype,
@@ -1795,6 +1842,36 @@ def cmd_relabel(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# wk-mappings
+# --------------------------------------------------------------------------- #
+def cmd_wk_mappings(args) -> int:
+    """Fetch agglomerate views as lookup tables, with a descriptor per view."""
+    from neu_vol.ops.wk_mappings import fetch_mapping_tables
+
+    def report(name, seconds, n):
+        print(f"  {name:<24} {n:>9,} agglomerates   {seconds:5.1f} s")
+
+    try:
+        index = fetch_mapping_tables(args.src, args.out, volume=args.volume,
+                                     mappings=args.mapping, overwrite=args.overwrite,
+                                     max_id=args.max_id, threads=args.threads, progress=report)
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+    print(f"\n{len(index['views'])} table(s) for {index['n_ids'] - 1:,} supervoxel ids "
+          f"in {args.out} (index: mappings.json)")
+    if args.volume:
+        name = (args.mapping or [index.get("default_mapping") or "VIEW"])[0]
+        print(f"each <view>.json reads {args.volume} through that view, e.g.\n"
+              f"    neu-vol info {os.path.join(args.out, name + '.json')}\n"
+              f"    neu-vol convert --src {os.path.join(args.out, name + '.json')} "
+              f"--dst /path/to/{name}.precomputed")
+    else:
+        print("no --volume given, so no descriptors were written; re-run with "
+              "--volume <supervoxel volume> to add them (tables are not refetched)")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
 def _maybe_cluster(args):
@@ -2367,6 +2444,38 @@ def build_parser() -> argparse.ArgumentParser:
                         "nothing. Still reads them, since the ids come from the voxels")
     q.add_argument("--store-logs", action="store_true")
     q.set_defaults(func=cmd_relabel)
+
+    # --- wk-mappings --------------------------------------------------------
+    q = sub.add_parser(
+        "wk-mappings", help="fetch a webknossos layer's agglomerate views as tables",
+        description="Fetch the agglomerate views of a webknossos segmentation layer as "
+                    "lookup tables, table[supervoxel] = agglomerate, one .npy per view.\n\n"
+                    "With --volume (the layer's supervoxels, converted with no "
+                    "--wk-mapping), also writes a descriptor <view>.json per view, which "
+                    "reads that volume through the view ON THE FLY wherever a volume is "
+                    "accepted: `neu-vol info`, read_piece / `neu-eval compare "
+                    "--segmentation`, and `neu-vol convert --src`, which turns a chosen "
+                    "view into a real volume. Level 0 of a view is exact; coarser levels "
+                    "map the source's downsampled supervoxels and are approximate. "
+                    "A converted view rebuilds its pyramid from level 0, so it is exact.\n\n"
+                    "Resumable: a view whose table exists is skipped unless --overwrite.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("src", help="the layer, as wk://DATASET/LAYER")
+    q.add_argument("--out", required=True, metavar="DIR",
+                   help="where the tables, descriptors and mappings.json go: a local "
+                        "directory or an object-store prefix (s3://...)")
+    q.add_argument("--volume", default=None, metavar="VOLUME",
+                   help="the supervoxel volume the descriptors should read")
+    q.add_argument("--mapping", action="append", default=None, metavar="NAME",
+                   help="a view to fetch (repeatable; default: every agglomerate view)")
+    q.add_argument("--max-id", type=int, default=None,
+                   help="highest supervoxel id (default: the layer's largestSegmentId)")
+    q.add_argument("--overwrite", action="store_true", help="refetch existing tables")
+    q.add_argument("--threads", type=int, default=4, metavar="N",
+                   help="views fetched at once, on threads (default: 4). The time is the "
+                        "server's, so this is the only lever; keep it modest on a shared "
+                        "public server")
+    q.set_defaults(func=cmd_wk_mappings)
 
     _add_help_command(sub)
     return p

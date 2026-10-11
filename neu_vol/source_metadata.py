@@ -309,7 +309,7 @@ def other_format_markers(location: str | Mapping[str, Any], fmt: str) -> list[st
     # an HDF5 file is a file, and probing `piece.h5/info` is two reads that can only
     # miss. An image stack's directory *could* hold a marker, but then detection would
     # have returned that format instead, so there is nothing left to shadow.
-    if fmt == "dvid" or fmt in SINGLE_LEVEL_FORMATS:
+    if fmt in ("dvid", "webknossos", "mapped") or fmt in SINGLE_LEVEL_FORMATS:
         return []
     kv = to_kvstore(location)
     if "path" in kv and not str(kv["path"]).endswith("/"):
@@ -413,6 +413,17 @@ def detect_backend(location: str | Mapping[str, Any]) -> str | None:
 
     if _is_dvid_url(location):
         return "dvid"
+    # Same reason: a webknossos layer is a server, and `wk://` must not reach to_kvstore.
+    from .webknossos import is_url as _is_wk_url
+
+    if _is_wk_url(location):
+        return "webknossos"
+    # A mapped view is a descriptor FILE, which every marker probe below would miss
+    # (they look for `info`/`zarr.json` under it as a directory).
+    from .mapped import is_descriptor
+
+    if is_descriptor(location):
+        return "mapped"
 
     kv = to_kvstore(location)
     if "path" in kv and not str(kv["path"]).endswith("/"):
@@ -484,6 +495,14 @@ def location_spec(location: str, fmt: str, *,
         from .dvid import parse_url
 
         return {"backend": fmt, **parse_url(location)}
+    if fmt == "webknossos":
+        from .webknossos import parse_url as parse_wk_url
+
+        return {"backend": fmt, **parse_wk_url(location)}
+    if fmt == "mapped":
+        from .mapped import location_spec as mapped_spec
+
+        return mapped_spec(location)
     if fmt == "image_stack":
         return {"backend": fmt, "source": location}
     if fmt == "hdf5":
@@ -501,6 +520,10 @@ def read_source_metadata(spec: Mapping[str, Any]) -> dict | None:
         return _read_zarr_ome(spec)
     if backend == "dvid":
         return _read_dvid(spec)
+    if backend == "webknossos":
+        return _read_webknossos(spec)
+    if backend == "mapped":
+        return _read_mapped(spec)
     # PRECOMPUTED_GZ reads the SAME `info` document — only the chunk keys differ, and
     # metadata does not live in chunks. Omitting it here silently loses voxel_size,
     # offset and kind, which makes `convert` demand --voxel-size and, worse, lose the
@@ -540,6 +563,16 @@ def read_level_voxel_sizes(spec: Mapping[str, Any]) -> list[tuple[float, ...]] |
         geom = geometry(instance_info(spec), spec)
         return [tuple(v * 2 ** i for v in geom["voxel_size"])
                 for i in range(geom["max_scale"] + 1)]
+    if backend == "webknossos":
+        from .backends.webknossos import geometry as wk_geometry
+        from .webknossos import dataset_info, resolve_dataset_id
+
+        dataset_id = spec.get("dataset_id") or resolve_dataset_id(str(spec["dataset"]))
+        return [lv["voxel_size"] for lv in
+                wk_geometry(dataset_info(dataset_id), str(spec["layer"]))["levels"]]
+    if backend == "mapped":
+        # A lookup changes ids, not geometry: the levels are the source's.
+        return read_level_voxel_sizes(spec["source"])
     if backend in ("neuroglancer_precomputed", PRECOMPUTED_GZ):   # same `info`
         raw = _read_key(_kvstore_of(spec), "info")
         if raw is None:
@@ -762,6 +795,73 @@ def _read_dvid(spec: Mapping[str, Any]) -> dict | None:
     }
 
 
+def _read_webknossos(spec: Mapping[str, Any]) -> dict | None:
+    """Coordinate metadata for a webknossos layer, from the dataset's one record.
+
+    **The dataset NAME is resolved to its id here**, and the id, the server and the
+    datastore go into ``data_spec`` — the same discipline as DVID's ref: names are not
+    unique across organizations, so workers and the provenance must address the one the
+    driver chose. The token does not go in; each process reads the credentials itself.
+
+    A requested ``mapping`` is checked against the layer's own list before any work, since
+    an unknown name would otherwise fail every task of the run.
+    """
+    from .backends.webknossos import geometry
+    from .webknossos import (check_mapping, credentials, dataset_info,
+                             resolve_dataset_id)
+
+    creds = credentials()
+    dataset_id = spec.get("dataset_id") or resolve_dataset_id(str(spec["dataset"]),
+                                                              creds=creds)
+    info = dataset_info(dataset_id, creds=creds)
+    resolved = {**spec, "dataset_id": dataset_id, "url": creds["url"],
+                "datastore": info["dataStore"]["url"],
+                "organization": info.get("owningOrganization")}
+    if resolved.get("mapping"):
+        check_mapping(resolved, str(resolved["mapping"]))
+    else:
+        resolved.pop("mapping", None)
+    level = int(spec.get("scale_index", 0))
+    geom = geometry(info, str(spec["layer"]))
+    if not 0 <= level < len(geom["levels"]):
+        raise ValueError(f"{spec.get('dataset')}/{spec.get('layer')} has "
+                         f"{len(geom['levels'])} mags; level {level} was requested")
+    return {
+        "data_spec": {**resolved, "backend": spec.get("backend") or "webknossos",
+                      "scale_index": level},
+        "provenance_spec": resolved,
+        "voxel_size": geom["levels"][level]["voxel_size"],
+        # Origin-anchored, as the backend presents it: voxel indices are webknossos' own.
+        "offset": (0.0, 0.0, 0.0),
+        "units": "nm",
+        "spatial_axes": ("z", "y", "x"),
+        "has_channels": False,
+        "kind": geom["kind"],
+        "default_mapping": geom["default_mapping"],
+    }
+
+
+def _read_mapped(spec: Mapping[str, Any]) -> dict | None:
+    """The source's metadata, with its ``data_spec`` wrapped in the table.
+
+    The source's resolution happens first and is kept — which scale stores data, which
+    level is 0, its frame — so a mapped view inherits all of it rather than re-deciding.
+    ``kind`` is ``segmentation``: a table maps labels to labels by construction.
+    """
+    source = dict(spec["source"])
+    if "scale_index" in spec:
+        # `--src-level` / `describe(level=)` set it on the outer spec; it means the source's.
+        source["scale_index"] = int(spec["scale_index"])
+        spec = {k: v for k, v in spec.items() if k != "scale_index"}
+    meta = read_source_metadata(source)
+    if not meta:
+        raise ValueError(f"{spec.get('descriptor')} maps {spec.get('source_location')}, "
+                         f"which records no metadata; a mapped view needs a volume")
+    wrapped = {**spec, "source": meta["data_spec"]}
+    return {**meta, "data_spec": wrapped, "provenance_spec": wrapped,
+            "kind": "segmentation"}
+
+
 def _read_precomputed(spec: Mapping[str, Any]) -> dict | None:
     kv = _kvstore_of(spec)
     raw = _read_key(kv, "info")
@@ -874,10 +974,15 @@ def level_spec(volume: str, fmt: str, level: int,
         return location_spec(volume, fmt, dataset=dataset)
     if fmt == "zarr3":
         return {"backend": fmt, "path": f"{volume.rstrip('/')}/{level}"}
-    if fmt == "dvid":
-        # A DVID level is a downres scale of one instance, addressed the same way
-        # precomputed addresses a scale — by index, not by a distinct location.
+    if fmt in ("dvid", "webknossos"):
+        # A DVID level is a downres scale of one instance (a webknossos level, one mag of
+        # a layer), addressed the way precomputed addresses a scale — by index.
         return {**location_spec(volume, fmt), "scale_index": int(level)}
+    if fmt == "mapped":
+        # The same table over the source's own level (approximate above 0; see mapped.py).
+        spec = location_spec(volume, fmt)
+        return {**spec, "source": level_spec(spec["source_location"],
+                                             spec["source_format"], level)}
     return {"backend": fmt, "path": volume, "scale_index": int(level)}
 
 

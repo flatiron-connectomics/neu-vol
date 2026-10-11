@@ -43,8 +43,8 @@ ingest_image_stack(
 )
 ```
 
-`convert()` does the same from any source backend (zarr v3, precomputed, DVID, HDF5,
-image stack) to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel. It
+`convert()` does the same from any source backend (zarr v3, precomputed, DVID,
+webknossos, HDF5, image stack) to **zarr v3 or neuroglancer-precomputed**, single- or multi-channel. It
 reads `voxel_size`/`offset`/`units` from the source when present (OME-NGFF groups,
 precomputed `info`, a DVID instance, an HDF5 file that records its own frame); explicit
 args override. Segmentations default to `compressed_segmentation` encoding on
@@ -72,6 +72,50 @@ built from the cropped level 0, never from slices of the source's coarse levels.
 convert("in.precomputed", "crop.precomputed", kind="segmentation",
         crop_start=(5632, 4480, 6784), crop_stop=(5760, 4736, 7040))   # zyx voxels
 ```
+
+**A webknossos layer is a source too**, addressed as `wk://DATASET/LAYER` (a dataset
+name or id). The server and its API token come from `~/.config/webknossos/credentials.toml`
+(`url = "..."`, `token = "..."`, optionally `organization = "..."`; keep it `chmod 600`), or
+from `$WK_TOKEN`/`$WK_URL` — never from the URL, a spec or `provenance.json`. Only the
+standard library is used, so nothing extra is installed. Reads fetch boxes over HTTP and
+are written straight to zarr or precomputed, local or on an object store, so a download
+and a conversion are one step:
+
+```bash
+neu-vol info wk://my_dataset/segmentation        # mags, and every mapping the layer has
+neu-vol convert --src wk://my_dataset/segmentation --dst /path/to/sv.zarr --format zarr
+neu-vol convert --src wk://my_dataset/segmentation --dst /path/to/view70.precomputed \
+    --wk-mapping agglomerate_view_70
+```
+
+A segmentation layer stores **supervoxels**; neurons are an *agglomerate mapping* applied
+on top, and the viewer applies the layer's default one. **Without `--wk-mapping` the ids
+read are supervoxels**, which is what the `webknossos` package's own `download()` returns
+too; with it, the server applies that mapping on every read. `convert` warns when a layer
+has a default mapping that is not being applied, and `provenance.json` records which.
+
+**Keep `--workers` modest (~8).** A webknossos server's throughput is shared among your
+requests, so more workers do not go faster, and an overloaded server returns buckets it
+could not load in time **as zeros, without an error**. Reads are therefore capped at 128³
+per request, and a response slower than 30 s is retried rather than trusted.
+
+**Many views of one supervoxel volume.** Rather than converting every view, fetch each
+view's table (`table[supervoxel] = agglomerate`, a few MB, about half a minute) and read the
+supervoxels through it:
+
+```bash
+neu-vol convert --src wk://my_dataset/segmentation --dst /path/to/sv.precomputed
+neu-vol wk-mappings wk://my_dataset/segmentation --out /path/to/views \
+    --volume /path/to/sv.precomputed                 # every view; --mapping NAME for one
+```
+
+This writes `<view>.npy` (the table), `mappings.json` (what was fetched, per-view
+agglomerate counts) and a descriptor `<view>.json` per view. A descriptor reads the volume
+through its table on the fly wherever a volume is accepted — `neu-vol info`, `read_piece`
+and so `neu-eval compare --segmentation`, and `neu-vol convert --src`, which turns a chosen
+view into a real volume. Level 0 of a view is exact. Coarser levels apply the table to the
+source's downsampled supervoxels, so they are approximate (good for looking, not for
+measuring); a converted view rebuilds its pyramid from level 0 and is exact throughout.
 
 `extract_roi()` is the same crop with the opposite out-of-bounds policy: `start` may be
 negative and `stop` may pass the extent, and the margin is filled with `pad_value`

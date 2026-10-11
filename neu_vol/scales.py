@@ -47,7 +47,16 @@ def read_scales(spec: str | Mapping[str, Any]) -> list[ScaleInfo]:
 
 
 def _read_scales(spec: str | Mapping[str, Any]) -> list[ScaleInfo]:
+    from .mapped import TAG as MAPPED, is_descriptor, read_descriptor
     from .source_metadata import detect_backend
+
+    # A mapped view relabels its source and changes nothing else, so its levels — shapes,
+    # voxel sizes, origins — ARE the source's. Without this a descriptor reaches the
+    # store probes below as a directory and fails as "backend None".
+    if isinstance(spec, str) and is_descriptor(spec):
+        return _read_scales(read_descriptor(spec)["source"])
+    if not isinstance(spec, str) and spec.get("backend") == MAPPED:
+        return _read_scales(spec["source_location"])
 
     spec = {"path": spec} if isinstance(spec, str) else dict(spec)
     kv = _kvstore(spec)

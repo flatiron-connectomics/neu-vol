@@ -140,6 +140,7 @@ def convert(
     background: Sequence[int] | None = None,
     supervoxels: bool = False,
     prefer_locked: bool = False,
+    wk_mapping: str | None = None,
     profile: str = "local",
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
@@ -239,6 +240,16 @@ def convert(
                 f"{src_spec.get('backend')!r}")
         src_spec["supervoxels"] = True
 
+    if wk_mapping:
+        # The server applies it on every read. Rejected for other sources for the same
+        # reason as `supervoxels`: dropping it would hand back a different segmentation
+        # than the one asked for, and nothing downstream could tell.
+        if src_spec.get("backend") != "webknossos":
+            raise ValueError(
+                f"wk_mapping applies to webknossos sources only, but the source is "
+                f"{src_spec.get('backend')!r}")
+        src_spec["mapping"] = str(wk_mapping)
+
     meta = read_source_metadata(src_spec)
 
     # The array/scale to actually read (level 0 of an OME group / the finest precomputed
@@ -249,7 +260,9 @@ def convert(
     # opens, reports the extent its `info` claims and reads as the fill value at every
     # block, so the run would succeed and write a volume of zeros. Only fires when some
     # other scale stores data and this one does not — see `require_populated_scale`.
-    require_populated_scale(data_spec, op="convert")
+    # A mapped view is checked through its source: the guard reads precomputed specs only.
+    require_populated_scale(data_spec["source"] if data_spec.get("backend") == "mapped"
+                            else data_spec, op="convert")
 
     # Warned here rather than in the metadata reader, which is also on the read-only
     # inspection path: this is where an export is about to happen, which is what makes
@@ -264,6 +277,19 @@ def convert(
                 "the node. For an immutable snapshot re-run with --dvid-locked, which "
                 "takes the newest locked ancestor. Source: %s",
                 data_spec.get("uuid"), spec_url(data_spec))
+
+    # The viewer shows a webknossos segmentation through its default mapping, so a
+    # supervoxel export differs from what was looked at — legitimately (it is the input
+    # for comparing views), but never silently.
+    if data_spec.get("backend") == "webknossos" and meta:
+        if data_spec.get("mapping"):
+            logger.info("webknossos: reading with mapping %s, applied by the server",
+                        data_spec["mapping"])
+        elif meta.get("default_mapping"):
+            logger.warning(
+                "webknossos: reading SUPERVOXELS (no mapping). The viewer shows this layer "
+                "through %r; pass --wk-mapping %s for those ids",
+                meta["default_mapping"], meta["default_mapping"])
 
     # Resolve coordinate metadata: explicit arg > source metadata > default.
     if voxel_size is None:
