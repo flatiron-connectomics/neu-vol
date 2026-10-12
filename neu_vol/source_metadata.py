@@ -833,6 +833,9 @@ def _read_webknossos(spec: Mapping[str, Any]) -> dict | None:
         "voxel_size": geom["levels"][level]["voxel_size"],
         # Origin-anchored, as the backend presents it: voxel indices are webknossos' own.
         "offset": (0.0, 0.0, 0.0),
+        # The layer's bounding box at this level, zyx [lo, hi). Everything outside reads
+        # as zeros, so `convert` crops to it by default.
+        "data_box": (geom["levels"][level]["box_lo"], geom["levels"][level]["box_hi"]),
         "units": "nm",
         "spatial_axes": ("z", "y", "x"),
         "has_channels": False,

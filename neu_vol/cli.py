@@ -98,6 +98,11 @@ def _add_convert_args(p, *, source_defaults: bool):
                         "SUPERVOXELS — the raw ids — even when the viewer shows the layer "
                         "through a default mapping. `neu-vol info wk://...` lists the "
                         "mappings")
+    p.add_argument("--wk-full-extent", action="store_true",
+                   help="keep the layer's full origin-anchored extent (webknossos sources "
+                        "only). Default: crop to the layer's bounding box, keeping its "
+                        "frame, since everything outside it reads as zeros and would only "
+                        "add empty tasks. --crop-bbox overrides either")
     p.add_argument("--dst", required=True,
                    help="destination base (path or s3://bucket/prefix). With "
                         "--format both, '.precomputed' and '.zarr' are appended. "
@@ -712,6 +717,7 @@ def _run_convert(args, *, fmt, voxel, chunk, shard, kind, crop, masks=()) -> int
                 supervoxels=getattr(args, "dvid_supervoxels", False),
                 prefer_locked=getattr(args, "dvid_locked", False),
                 wk_mapping=getattr(args, "wk_mapping", None),
+                crop_to_data=not getattr(args, "wk_full_extent", False),
                 factors=_factor_list(args.factors), max_levels=args.max_levels,
                 min_dim=args.min_dim, multiscale=not args.single_level,
                 sparse=args.sparse,

@@ -96,6 +96,12 @@ read are supervoxels**, which is what the `webknossos` package's own `download()
 too; with it, the server applies that mapping on every read. `convert` warns when a layer
 has a default mapping that is not being applied, and `provenance.json` records which.
 
+**`convert` crops a layer to its bounding box.** webknossos indexes a layer from the
+dataset's voxel 0, and everything outside the box reads as zeros, so a full-extent copy
+plans (and steps through) every empty block of that margin. The output keeps the layer's
+frame, with its offset shifted to the box's corner, so it overlays the layer and any other
+copy of it. `--wk-full-extent` keeps the origin-anchored extent; `--crop-bbox` overrides both.
+
 **Keep `--workers` modest (~8).** A webknossos server's throughput is shared among your
 requests, so more workers do not go faster, and an overloaded server returns buckets it
 could not load in time **as zeros, without an error**. Reads are therefore capped at 128³

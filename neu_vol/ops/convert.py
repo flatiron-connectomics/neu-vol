@@ -141,6 +141,7 @@ def convert(
     supervoxels: bool = False,
     prefer_locked: bool = False,
     wk_mapping: str | None = None,
+    crop_to_data: bool = True,
     profile: str = "local",
     chunk: Sequence[int] | None = None,
     shard: Sequence[int] | None = None,
@@ -198,6 +199,12 @@ def convert(
     are the crop's own reductions rather than slices of the source's coarse levels —
     for a crop whose origin is not a multiple of the cumulative factor, a coarse voxel
     of the output straddles the source's differently.
+
+    ``crop_to_data`` (default on) crops a source that records the box its data lies in —
+    a webknossos layer's bounding box — to that box when no crop is given. The layer is
+    presented origin-anchored, so without it the output runs from voxel 0 and the run
+    steps through every empty block of the margin; the crop keeps the frame (the offset
+    shifts), so the output still overlays the source. ``False`` keeps the full extent.
     """
     if isinstance(src, dict):
         src_spec = dict(src)
@@ -315,6 +322,12 @@ def convert(
         kind = (meta or {}).get("kind") or "image"
         if meta and meta.get("kind"):
             logger.info("kind=%s, from the source's own metadata", kind)
+
+    if (crop_to_data and crop_start is None and crop_stop is None
+            and meta and meta.get("data_box")):
+        crop_start, crop_stop = (tuple(int(v) for v in c) for c in meta["data_box"])
+        logger.info("cropping to the source's data box [%s:%s] (crop_to_data; the "
+                    "output keeps the source's frame)", crop_start, crop_stop)
 
     src_backend = open_backend(data_spec)
     src_shape = src_backend.shape

@@ -147,6 +147,14 @@ def _zyx(xyz: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(xyz.transpose(2, 1, 0))
 
 
+#: The bounding box in zyx, which `convert` crops a layer to by default.
+BOX_LO, BOX_HI = TOP_LEFT[::-1], HI[::-1]
+
+
+def _in_box(zyx: np.ndarray) -> np.ndarray:
+    return zyx[tuple(slice(a, b) for a, b in zip(BOX_LO, BOX_HI))]
+
+
 # --------------------------------------------------------------------------- #
 # addressing
 # --------------------------------------------------------------------------- #
@@ -492,15 +500,56 @@ def test_convert_writes_the_layer_zyx_and_records_what_it_read(server, tmp_path,
     convert("wk://specimen/segmentation", dst, profile="local", chunk=(4, 4, 4),
             multiscale=False, wk_mapping=mapping, delete_existing=True)
     lvl0 = open_backend({"backend": "zarr3", "path": os.path.join(dst, "0")})
-    want = _zyx(_mapped(server.xyz) if mapping else server.xyz)
+    want = _in_box(_zyx(_mapped(server.xyz) if mapping else server.xyz))
     np.testing.assert_array_equal(lvl0.read_region(tuple(slice(0, s) for s in lvl0.shape)),
                                   want)
     with open(os.path.join(dst, "provenance.json")) as fh:
         text = fh.read()
-    rec = json.loads(text)["source"]
+    prov = json.loads(text)
+    rec = prov["source"]
     assert rec["dataset_id"] == DSID and rec["mapping"] == mapping
     assert rec["ids"] == ("agglomerates" if mapping else "supervoxels (raw ids)")
     assert TOKEN not in text
+    assert (prov["run"]["crop_start"], prov["run"]["crop_stop"]) == \
+        (list(BOX_LO), list(BOX_HI))
+
+
+def test_convert_crops_to_the_bounding_box_and_keeps_the_frame(server, tmp_path):
+    """Origin-anchored, the output would run from voxel 0 and every task of the empty
+    margin would be planned and stepped through; cropped, it is the box, shifted by its
+    origin so it still overlays the layer."""
+    from neu_vol import convert, read_piece
+
+    dst = str(tmp_path / "out")
+    convert("wk://specimen/segmentation", dst, profile="local", chunk=(4, 4, 4),
+            multiscale=False, delete_existing=True)
+    piece = read_piece(dst)
+    assert np.asarray(piece.array).shape == tuple(b - a for a, b in zip(BOX_LO, BOX_HI))
+    assert tuple(piece.frame.voxel_size_nm) == (30.0, 8.0, 8.0)
+    assert tuple(piece.frame.origin_nm) == tuple(
+        a * v for a, v in zip(BOX_LO, (30.0, 8.0, 8.0)))
+
+
+def test_full_extent_keeps_the_origin_anchored_volume(server, tmp_path):
+    from neu_vol import convert
+
+    dst = str(tmp_path / "out")
+    convert("wk://specimen/segmentation", dst, profile="local", chunk=(4, 4, 4),
+            multiscale=False, delete_existing=True, crop_to_data=False)
+    lvl0 = open_backend({"backend": "zarr3", "path": os.path.join(dst, "0")})
+    np.testing.assert_array_equal(lvl0.read_region(tuple(slice(0, s) for s in lvl0.shape)),
+                                  _zyx(server.xyz))
+
+
+def test_an_explicit_crop_wins_over_the_bounding_box(server, tmp_path):
+    from neu_vol import convert
+
+    dst = str(tmp_path / "out")
+    convert("wk://specimen/segmentation", dst, profile="local", chunk=(4, 4, 4),
+            multiscale=False, delete_existing=True, crop_start=(0, 0, 0),
+            crop_stop=(3, 4, 6))
+    lvl0 = open_backend({"backend": "zarr3", "path": os.path.join(dst, "0")})
+    assert lvl0.shape == (3, 4, 6)
 
 
 def test_the_backend_is_registered_under_its_tag():
@@ -604,11 +653,14 @@ def test_a_descriptor_is_a_volume_everywhere_a_location_is_taken(server, view, s
     d = describe(view)
     assert d["format"] == "mapped" and d["meta"]["kind"] == "segmentation"
     # The view's levels are its source's, whatever pyramid that volume was given.
-    assert d["shape"] == (6, 9, 14)
+    assert d["shape"] == tuple(b - a for a, b in zip(BOX_LO, BOX_HI))
     assert d["levels"] == describe(sv_volume)["levels"]
     piece = read_piece(view)
-    np.testing.assert_array_equal(np.asarray(piece.array), _zyx(_mapped(server.xyz)))
+    np.testing.assert_array_equal(np.asarray(piece.array),
+                                  _in_box(_zyx(_mapped(server.xyz))))
     assert tuple(piece.frame.voxel_size_nm) == (30.0, 8.0, 8.0)
+    # ...and its frame, so a view of a cropped supervoxel volume still overlays the layer
+    assert piece.frame == read_piece(sv_volume).frame
 
 
 def test_a_coarse_level_maps_the_sources_own_coarse_level(server, view, sv_volume):
@@ -629,7 +681,7 @@ def test_converting_a_view_writes_the_mapped_labels_and_records_both_halves(
             delete_existing=True)
     lvl0 = open_backend({"backend": "zarr3", "path": os.path.join(dst, "0")})
     np.testing.assert_array_equal(lvl0.read_region(tuple(slice(0, s) for s in lvl0.shape)),
-                                  _zyx(_mapped(server.xyz)))
+                                  _in_box(_zyx(_mapped(server.xyz))))
     assert lvl0.dtype == np.uint32              # values fit, so the source's dtype is kept
     with open(os.path.join(dst, "provenance.json")) as fh:
         rec = json.load(fh)["source"]
