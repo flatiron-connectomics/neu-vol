@@ -1872,6 +1872,105 @@ def cmd_wk_mappings(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# wk-ls
+# --------------------------------------------------------------------------- #
+def _human_bytes(n) -> str:
+    if not isinstance(n, (int, float)) or n <= 0:
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _print_wk_summary(s) -> None:
+    print(f"{s['name']}  ({s['id']})")
+    print(f"  created {s['created']}" + (f" by {s['uploader']}" if s["uploader"] else "")
+          + f", last used {s['last_used']}, {_human_bytes(s['bytes'])}")
+    if s["description"]:
+        print(f"  description: {' '.join(str(s['description']).split())}")
+    if s["tags"]:
+        print(f"  tags: {', '.join(map(str, s['tags']))}")
+    if s["voxel_size"]:
+        print(f"  voxel size: {' x '.join(f'{v:g}' for v in s['voxel_size'])} "
+              f"{s['voxel_unit'] or ''}".rstrip())
+    for lyr in s["layers"]:
+        tl, size = lyr["top_left_xyz"] or [], lyr["size_xyz"]
+        mags = lyr["mags"]
+        mag_txt = (f"mags {'-'.join(map(str, mags[0]))} .. {'-'.join(map(str, mags[-1]))}"
+                   if mags else "no mags")
+        print(f"  {lyr['name']:<16} {lyr['category'] or '?':<12} {lyr['dtype'] or '?':<7} "
+              f"box xyz {','.join(map(str, tl))} + {'x'.join(map(str, size))}  {mag_txt}")
+        if lyr["category"] == "segmentation":
+            views = lyr["mappings"]["agglomerate"] + lyr["mappings"]["json"]
+            print(f"      views: {', '.join(views) or 'none'}"
+                  + (f"  (default: {lyr['default_mapping']})" if lyr["default_mapping"]
+                     else ""))
+
+
+def cmd_wk_ls(args) -> int:
+    """List webknossos datasets and their layers."""
+    import json as _json
+
+    from neu_vol import webknossos as wk
+
+    try:
+        creds = wk.credentials()
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e)) from None
+    org = None if args.all_orgs else (args.org or creds.get("organization"))
+    found = wk.list_datasets(args.pattern, organization=org, creds=creds)
+    scope = f"organization {org}" if org else "every organization"
+
+    if args.details:
+        if len(found) > args.max_details:
+            raise SystemExit(
+                f"{len(found)} datasets match in {scope}; --details asks the server ~3 "
+                f"times per dataset, so it stops at --max-details {args.max_details}. Narrow "
+                f"the pattern, or raise --max-details.")
+        summaries = []
+        for d in found:
+            try:
+                summaries.append(wk.dataset_summary(str(d["id"]), creds=creds))
+            except RuntimeError as e:
+                summaries.append({"id": d["id"], "name": d.get("name"), "error": str(e)})
+        if args.json:
+            print(_json.dumps(summaries, indent=1))
+            return 0
+        for s in summaries:
+            if "error" in s:
+                print(f"{s['name']}  ({s['id']})\n  ! {s['error']}")
+            else:
+                _print_wk_summary(s)
+            print()
+        print(f"{len(found)} dataset(s) in {scope}")
+        return 0
+
+    if args.json:
+        print(_json.dumps(found, indent=1))
+        return 0
+    if found:
+        width = max(len(str(d.get("name"))) for d in found)
+        print(f"{'name':<{width}}  {'id':<24}  created     last used   size       layers")
+        for d in found:
+            seg = ", ".join(d.get("segmentationLayerNames") or [])
+            col = ", ".join(d.get("colorLayerNames") or [])
+            layers = " | ".join(t for t in (f"seg: {seg}" if seg else "",
+                                            f"color: {col}" if col else "") if t)
+            print(f"{str(d.get('name')):<{width}}  {d['id']:<24}  "
+                  f"{wk.iso_date(d.get('created')):<10}  "
+                  f"{wk.iso_date(d.get('lastUsedByUser')):<10}  "
+                  f"{_human_bytes(d.get('usedStorageBytes')):>9}  {layers}")
+    print(f"\n{len(found)} dataset(s) in {scope}"
+          + ("" if org or args.all_orgs else
+             " -- set `organization` in the credentials file (or pass --org) to see only "
+             "yours"))
+    if found and not args.details:
+        print("--details adds each one's description, uploader, layer boxes and views")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
 def _maybe_cluster(args):
@@ -2476,6 +2575,35 @@ def build_parser() -> argparse.ArgumentParser:
                         "server's, so this is the only lever; keep it modest on a shared "
                         "public server")
     q.set_defaults(func=cmd_wk_mappings)
+
+    # --- wk-ls --------------------------------------------------------------
+    q = sub.add_parser(
+        "wk-ls", help="list webknossos datasets and their layers",
+        description="List the webknossos datasets your token can see, with their layers, "
+                    "dates and size -- one request. The server's list includes other "
+                    "organizations' public datasets, so it is filtered to the "
+                    "`organization` in the credentials file unless --org or --all-orgs "
+                    "says otherwise.\n\n"
+                    "--details adds each matching dataset's description, uploader, voxel "
+                    "size, and per layer its bounding box, mags and agglomerate views "
+                    "(about three requests per dataset, so it is capped by "
+                    "--max-details).",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("pattern", nargs="?", default=None,
+                   help="dataset names to show: a substring, or a glob if it contains "
+                        "*, ? or [ (case-insensitive)")
+    q.add_argument("--org", default=None, metavar="ID",
+                   help="list this organization's datasets (default: the credentials "
+                        "file's `organization`)")
+    q.add_argument("--all-orgs", action="store_true",
+                   help="list every visible dataset, whatever its organization")
+    q.add_argument("--details", action="store_true",
+                   help="fetch each matching dataset's full record and layer views")
+    q.add_argument("--max-details", type=int, default=10, metavar="N",
+                   help="with --details: refuse to fetch more than N datasets "
+                        "(default: %(default)s)")
+    q.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    q.set_defaults(func=cmd_wk_ls)
 
     _add_help_command(sub)
     return p

@@ -82,6 +82,8 @@ are written straight to zarr or precomputed, local or on an object store, so a d
 and a conversion are one step:
 
 ```bash
+neu-vol wk-ls                                    # your organization's datasets and layers
+neu-vol wk-ls specimen --details                 # + description, uploader, boxes, views
 neu-vol info wk://my_dataset/segmentation        # mags, and every mapping the layer has
 neu-vol convert --src wk://my_dataset/segmentation --dst /path/to/sv.zarr --format zarr
 neu-vol convert --src wk://my_dataset/segmentation --dst /path/to/view70.precomputed \

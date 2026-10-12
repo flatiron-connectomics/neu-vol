@@ -329,6 +329,84 @@ def _natural(name: str):
     return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", str(name))]
 
 
+# --------------------------------------------------------------------------- #
+# listing
+# --------------------------------------------------------------------------- #
+def list_datasets(pattern: str | None = None, *, organization: str | None = None,
+                  creds: Mapping[str, Any] | None = None) -> list[dict]:
+    """The active datasets this token can see, oldest first — ONE request.
+
+    The server's list includes every public dataset on it, other organizations' too
+    (webknossos.org answers with hundreds), so ``organization`` filters to one. Its records
+    carry the layer names, dates and size but no description; `dataset_summary` adds that
+    at one request per dataset.
+
+    ``pattern`` matches the name case-insensitively: a glob if it has ``*?[``, else a
+    substring.
+    """
+    import fnmatch
+
+    creds = creds or credentials()
+    _check_api_version(creds["url"])
+    found = _get_json(f"{api(creds['url'])}/datasets", token=creds["token"],
+                      query={"isActive": "true", "organizationId": organization})
+    if organization:
+        found = [d for d in found if d.get("owningOrganization") == organization]
+    if pattern:
+        p = pattern.lower()
+        glob = any(c in p for c in "*?[")
+        found = [d for d in found
+                 if (fnmatch.fnmatch(str(d.get("name", "")).lower(), p) if glob
+                     else p in str(d.get("name", "")).lower())]
+    return sorted(found, key=lambda d: (d.get("created") or 0, str(d.get("name"))))
+
+
+def iso_date(ms: Any) -> str:
+    """A webknossos timestamp (ms since the epoch) as a UTC date; ``-`` if absent."""
+    import datetime as dt
+
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return "-"
+    return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def dataset_summary(dataset_id: str, *, creds: Mapping[str, Any] | None = None) -> dict:
+    """What a dataset is, for choosing one: its record's description, uploader and dates,
+    and per layer the box, mags, default view and every mapping it can be read with.
+
+    One request for the record plus two per segmentation layer (the mapping lists).
+    """
+    creds = creds or credentials()
+    info = dataset_info(dataset_id, creds=creds)
+    source = info.get("dataSource") or {}
+    layers = []
+    for rec in source.get("dataLayers") or []:
+        box = rec.get("boundingBox") or {}
+        layer = {
+            "name": rec.get("name"), "category": rec.get("category"),
+            "dtype": rec.get("elementClass"),
+            "top_left_xyz": box.get("topLeft"),
+            "size_xyz": [box.get("width"), box.get("height"), box.get("depth")],
+            "mags": [m.get("mag") for m in rec.get("mags") or []],
+            "default_mapping": default_mapping(rec),
+        }
+        if rec.get("category") == "segmentation":
+            layer["mappings"] = mappings({"dataset_id": dataset_id, "layer": rec["name"]},
+                                         creds=creds)
+        layers.append(layer)
+    return {
+        "id": info.get("id", dataset_id), "name": info.get("name"),
+        "organization": info.get("owningOrganization"),
+        "description": info.get("description"), "uploader": info.get("uploaderFullName"),
+        "created": iso_date(info.get("created")),
+        "last_used": iso_date(info.get("lastUsedByUser")),
+        "tags": info.get("tags") or [], "bytes": info.get("usedStorageBytes"),
+        "voxel_size": (source.get("scale") or {}).get("factor"),
+        "voxel_unit": (source.get("scale") or {}).get("unit"),
+        "layers": layers,
+    }
+
+
 def layer_base(spec: Mapping[str, Any]) -> str:
     """The datastore URL of a resolved spec's layer; every per-layer route hangs off it."""
     info = dataset_info(spec["dataset_id"])

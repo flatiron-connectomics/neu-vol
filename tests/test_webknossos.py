@@ -60,11 +60,18 @@ class FakeServer:
         self.tokens: set[str | None] = set()
         self.failed_buckets = "[]"
         self.datasets = [{"id": DSID, "name": "specimen", "directoryName": "specimen",
-                          "owningOrganization": "lab"}]
+                          "owningOrganization": "lab", "created": 1790000000000,
+                          "lastUsedByUser": 1791000000000, "usedStorageBytes": 3 * 2**30,
+                          "segmentationLayerNames": ["segmentation"],
+                          "colorLayerNames": []}]
+        self.list_queries: list[dict] = []
 
     def info(self):
         return {
             "id": DSID, "name": "specimen", "owningOrganization": "lab",
+            "description": "Workflow Report: [abc](https://wk.example.org/workflows/abc)",
+            "uploaderFullName": "A. Uploader", "created": 1790000000000,
+            "lastUsedByUser": 1791000000000, "tags": [], "usedStorageBytes": 3 * 2**30,
             "dataStore": {"url": DATASTORE},
             "dataSource": {
                 "scale": {"factor": [8.0, 8.0, 30.0], "unit": "nanometer"},
@@ -96,7 +103,8 @@ class FakeServer:
             return json.dumps({"httpApiVersioning": {
                 "currentApiVersion": 16, "oldestSupportedApiVersion": 5}}).encode(), {}
         if url == f"{URL}/api/v16/datasets":
-            hits = [d for d in self.datasets if q["searchQuery"] in d["name"]]
+            self.list_queries.append(q)
+            hits = [d for d in self.datasets if q.get("searchQuery", "") in d["name"]]
             return json.dumps(hits).encode(), {}
         if url == f"{URL}/api/v16/datasets/{DSID}":
             return json.dumps(self.info()).encode(), {}
@@ -369,6 +377,103 @@ def test_an_ambiguous_dataset_name_raises_rather_than_picking(server):
     server.datasets.append({"id": "f" * 24, "name": "specimen", "owningOrganization": "x"})
     with pytest.raises(ValueError, match="ambiguous"):
         wk.resolve_dataset_id("specimen")
+
+
+# --------------------------------------------------------------------------- #
+# listing (wk-ls)
+# --------------------------------------------------------------------------- #
+def _other_orgs(server):
+    """Datasets a real server lists beside yours: other organizations' public ones."""
+    server.datasets += [
+        {"id": "a" * 24, "name": "specimen_public", "owningOrganization": "elsewhere",
+         "created": 1600000000000, "segmentationLayerNames": ["seg"],
+         "colorLayerNames": ["image"]},
+        {"id": "b" * 24, "name": "specimen_5_v2", "owningOrganization": "lab",
+         "created": 1795000000000, "segmentationLayerNames": ["gt", "specimen5"],
+         "colorLayerNames": ["image"]},
+    ]
+
+
+def test_listing_is_one_request_filtered_to_the_organization_and_oldest_first(server):
+    _other_orgs(server)
+    found = wk.list_datasets(organization="lab")
+    assert [d["name"] for d in found] == ["specimen", "specimen_5_v2"]
+    assert len(server.list_queries) == 1
+    assert {d["owningOrganization"] for d in wk.list_datasets()} == {"lab", "elsewhere"}
+
+
+@pytest.mark.parametrize("pattern, names", [
+    ("SPECIMEN_5", ["specimen_5_v2"]),           # substring, case-insensitive
+    ("specimen", ["specimen", "specimen_5_v2"]),
+    ("spec*v2", ["specimen_5_v2"]),              # glob: the whole name must match
+    ("*imen", ["specimen"]),
+])
+def test_a_pattern_is_a_substring_or_a_glob(server, pattern, names):
+    _other_orgs(server)
+    assert [d["name"] for d in wk.list_datasets(pattern, organization="lab")] == names
+
+
+def test_dates_are_utc_days_and_a_missing_one_is_a_dash():
+    assert wk.iso_date(1790000000000) == "2026-09-21"
+    assert wk.iso_date(None) == "-" and wk.iso_date(0) == "-"
+
+
+def test_a_summary_carries_what_tells_datasets_apart(server):
+    s = wk.dataset_summary(DSID)
+    assert s["description"].startswith("Workflow Report")
+    assert s["uploader"] == "A. Uploader" and s["created"] == "2026-09-21"
+    (lyr,) = s["layers"]
+    assert lyr["top_left_xyz"] == list(TOP_LEFT) and lyr["size_xyz"] == list(SIZE)
+    assert lyr["default_mapping"] == "agglomerate_view_70"
+    assert lyr["mappings"]["agglomerate"] == ["agglomerate_view_10", "agglomerate_view_70"]
+
+
+def _wk_ls(capsys, *argv):
+    from neu_vol.cli import main
+
+    assert main(["wk-ls", *argv]) == 0
+    return capsys.readouterr().out
+
+
+def test_wk_ls_uses_the_credentials_organization(server, tmp_path, monkeypatch, capsys):
+    _other_orgs(server)
+    monkeypatch.delenv("WK_TOKEN", raising=False)
+    f = tmp_path / "credentials.toml"
+    f.write_text(f'url = "{URL}"\ntoken = "{TOKEN}"\norganization = "lab"\n')
+    f.chmod(0o600)
+    monkeypatch.setenv(wk.ENV_CREDENTIALS, str(f))
+    out = _wk_ls(capsys)
+    assert "specimen_5_v2" in out and "specimen_public" not in out
+    assert "seg: gt, specimen5 | color: image" in out and "2026-09-21" in out
+    assert "2 dataset(s) in organization lab" in out
+    assert TOKEN not in out
+    assert "specimen_public" in _wk_ls(capsys, "--all-orgs")
+
+
+def test_wk_ls_without_an_organization_lists_everything_and_says_how_to_narrow(
+        server, capsys):
+    _other_orgs(server)
+    out = _wk_ls(capsys)
+    assert "specimen_public" in out and "set `organization`" in out
+    assert "specimen_public" not in _wk_ls(capsys, "--org", "lab")
+
+
+def test_wk_ls_details_shows_the_box_views_and_description(server, capsys):
+    out = _wk_ls(capsys, "specimen", "--org", "lab", "--details")
+    assert "description: Workflow Report" in out and "by A. Uploader" in out
+    assert "box xyz 4,2,1 + 10x7x5" in out
+    assert "views: agglomerate_view_10, agglomerate_view_70  (default: agglomerate_view_70)" \
+        in out
+    assert TOKEN not in out
+
+
+def test_wk_ls_details_refuses_a_broad_match_before_asking_for_any(server, capsys):
+    from neu_vol.cli import main
+
+    _other_orgs(server)
+    server.info = lambda: pytest.fail("fetched a dataset record despite the cap")
+    with pytest.raises(SystemExit, match="--max-details 1"):
+        main(["wk-ls", "--all-orgs", "--details", "--max-details", "1"])
 
 
 def test_wk_mapping_on_another_source_raises_rather_than_being_ignored(tmp_path):
